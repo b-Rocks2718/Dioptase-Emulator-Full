@@ -3,9 +3,54 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+pub struct RandomCache {
+    table : HashMap<u32, u32>,
+    size : usize,
+    capacity : usize,
+}
+
+impl RandomCache {
+  pub fn new(capacity : usize) -> RandomCache  {
+    RandomCache {
+      table : HashMap::new(),
+      size : 0,
+      capacity : capacity,
+    }
+  }
+
+  pub fn read(&self, key : u32) -> Option<u32> {
+    assert!(self.size <= self.capacity);
+    self.table.get(&key).copied()
+  }
+
+  pub fn write(&mut self, key : u32, value : u32){
+    if self.size < self.capacity {
+      self.size += 1;
+    } else {
+      // remove an entry
+      let evict = {
+        let mut keys = self.table.keys();
+        keys.next().cloned().expect("size was nonzero, this should work")
+      };
+      self.table.remove(&evict);
+    }
+
+    self.table.insert(key, value);
+    assert!(self.size <= self.capacity);
+  }
+
+  pub fn clear(&mut self){
+    self.size = 0;
+    self.table.drain();
+  }
+}
+
 pub struct Emulator {
+  kmode : bool,
   regfile : [u32; 32],
+  cregfile : [u32; 7],
   ram : HashMap<u32, u8>,
+  tlb : RandomCache,
   pc : u32,
   flags : [bool; 4], // flags are: carry | zero | sign | overflow
   halted : bool
@@ -58,11 +103,14 @@ impl Emulator {
     }
     
     Emulator {
+      kmode: true,
       regfile: [0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
+      cregfile: [0, 0, 0, 0, 0, 0, 0],
       ram: instructions,
+      tlb: RandomCache::new(8),
       pc: 0,
       flags: [false, false, false, false],
       halted: false
@@ -130,6 +178,7 @@ impl Emulator {
       13 => self.branch_absolute(instr),
       14 => self.branch_relative(instr),
       15 => self.syscall(instr),
+      31 => self.kernel_instr(instr),
       _ => panic!("Unrecognized opcode")
     }
   }
@@ -916,4 +965,55 @@ impl Emulator {
     self.flags[3] = (result_sign != lhs_sign) && (lhs_sign == rhs_sign);
   }
 
+
+  fn kernel_instr(&mut self, instr : u32){
+    if !self.kmode {
+      // exec_priv
+    }
+    let op = (instr >> 12) & 0x1F;
+
+    match op {
+      0 => self.tlb_op(instr),
+      1 => self.crmv_op(instr),
+      2 => self.mode_op(instr),
+      3 => self.rfe(instr),
+      _ => panic!("Unrecognized opcode")
+    }
+  }
+
+  fn tlb_op(&mut self, instr : u32) {
+    let op = (instr >> 10) & 3;
+    let ra = (instr >> 22) & 0x1F;
+    let rb = (instr >> 27) & 0x1F;
+
+    let rb = self.regfile[rb as usize];
+    if op == 0 {
+      // tlbr
+      if let Some(val) = self.tlb.read(rb & 0xFFFFF000) {
+        self.regfile[ra as usize] = val;
+      } else {
+        self.regfile[ra as usize] = 0;
+      }
+    } else if op == 1 {
+      // tlbw
+      let ra = self.regfile[ra as usize];
+      self.tlb.write(rb & 0xFFFFF000, ra & 0xF);
+    } else {
+      // tlbc
+      self.tlb.clear();
+    }
+  }
+
+  fn crmv_op(&mut self, instr : u32) {
+    
+  }
+
+  fn mode_op(&mut self, instr : u32) {
+    
+  }
+
+  fn rfe(&mut self, instr : u32) {
+    
+    
+  }
 }

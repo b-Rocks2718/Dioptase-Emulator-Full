@@ -48,11 +48,12 @@ impl RandomCache {
 pub struct Emulator {
   kmode : bool,
   regfile : [u32; 32],
-  cregfile : [u32; 7],
+  cregfile : [u32; 8],
   ram : HashMap<u32, u8>,
   tlb : RandomCache,
   pc : u32,
   flags : [bool; 4], // flags are: carry | zero | sign | overflow
+  asleep : bool,
   halted : bool
 }
 
@@ -108,54 +109,154 @@ impl Emulator {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
-      cregfile: [0, 0, 0, 0, 0, 0, 0],
+      cregfile: [0, 0, 0, 0, 0, 0, 0, 0],
       ram: instructions,
       tlb: RandomCache::new(8),
-      pc: 0,
+      pc: 0x400,
       flags: [false, false, false, false],
+      asleep: false,
       halted: false
     }
   }
 
-  fn mem_write8(&mut self, addr : u32, data : u8) {
-    self.ram.insert(addr, data);
-  }
-
-  fn mem_write16(&mut self, addr : u32, data : u16) {
-    self.mem_write8(addr, data as u8);
-    self.mem_write8(addr + 1, (data >> 8) as u8);
-  }
-
-  fn mem_write32(&mut self, addr : u32, data : u32) {
-    self.mem_write16(addr, data as u16);
-    self.mem_write16(addr + 2, (data >> 16) as u16);
-  }
-
-  fn mem_read8(&self, addr : u32) -> u8 {
-    if self.ram.contains_key(&addr) {
-      self.ram[&addr]
+  fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
+    let addr = if self.kmode {
+      if addr < 0x30000 {
+        addr
+      } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        result
+      } else {
+        // TLB_KMISS
+        return false;
+      }
     } else {
-      0
+      if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        result
+      } else {
+        // TLB_UMISS
+        return false;
+      }
+    };
+
+    self.ram.insert(addr, data);
+    return true;
+  }
+
+  fn mem_write16(&mut self, addr : u32, data : u16) -> bool {
+    self.mem_write8(addr, data as u8) &&
+    self.mem_write8(addr + 1, (data >> 8) as u8)
+  }
+
+  fn mem_write32(&mut self, addr : u32, data : u32) -> bool {
+    self.mem_write16(addr, data as u16) &&
+    self.mem_write16(addr + 2, (data >> 16) as u16)
+  }
+
+  fn mem_read8(&mut self, addr : u32) -> Option<u8> {
+    let addr = if self.kmode {
+      if addr < 0x30000 {
+        addr
+      } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        result
+      } else {
+        // TLB_KMISS
+        return None;
+      }
+    } else {
+      if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        result
+      } else {
+        // TLB_UMISS
+        return None;
+      }
+    };
+
+    if self.ram.contains_key(&addr) {
+      Some(self.ram[&addr])
+    } else {
+      Some(0)
     }
   }
 
-  fn mem_read16(&self, addr : u32) -> u16 {
-    (u16::from(self.mem_read8(addr + 1)) << 8) + 
-    u16::from(self.mem_read8(addr))
+  fn mem_read16(&mut self, addr: u32) -> Option<u16> {
+    self.mem_read8(addr).zip(self.mem_read8(addr + 1))
+        .map(|(lo, hi)| (u16::from(hi) << 8) | u16::from(lo))
   }
 
-  fn mem_read32(&self, addr : u32) -> u32 {
-    (u32::from(self.mem_read16(addr + 2)) << 16) + 
-    u32::from(self.mem_read16(addr))
+  fn mem_read32(&mut self, addr: u32) -> Option<u32> {
+    self.mem_read16(addr).zip(self.mem_read16(addr + 2))
+        .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
 
   pub fn run(&mut self) -> u32 {
     while !self.halted {
-      self.execute(self.mem_read32(self.pc));
+      self.handle_interrupts();
+      if !self.asleep{
+        let instr = self.mem_read32(self.pc);
+        if let Some(instr) = instr {
+          self.execute(instr);
+        }
+      }
     }
 
     // return the value in r3
     self.regfile[3]
+  }
+
+  fn handle_interrupts(&mut self){
+    if self.cregfile[3] >> 31 != 0 {
+      // top bit activates/disables all interrupts
+      let active_ints = self.cregfile[3] & self.cregfile[2];
+      if active_ints != 0 {
+        self.cregfile[0] += 1;
+        self.kmode = true;
+      }
+
+      // save pc and flags
+      self.cregfile[4] = self.pc;
+      self.cregfile[5] = 
+        ((self.flags[3] as u32) << 3) |
+        ((self.flags[2] as u32) << 2) |
+        ((self.flags[1] as u32) << 1) |
+        (self.flags[0] as u32);
+
+      // disable interrupts
+      self.cregfile[3] &= 0x7FFFFFFF;
+
+      if (active_ints >> 15) & 1 != 0 {
+        self.pc = self.mem_read32(0xFF * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 14) & 1 != 0 {
+        self.pc = self.mem_read32(0xFE * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 13) & 1 != 0 {
+        self.pc = self.mem_read32(0xFD * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 12) & 1 != 0 {
+        self.pc = self.mem_read32(0xFC * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 11) & 1 != 0 {
+        self.pc = self.mem_read32(0xFB * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 10) & 1 != 0 {
+        self.pc = self.mem_read32(0xFA * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 9) & 1 != 0 {
+        self.pc = self.mem_read32(0xF9 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 8) & 1 != 0{
+        self.pc = self.mem_read32(0xF8 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 7) & 1 != 0 {
+        self.pc = self.mem_read32(0xF7 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 6) & 1 != 0 {
+        self.pc = self.mem_read32(0xF6 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 5) & 1 != 0 {
+        self.pc = self.mem_read32(0xF5 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 4) & 1 != 0 {
+        self.pc = self.mem_read32(0xF4 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 3) & 1 != 0 {
+        self.pc = self.mem_read32(0xF3 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 2) & 1 != 0 {
+        self.pc = self.mem_read32(0xF2 * 4).expect("this address shouldn't error");
+      } else if (active_ints >> 1) & 1 != 0 {
+        self.pc = self.mem_read32(0xF1 * 4).expect("this address shouldn't error");
+      } else if active_ints & 1 != 0 {
+        self.pc = self.mem_read32(0xF0 * 4).expect("this address shouldn't error");
+      }
+    }
   }
 
   fn execute(&mut self, instr : u32) {
@@ -545,11 +646,18 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = self.mem_read32(addr);
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read32(addr) {
+          data
+        } else{
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write32(addr, data);
+      if !self.mem_write32(addr, data) {
+        return;
+      }
     }
 
     if y == 1 || y == 2 {
@@ -970,6 +1078,9 @@ impl Emulator {
     if !self.kmode {
       // exec_priv
     }
+
+    assert!(self.cregfile[0] > 0);
+
     let op = (instr >> 12) & 0x1F;
 
     match op {
@@ -987,9 +1098,10 @@ impl Emulator {
     let rb = (instr >> 27) & 0x1F;
 
     let rb = self.regfile[rb as usize];
+    // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
       // tlbr
-      if let Some(val) = self.tlb.read(rb & 0xFFFFF000) {
+      if let Some(val) = self.tlb.read(rb) {
         self.regfile[ra as usize] = val;
       } else {
         self.regfile[ra as usize] = 0;
@@ -997,7 +1109,7 @@ impl Emulator {
     } else if op == 1 {
       // tlbw
       let ra = self.regfile[ra as usize];
-      self.tlb.write(rb & 0xFFFFF000, ra & 0xF);
+      self.tlb.write(rb, ra & 0x3F);
     } else {
       // tlbc
       self.tlb.clear();
@@ -1005,15 +1117,55 @@ impl Emulator {
   }
 
   fn crmv_op(&mut self, instr : u32) {
-    
+    let op = (instr >> 10) & 3;
+    let ra = (instr >> 22) & 0x1F;
+    let rb = (instr >> 27) & 0x1F;
+
+    // rb has tid (12 bits) | addr (20 bits)
+    if op == 0 {
+      // crmv crA, rB
+      let rb = self.regfile[rb as usize];
+      self.cregfile[ra as usize] = rb;
+    } else if op == 1 {
+      // crmv rA, crB
+      let rb = self.cregfile[rb as usize];
+      self.regfile[ra as usize] = rb;
+    } else {
+      // crmv crA, crB
+      let rb = self.cregfile[rb as usize];
+      self.cregfile[ra as usize] = rb;
+    }
   }
 
   fn mode_op(&mut self, instr : u32) {
-    
+    let op = (instr >> 10) & 3;
+
+    // rb has tid (12 bits) | addr (20 bits)
+    if op == 0 {
+      // mode run
+    } else if op == 1 {
+      // mode sleep
+      self.asleep = true;
+    } else {
+      // mode halt
+      self.halted = true;
+    }
   }
 
-  fn rfe(&mut self, instr : u32) {
-    
-    
+  fn rfe(&mut self, _instr : u32) {
+    // update kernel mode
+    self.cregfile[0] -= 1;
+    if self.cregfile[0] == 0 {
+      self.kmode = false;
+    }
+
+    // restore flags
+    self.flags[3] = if (self.cregfile[5] >> 3) & 1 != 0 {true} else {false};
+    self.flags[2] = if (self.cregfile[5] >> 2) & 1 != 0 {true} else {false};
+    self.flags[1] = if (self.cregfile[5] >> 1) & 1 != 0 {true} else {false};
+    self.flags[0] = if (self.cregfile[5] >> 0) & 1 != 0 {true} else {false};
+
+    // restore pc
+    self.pc = self.cregfile[4];
   }
 }

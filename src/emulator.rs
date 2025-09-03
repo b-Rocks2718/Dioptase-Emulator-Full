@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+#[derive(Debug)]
 pub struct RandomCache {
     table : HashMap<u32, u32>,
     size : usize,
@@ -124,14 +125,14 @@ impl Emulator {
       if addr < 0x30000 {
         Some(addr)
       } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        Some(result)
+        Some((result << 12) | (addr & 0xFFF))
       } else {
         // TLB_KMISS
         None
       }
     } else {
       if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        Some(result)
+        Some((result << 12) | (addr & 0xFFF))
       } else {
         // TLB_UMISS
         None
@@ -162,10 +163,6 @@ impl Emulator {
   fn save_state(&mut self){
     // save state as an interrupt happens
 
-    // enter kernel mode
-    self.cregfile[0] += 1;
-    self.kmode = true;
-
     // save pc and flags
     self.cregfile[4] = self.pc;
     self.cregfile[5] = 
@@ -188,8 +185,12 @@ impl Emulator {
     self.save_state();
 
     if self.kmode {
+      self.kmode = true;
+      self.cregfile[0] += 1;
       self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
     } else {
+      self.kmode = true;
+      self.cregfile[0] += 1;
       self.pc = self.mem_read32(0x82 * 4).expect("shouldnt fail");
     }
   }
@@ -239,11 +240,19 @@ impl Emulator {
   }
 
   fn mem_read16(&mut self, addr: u32) -> Option<u16> {
+    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) {
+      return None;
+    }
     self.mem_read8(addr).zip(self.mem_read8(addr + 1))
         .map(|(lo, hi)| (u16::from(hi) << 8) | u16::from(lo))
   }
 
   fn mem_read32(&mut self, addr: u32) -> Option<u32> {
+    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) ||
+       !self.is_addr_valid(addr + 2) || !self.is_addr_valid(addr + 3) {
+      return None;
+    }
+
     self.mem_read16(addr).zip(self.mem_read16(addr + 2))
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
@@ -256,6 +265,8 @@ impl Emulator {
         let instr = self.mem_read32(self.pc);
         if let Some(instr) = instr {
           self.execute(instr);
+        } else {
+          self.raise_tlb_miss(self.pc);
         }
       }
       if max_iters != 0 && count > max_iters {
@@ -277,6 +288,10 @@ impl Emulator {
       }
 
       self.save_state();
+
+      // enter kernel mode
+      self.cregfile[0] += 1;
+      self.kmode = true;
 
       if (active_ints >> 15) & 1 != 0 {
         self.pc = self.mem_read32(0xFF * 4).expect("this address shouldn't error");
@@ -314,6 +329,18 @@ impl Emulator {
     }
   }
 
+  fn raise_exc_instr(&mut self){
+    // exec_instr
+
+    self.save_state();
+
+    self.kmode = true;
+    self.cregfile[0] += 1;
+
+    self.pc = self.mem_read32(0x80 * 4).expect("shouldn't fail");
+    return;
+  }
+
   fn execute(&mut self, instr : u32) {
     let opcode = instr >> 27; // opcode is top 5 bits of instruction
 
@@ -335,7 +362,7 @@ impl Emulator {
       14 => self.branch_relative(instr),
       15 => self.syscall(instr),
       31 => self.kernel_instr(instr),
-      _ => panic!("Unrecognized opcode")
+      _ => self.raise_exc_instr(),
     }
   }
 
@@ -479,7 +506,10 @@ impl Emulator {
 
         result as u32
       },
-      _ => panic!("Invalid opcode")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     };
 
     // never update r0
@@ -493,21 +523,24 @@ impl Emulator {
 
   }
 
-  fn decode_alu_imm(op : u32, imm : u32) -> u32 {
+  fn decode_alu_imm(&mut self, op : u32, imm : u32) -> Option<u32> {
     match op {
       0..=6 => {
         // Bitwise op
-        (imm & 0xFF) << (8 * ((imm >> 8) & 3))
+        Some((imm & 0xFF) << (8 * ((imm >> 8) & 3)))
       },
       7..=13 => {
         // Shift op
-        imm & 0x1F
+        Some(imm & 0x1F)
       },
       14..=18 => {
         // Arithmetic op
-        imm | (0xFFFFF000 * ((imm >> 11) & 1)) // sign extend
+        Some(imm | (0xFFFFF000 * ((imm >> 11) & 1))) // sign extend
       },
-      _ => panic!("Unrecognized ALU operation")
+      _ => {
+        self.raise_exc_instr();
+        return None
+      }
     }
   }
 
@@ -520,7 +553,14 @@ impl Emulator {
     let op = (instr >> 12) & 0x1F;
     let imm = instr & 0xFFF;
 
-    let imm = Self::decode_alu_imm(op, imm);
+    let imm = self.decode_alu_imm(op, imm);
+
+    if let Some(_) = imm {} 
+    else {
+      return;
+    }
+
+    let imm = imm.unwrap();
 
     // retrieve arguments
     let r_b = self.regfile[r_b as usize];
@@ -652,7 +692,10 @@ impl Emulator {
 
         result as u32
       },
-      _ => panic!("Invalid opcode")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     };
 
     // never update r0
@@ -694,7 +737,10 @@ impl Emulator {
     // shift imm
     let imm = imm << z;
 
-    if y >= 4 {panic!("y must be in range 0..=3 for memory instruction")};
+    if y >= 4 {
+      self.raise_exc_instr();
+      return;
+    };
 
     // get addr
     let r_b_out = self.regfile[r_b as usize];
@@ -825,7 +871,10 @@ impl Emulator {
     // shift imm
     let imm = imm << z;
 
-    if y >= 4 {panic!("y must be in range 0..=3 for memory instruction")};
+    if y >= 4 {
+      self.raise_exc_instr();
+      return;
+    };
 
     // get addr
     let r_b_out = self.regfile[r_b as usize];
@@ -956,7 +1005,10 @@ impl Emulator {
     // shift imm
     let imm = imm << z;
 
-    if y >= 4 {panic!("y must be in range 0..=3 for memory instruction")};
+    if y >= 4 {
+      self.raise_exc_instr();
+      return;
+    };
 
     // get addr
     let r_b_out = self.regfile[r_b as usize];
@@ -1100,7 +1152,10 @@ impl Emulator {
       16 => self.flags[0] || self.flags[1], // bae
       17 => !self.flags[0] && !self.flags[1], // bb
       18 => !self.flags[0] || self.flags[1], // bbe
-      _ => panic!("Unrecognized branch instruction")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     };
 
     if branch {
@@ -1142,7 +1197,10 @@ impl Emulator {
       16 => self.flags[0] || self.flags[1], // bae
       17 => !self.flags[0] && !self.flags[1], // bb
       18 => !self.flags[0] || self.flags[1], // bbe
-      _ => panic!("Unrecognized branch instruction")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     };
 
     if branch {
@@ -1184,7 +1242,10 @@ impl Emulator {
       16 => self.flags[0] || self.flags[1], // bae
       17 => !self.flags[0] && !self.flags[1], // bb
       18 => !self.flags[0] || self.flags[1], // bbe
-      _ => panic!("Unrecognized branch instruction")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     };
 
     if branch {
@@ -1198,11 +1259,17 @@ impl Emulator {
   fn syscall(&mut self, instr : u32){
     let imm = instr & 0xFF;
 
+    self.kmode = true;
+    self.cregfile[0] += 1;
+
     match imm {
       0 => {
         self.pc = self.mem_read32(0x00 * 4).expect("shouldnt fail");
       }
-      _ => panic!("Unrecognized syscall")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     }
   }
 
@@ -1223,6 +1290,15 @@ impl Emulator {
   fn kernel_instr(&mut self, instr : u32){
     if !self.kmode {
       // exec_priv
+      assert!(self.cregfile[0] == 0);
+
+      self.save_state();
+
+      self.kmode = true;
+      self.cregfile[0] += 1;
+
+      self.pc = self.mem_read32(0x81 * 4).expect("shouldn't fail");
+      return;
     }
 
     assert!(self.cregfile[0] > 0);
@@ -1234,14 +1310,17 @@ impl Emulator {
       1 => self.crmv_op(instr),
       2 => self.mode_op(instr),
       3 => self.rfe(instr),
-      _ => panic!("Unrecognized opcode")
+      _ => {
+        self.raise_exc_instr();
+        return;
+      }
     }
   }
 
   fn tlb_op(&mut self, instr : u32) {
     let op = (instr >> 10) & 3;
     let ra = (instr >> 22) & 0x1F;
-    let rb = (instr >> 27) & 0x1F;
+    let rb = (instr >> 17) & 0x1F;
 
     let rb = self.regfile[rb as usize];
     // rb has tid (12 bits) | addr (20 bits)
@@ -1260,12 +1339,13 @@ impl Emulator {
       // tlbc
       self.tlb.clear();
     }
+    self.pc += 4;
   }
 
   fn crmv_op(&mut self, instr : u32) {
     let op = (instr >> 10) & 3;
     let ra = (instr >> 22) & 0x1F;
-    let rb = (instr >> 27) & 0x1F;
+    let rb = (instr >> 17) & 0x1F;
 
     // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
@@ -1281,6 +1361,7 @@ impl Emulator {
       let rb = self.cregfile[rb as usize];
       self.cregfile[ra as usize] = rb;
     }
+    self.pc += 4;
   }
 
   fn mode_op(&mut self, instr : u32) {
@@ -1296,22 +1377,29 @@ impl Emulator {
       // mode halt
       self.halted = true;
     }
+    self.pc += 4;
   }
 
-  fn rfe(&mut self, _instr : u32) {
+  fn rfe(&mut self, instr : u32) {
     // update kernel mode
     self.cregfile[0] -= 1;
     if self.cregfile[0] == 0 {
       self.kmode = false;
     }
 
+    let ra = (instr >> 22) & 0x1F;
+    let rb = (instr >> 17) & 0x1F;
+
+    let ra = self.regfile[ra as usize];
+    let rb = self.regfile[rb as usize];
+
     // restore flags
-    self.flags[3] = if (self.cregfile[5] >> 3) & 1 != 0 {true} else {false};
-    self.flags[2] = if (self.cregfile[5] >> 2) & 1 != 0 {true} else {false};
-    self.flags[1] = if (self.cregfile[5] >> 1) & 1 != 0 {true} else {false};
-    self.flags[0] = if (self.cregfile[5] >> 0) & 1 != 0 {true} else {false};
+    self.flags[3] = if (ra >> 3) & 1 != 0 {true} else {false};
+    self.flags[2] = if (ra >> 2) & 1 != 0 {true} else {false};
+    self.flags[1] = if (ra >> 1) & 1 != 0 {true} else {false};
+    self.flags[0] = if (ra >> 0) & 1 != 0 {true} else {false};
 
     // restore pc
-    self.pc = self.cregfile[4];
+    self.pc = rb;
   }
 }

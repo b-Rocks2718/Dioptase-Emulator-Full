@@ -258,3 +258,33 @@ fn call() {
 fn origin() {
   run_test("tests/asm/origin.s", 21);
 }
+
+#[test]
+fn tlbc() {
+  run_test("tests/asm/tlbc.s", 0);
+}
+
+#[test]
+fn tlbr() {
+  run_test("tests/asm/tlbr.s", 0xA);
+}
+
+#[test]
+fn tlbw() {
+  run_test("tests/asm/tlbw.s", 0x43);
+}
+
+#[test]
+fn kmiss() {
+  run_test("tests/asm/kmiss.s", 2);
+}
+
+#[test]
+fn priv_() {
+  run_test("tests/asm/priv.s", 0x15);
+}
+
+#[test]
+fn instr() {
+  run_test("tests/asm/instr.s", 0x16);
+}

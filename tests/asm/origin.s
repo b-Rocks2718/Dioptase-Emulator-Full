@@ -3,7 +3,7 @@
 EXIT:
   mode halt
 
-  .origin 0xF0
+  .origin 0x500
 _start:
   movi r3, 21
   sys EXIT

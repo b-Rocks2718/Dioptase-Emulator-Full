@@ -109,7 +109,7 @@ impl Emulator {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
-      cregfile: [0, 0, 0, 0, 0, 0, 0, 0],
+      cregfile: [1, 0, 0, 0, 0, 0, 0, 0],
       ram: instructions,
       tlb: RandomCache::new(8),
       pc: 0x400,
@@ -248,7 +248,8 @@ impl Emulator {
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
 
-  pub fn run(&mut self) -> u32 {
+  pub fn run(&mut self, max_iters : u32) -> Option<u32> {
+    let mut count = 0;
     while !self.halted {
       self.handle_interrupts();
       if !self.asleep{
@@ -257,10 +258,14 @@ impl Emulator {
           self.execute(instr);
         }
       }
+      if max_iters != 0 && count > max_iters {
+        return None;
+      }
+      count += 1;
     }
 
     // return the value in r3
-    self.regfile[3]
+    Some(self.regfile[3])
   }
 
   fn handle_interrupts(&mut self){
@@ -1195,8 +1200,7 @@ impl Emulator {
 
     match imm {
       0 => {
-        // sys EXIT
-        self.halted = true;
+        self.pc = self.mem_read32(0x00 * 4).expect("shouldnt fail");
       }
       _ => panic!("Unrecognized syscall")
     }

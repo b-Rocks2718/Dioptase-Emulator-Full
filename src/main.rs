@@ -12,7 +12,7 @@ fn main() {
   if args.len() == 2 {
     // file to run is passed as a command line argument
     let mut cpu = Emulator::new(args[1].clone());
-    let result = cpu.run();
+    let result = cpu.run(0).unwrap();
     println!("{:08x}", result);
   } else {
     println!("Usage: cargo run -- file.hex");

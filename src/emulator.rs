@@ -119,62 +119,122 @@ impl Emulator {
     }
   }
 
-  fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
-    let addr = if self.kmode {
+  fn convert_mem_address(&self, addr : u32) -> Option<u32> {
+    if self.kmode {
       if addr < 0x30000 {
-        addr
+        Some(addr)
       } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        result
+        Some(result)
       } else {
         // TLB_KMISS
-        return false;
+        None
       }
     } else {
       if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        result
+        Some(result)
       } else {
         // TLB_UMISS
-        return false;
+        None
       }
-    };
+    }
+  }
 
-    self.ram.insert(addr, data);
-    return true;
+  fn is_addr_valid(&self, addr : u32) -> bool {
+    if self.kmode {
+      if addr < 0x30000 {
+        true
+      } else if let Some(_) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        true
+      } else {
+        // TLB_KMISS
+        false
+      }
+    } else {
+      if let Some(_) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
+        true
+      } else {
+        // TLB_UMISS
+        false
+      }
+    }
+  }
+
+  fn save_state(&mut self){
+    // save state as an interrupt happens
+
+    // enter kernel mode
+    self.cregfile[0] += 1;
+    self.kmode = true;
+
+    // save pc and flags
+    self.cregfile[4] = self.pc;
+    self.cregfile[5] = 
+      ((self.flags[3] as u32) << 3) |
+      ((self.flags[2] as u32) << 2) |
+      ((self.flags[1] as u32) << 1) |
+      (self.flags[0] as u32);
+
+    // disable interrupts
+    self.cregfile[3] &= 0x7FFFFFFF;
+  }
+
+  fn raise_tlb_miss(&mut self, addr : u32) {
+    // TLB_UMISS = 0x82
+    // TLB_KMISS = 0x83
+
+    // save address and pid that caused exception
+    self.cregfile[7] = (addr >> 12) | (self.cregfile[1] << 20);
+
+    self.save_state();
+
+    if self.kmode {
+      self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
+    } else {
+      self.pc = self.mem_read32(0x82 * 4).expect("shouldnt fail");
+    }
+  }
+
+  fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
+    let addr = self.convert_mem_address(addr);
+
+    if let Some(addr) = addr {
+      self.ram.insert(addr, data);
+      true
+    } else {
+      false
+    }
   }
 
   fn mem_write16(&mut self, addr : u32, data : u16) -> bool {
+    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) {
+      return false;
+    }
+
     self.mem_write8(addr, data as u8) &&
     self.mem_write8(addr + 1, (data >> 8) as u8)
   }
 
   fn mem_write32(&mut self, addr : u32, data : u32) -> bool {
+    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) ||
+       !self.is_addr_valid(addr + 2) || !self.is_addr_valid(addr + 3) {
+      return false;
+    }
+
     self.mem_write16(addr, data as u16) &&
     self.mem_write16(addr + 2, (data >> 16) as u16)
   }
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
-    let addr = if self.kmode {
-      if addr < 0x30000 {
-        addr
-      } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        result
-      } else {
-        // TLB_KMISS
-        return None;
-      }
-    } else {
-      if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        result
-      } else {
-        // TLB_UMISS
-        return None;
-      }
-    };
+    let addr = self.convert_mem_address(addr);
 
-    if self.ram.contains_key(&addr) {
-      Some(self.ram[&addr])
+    if let Some(addr) = addr {
+      if self.ram.contains_key(&addr) {
+        Some(self.ram[&addr])
+      } else {
+        Some(0)
+      }
     } else {
-      Some(0)
+      None
     }
   }
 
@@ -207,21 +267,11 @@ impl Emulator {
     if self.cregfile[3] >> 31 != 0 {
       // top bit activates/disables all interrupts
       let active_ints = self.cregfile[3] & self.cregfile[2];
-      if active_ints != 0 {
-        self.cregfile[0] += 1;
-        self.kmode = true;
+      if active_ints == 0 {
+        return;
       }
 
-      // save pc and flags
-      self.cregfile[4] = self.pc;
-      self.cregfile[5] = 
-        ((self.flags[3] as u32) << 3) |
-        ((self.flags[2] as u32) << 2) |
-        ((self.flags[1] as u32) << 1) |
-        (self.flags[0] as u32);
-
-      // disable interrupts
-      self.cregfile[3] &= 0x7FFFFFFF;
+      self.save_state();
 
       if (active_ints >> 15) & 1 != 0 {
         self.pc = self.mem_read32(0xFF * 4).expect("this address shouldn't error");
@@ -650,12 +700,16 @@ impl Emulator {
         if let Some(data) = self.mem_read32(addr) {
           data
         } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
           return;
         };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
       if !self.mem_write32(addr, data) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
         return;
       }
     }
@@ -690,11 +744,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = self.mem_read32(addr);
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read32(addr) {
+          data
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write32(addr, data);
+      if !self.mem_write32(addr, data) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -717,11 +782,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = self.mem_read32(addr);
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read32(addr) {
+          data
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write32(addr, data);
+      if !self.mem_write32(addr, data) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -751,11 +827,22 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read16(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read16(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write16(addr, data as u16);
+      if !self.mem_write16(addr, data as u16) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     if y == 1 || y == 2 {
@@ -788,11 +875,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read16(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read16(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write16(addr, data as u16);
+      if !self.mem_write16(addr, data as u16) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -815,11 +913,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read16(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read16(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write16(addr, data as u16);
+      if !self.mem_write16(addr, data as u16) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -849,11 +958,22 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read8(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read8(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write8(addr, data as u8);
+      if !self.mem_write8(addr, data as u8) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     if y == 1 || y == 2 {
@@ -886,11 +1006,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read8(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read8(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write8(addr, data as u8);
+      if !self.mem_write8(addr, data as u8) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -913,11 +1044,22 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = u32::from(self.mem_read8(addr));
+      self.regfile[r_a as usize] = 
+        if let Some(data) = self.mem_read8(addr) {
+          u32::from(data)
+        } else{
+          // TLB Miss
+          self.raise_tlb_miss(addr);
+          return;
+        };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
-      self.mem_write8(addr, data as u8);
+      if !self.mem_write8(addr, data as u8) {
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      }
     }
 
     self.pc += 4;
@@ -1049,7 +1191,7 @@ impl Emulator {
   }
 
   fn syscall(&mut self, instr : u32){
-    let imm = instr & 0x7F;
+    let imm = instr & 0xFF;
 
     match imm {
       0 => {

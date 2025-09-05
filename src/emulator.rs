@@ -3,6 +3,12 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use crate::memory::Memory;
+use crate::graphics::Graphics;
+
 #[derive(Debug)]
 pub struct RandomCache {
     table : HashMap<u32, u32>,
@@ -50,12 +56,13 @@ pub struct Emulator {
   kmode : bool,
   regfile : [u32; 32],
   cregfile : [u32; 8],
-  ram : HashMap<u32, u8>,
+  memory : Memory,
   tlb : RandomCache,
   pc : u32,
   flags : [bool; 4], // flags are: carry | zero | sign | overflow
   asleep : bool,
-  halted : bool
+  halted : bool,
+  count : u32
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -103,6 +110,8 @@ impl Emulator {
 
       pc += 4;
     }
+
+    let mem: Memory = Memory::new(instructions);
     
     Emulator {
       kmode: true,
@@ -111,12 +120,13 @@ impl Emulator {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
       cregfile: [1, 0, 0, 0, 0, 0, 0, 0],
-      ram: instructions,
+      memory: mem,
       tlb: RandomCache::new(8),
       pc: 0x400,
       flags: [false, false, false, false],
       asleep: false,
-      halted: false
+      halted: false,
+      count: 0
     }
   }
 
@@ -199,7 +209,7 @@ impl Emulator {
     let addr = self.convert_mem_address(addr);
 
     if let Some(addr) = addr {
-      self.ram.insert(addr, data);
+      self.memory.write(addr, data);
       true
     } else {
       false
@@ -229,11 +239,7 @@ impl Emulator {
     let addr = self.convert_mem_address(addr);
 
     if let Some(addr) = addr {
-      if self.ram.contains_key(&addr) {
-        Some(self.ram[&addr])
-      } else {
-        Some(0)
-      }
+      Some(self.memory.read(addr))
     } else {
       None
     }
@@ -257,26 +263,60 @@ impl Emulator {
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
 
-  pub fn run(&mut self, max_iters : u32) -> Option<u32> {
-    let mut count = 0;
-    while !self.halted {
-      self.handle_interrupts();
-      if !self.asleep{
-        let instr = self.mem_read32(self.pc);
-        if let Some(instr) = instr {
-          self.execute(instr);
-        } else {
-          self.raise_tlb_miss(self.pc);
-        }
-      }
-      if max_iters != 0 && count > max_iters {
-        return None;
-      }
-      count += 1;
+  pub fn run(mut self, max_iters : u32, with_graphics : bool) -> Option<u32> {
+    let mut graphics: Option<Graphics> = None;
+    if with_graphics {
+      graphics = Some(Graphics::new(
+        self.memory.get_frame_buffer(), 
+        self.memory.get_tile_map(), 
+        self.memory.get_io_buffer(),
+        self.memory.get_vscroll_register(),
+        self.memory.get_hscroll_register(),
+        self.memory.get_sprite_map(),
+        self.memory.get_scale_register(),
+      ));
     }
 
+    // Return value and termination signal
+    let ret: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let finished: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
+    // Runs emulator on thread because graphics must use main thread
+    let handle = thread::spawn({
+      let ret_clone = Arc::clone(&ret);
+      let finished_clone = Arc::clone(&finished);
+      move || {
+        self.count = 0;
+        while !self.halted {
+          self.handle_interrupts();
+          if !self.asleep{
+            let instr = self.mem_read32(self.pc);
+            if let Some(instr) = instr {
+              self.execute(instr);
+            } else {
+              self.raise_tlb_miss(self.pc);
+            }
+          }
+          if max_iters != 0 && self.count > max_iters {
+            return;
+          }
+          self.count += 1;
+        }
+
+        // return the value in r3
+        *ret_clone.lock().unwrap() = Some(self.regfile[3]);
+        *finished_clone.lock().unwrap() = true;
+      }
+    });
+
+    if with_graphics {
+      graphics.unwrap().start(finished, false);
+    }
+
+    handle.join().unwrap();
+
     // return the value in r3
-    Some(self.regfile[3])
+    return *ret.lock().unwrap();
   }
 
   fn handle_interrupts(&mut self){

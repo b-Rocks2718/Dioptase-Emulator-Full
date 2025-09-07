@@ -81,13 +81,14 @@ impl Graphics {
                     state, .. }), _) => {
                     match state {
                         ButtonState::Press => {
-                            self.io_buffer.write().unwrap().push_back(key as u16);
-                            // println!("Key pressed: {:?}", key);
                             // Handle key press here
+                            self.io_buffer.write().unwrap().push_back(key as u16 & 0xFF);
+                            //println!("Key pressed: {:?}", key);
                         }
                         ButtonState::Release => {
-                            // println!("Key released: {:?}", key);
                             // Handle key release here
+                            self.io_buffer.write().unwrap().push_back(key as u16 & 0xFF | 0x100);
+                            //println!("Key released: {:?}", key);
                         }
                     }
                 }

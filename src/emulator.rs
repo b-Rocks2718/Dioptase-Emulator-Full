@@ -291,6 +291,7 @@ impl Emulator {
           self.handle_interrupts();
           if !self.asleep{
             let instr = self.mem_read32(self.pc);
+
             if let Some(instr) = instr {
               self.execute(instr);
             } else {
@@ -332,6 +333,9 @@ impl Emulator {
       // enter kernel mode
       self.cregfile[0] += 1;
       self.kmode = true;
+
+      // disable interrupts
+      self.cregfile[3] &= 0x7FFFFFFF;
 
       if (active_ints >> 15) & 1 != 0 {
         self.pc = self.mem_read32(0xFF * 4).expect("this address shouldn't error");
@@ -787,7 +791,8 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read32(addr) {
           data
         } else{
@@ -795,6 +800,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -805,7 +811,7 @@ impl Emulator {
       }
     }
 
-    if y == 1 || y == 2 {
+    if (y == 1 || y == 2) && (r_b != 0) {
       // pre or post increment
       self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
     }
@@ -835,7 +841,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read32(addr) {
           data
         } else{
@@ -843,6 +850,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -873,7 +881,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read32(addr) {
           data
         } else{
@@ -881,6 +890,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -921,7 +931,8 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read16(addr) {
           u32::from(data)
         } else{
@@ -929,6 +940,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -939,7 +951,7 @@ impl Emulator {
       }
     }
 
-    if y == 1 || y == 2 {
+    if y == 1 || y == 2 && (r_b != 0) {
       // pre or post increment
       self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
     }
@@ -969,7 +981,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read16(addr) {
           u32::from(data)
         } else{
@@ -977,6 +990,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1007,7 +1021,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read16(addr) {
           u32::from(data)
         } else{
@@ -1015,6 +1030,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1055,7 +1071,8 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read8(addr) {
           u32::from(data)
         } else{
@@ -1063,6 +1080,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1073,7 +1091,7 @@ impl Emulator {
       }
     }
 
-    if y == 1 || y == 2 {
+    if (y == 1 || y == 2) && (r_b != 0) {
       // pre or post increment
       self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
     }
@@ -1103,7 +1121,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read8(addr) {
           u32::from(data)
         } else{
@@ -1111,6 +1130,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1141,7 +1161,8 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      self.regfile[r_a as usize] = 
+      if r_a != 0 {
+        self.regfile[r_a as usize] = 
         if let Some(data) = self.mem_read8(addr) {
           u32::from(data)
         } else{
@@ -1149,6 +1170,7 @@ impl Emulator {
           self.raise_tlb_miss(addr);
           return;
         };
+      }
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1244,7 +1266,9 @@ impl Emulator {
     };
 
     if branch {
-      self.regfile[r_a as usize] = self.pc + 4;
+      if r_a != 0 {
+        self.regfile[r_a as usize] = self.pc + 4;
+      }
       self.pc = r_b;
     } else {
       self.pc += 4;
@@ -1289,7 +1313,9 @@ impl Emulator {
     };
 
     if branch {
-      self.regfile[r_a as usize] = self.pc + 4;
+      if r_a != 0 {
+        self.regfile[r_a as usize] = self.pc + 4;
+      }
       self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4, r_b));
     } else {
       self.pc += 4;
@@ -1366,10 +1392,12 @@ impl Emulator {
     // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
       // tlbr
-      if let Some(val) = self.tlb.read(rb) {
-        self.regfile[ra as usize] = val;
-      } else {
-        self.regfile[ra as usize] = 0;
+      if ra != 0 {
+        if let Some(val) = self.tlb.read(rb) {
+          self.regfile[ra as usize] = val;
+        } else {
+          self.regfile[ra as usize] = 0;
+        }
       }
     } else if op == 1 {
       // tlbw
@@ -1394,8 +1422,10 @@ impl Emulator {
       self.cregfile[ra as usize] = rb;
     } else if op == 1 {
       // crmv rA, crB
-      let rb = self.cregfile[rb as usize];
-      self.regfile[ra as usize] = rb;
+      if ra != 0 {
+        let rb = self.cregfile[rb as usize];
+        self.regfile[ra as usize] = rb;
+      }
     } else {
       // crmv crA, crB
       let rb = self.cregfile[rb as usize];
@@ -1425,6 +1455,12 @@ impl Emulator {
     self.cregfile[0] -= 1;
     if self.cregfile[0] == 0 {
       self.kmode = false;
+    }
+
+    if ((instr >> 1) & 1) == 1 {
+      // was rfi
+      // re-enable interrupts
+      self.cregfile[3] |= 0x10000000;
     }
 
     let ra = (instr >> 22) & 0x1F;

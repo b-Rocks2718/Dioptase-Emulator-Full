@@ -22,6 +22,7 @@ const FRAME_BUFFER_START : u32 = 0x2E000;
 const FRAME_BUFFER_SIZE : u32 = 0x2000;
 const PS2_STREAM : u32 = 0x20000;
 const UART_TX : u32 = 0x20002;
+pub const PIT_START : u32 = 0x20004;
 const V_SCROLL_START : u32 = 0x2FFFE;
 const H_SCROLL_START : u32 = 0x2FFFC;
 const SCALE_REGISTER_START : u32 = 0x2FFFB; // each pixel is repeated 2^n times
@@ -38,6 +39,7 @@ pub struct Memory {
   vscroll_register: Arc<RwLock<(u8, u8)>>,
   hscroll_register: Arc<RwLock<(u8, u8)>>,
   scale_register: Arc<RwLock<u8>>,
+  pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
 }
 
@@ -79,6 +81,7 @@ impl Memory {
             vscroll_register: Arc::new(RwLock::new((0, 0))),
             hscroll_register: Arc::new(RwLock::new((0, 0))),
             scale_register: Arc::new(RwLock::new(0)),
+            pit: Arc::new(RwLock::new((0, 0, 0, 0))),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE)))
         }
     }
@@ -128,6 +131,18 @@ impl Memory {
         if addr == UART_TX {
             panic!("attempting to read output port (address {})", UART_TX);
         }
+        if addr == PIT_START {
+            return self.pit.read().unwrap().0;
+        }
+        if addr == PIT_START + 1 {
+            return self.pit.read().unwrap().1;
+        }
+        if addr == PIT_START + 2 {
+            return self.pit.read().unwrap().2;
+        }
+        if addr == PIT_START + 3 {
+            return self.pit.read().unwrap().3;
+        }
 
         if self.ram.contains_key(&addr) {
             return self.ram[&addr];
@@ -170,6 +185,18 @@ impl Memory {
         }
         if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPIRTE_REGISTERS_SIZE {
             self.sprite_map.write().unwrap().set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
+        }
+        if addr == PIT_START {
+            self.pit.write().unwrap().0 = data;
+        }
+        if addr == PIT_START + 1 {
+            self.pit.write().unwrap().1 = data;
+        }
+        if addr == PIT_START + 2 {
+            self.pit.write().unwrap().2 = data;
+        }
+        if addr == PIT_START + 3 {
+            self.pit.write().unwrap().3 = data;
         }
         if addr == 0 {
             println!("Writing to address 0x0000: 0x{:04X}", data);

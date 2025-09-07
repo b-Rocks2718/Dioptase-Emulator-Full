@@ -11,14 +11,24 @@
 
   .define USER_PID 1
 
+EXIT:
+  mode halt
+
+INT_KEYBOARD:
+  mode halt
+
+INT_TIMER:
+  mode halt
+
 _start:
   call init_tlb
   movi r4, 1
   mov  pid, r4 # set pid to 1
-  rfe  r0, r0 # jump to userland
 
-EXIT:
-  mode halt
+  # enable interrupts
+  movi r2, 0xFFFFFFFF
+
+  rfe  r0, r0 # jump to userland
 
 init_tlb:
   movi r3, USER_PID

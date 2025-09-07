@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::memory::Memory;
+use crate::memory::{Memory, PIT_START};
 use crate::graphics::Graphics;
 
 #[derive(Debug)]
@@ -62,6 +62,7 @@ pub struct Emulator {
   flags : [bool; 4], // flags are: carry | zero | sign | overflow
   asleep : bool,
   halted : bool,
+  timer : u32,
   count : u32
 }
 
@@ -126,6 +127,7 @@ impl Emulator {
       flags: [false, false, false, false],
       asleep: false,
       halted: false,
+      timer: 0,
       count: 0
     }
   }
@@ -288,6 +290,7 @@ impl Emulator {
       move || {
         self.count = 0;
         while !self.halted {
+          self.check_for_interrupts();
           self.handle_interrupts();
           if !self.asleep{
             let instr = self.mem_read32(self.pc);
@@ -320,10 +323,43 @@ impl Emulator {
     return *ret.lock().unwrap();
   }
 
+  fn check_for_interrupts(&mut self) {
+
+    // check if io buf is nonempty
+    let binding = self.memory.get_io_buffer();
+    let io_buf = binding.read().unwrap();
+
+    if !io_buf.is_empty() {
+      // cause a keyboard interrupt
+      self.cregfile[2] |= 2;
+    }
+
+    // check for timer interrupt
+    if self.timer == 0 {
+      // check if timer was set
+      let old_kmode = self.kmode;
+      self.kmode = true;
+      let v = self.mem_read32(PIT_START).unwrap();
+      self.kmode = old_kmode;
+      if v != 0 {
+        // reset timer
+        self.timer = v;
+
+        // trigger timer interrupt
+        self.cregfile[2] |= 1;
+      }
+    } else {
+      self.timer -= 1;
+    }
+  }
+
   fn handle_interrupts(&mut self){
     if self.cregfile[3] >> 31 != 0 {
       // top bit activates/disables all interrupts
       let active_ints = self.cregfile[3] & self.cregfile[2];
+
+      println!("{}", active_ints);
+
       if active_ints == 0 {
         return;
       }

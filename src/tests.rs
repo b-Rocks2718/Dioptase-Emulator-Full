@@ -288,3 +288,13 @@ fn priv_() {
 fn instr() {
   run_test("tests/asm/instr.s", 0x16);
 }
+
+#[test]
+fn rfe() {
+  run_test("tests/asm/rfe.s", 0x44);
+}
+
+#[test]
+fn rfi() {
+  run_test("tests/asm/rfi.s", 0x10000044);
+}

@@ -1505,7 +1505,7 @@ impl Emulator {
       self.kmode = false;
     }
 
-    if ((instr >> 1) & 1) == 1 {
+    if ((instr >> 11) & 1) == 1 {
       // was rfi
       // re-enable interrupts
       self.cregfile[3] |= 0x10000000;

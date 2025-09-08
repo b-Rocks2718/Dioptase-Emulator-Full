@@ -214,5 +214,5 @@ draw_square:
   or   r3, r4, r3
   mov  imr, r3
 
-inf_loop:
-  jmp  inf_loop
+  # wait for keypress
+  mode sleep

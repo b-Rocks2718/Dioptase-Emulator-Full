@@ -367,6 +367,9 @@ impl Emulator {
 
       self.save_state();
 
+      // undo sleep
+      self.asleep = false;
+
       // enter kernel mode
       self.cregfile[0] += 1;
       self.kmode = true;

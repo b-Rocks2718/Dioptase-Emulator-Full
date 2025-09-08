@@ -19,7 +19,7 @@ const SPRITE_DATA_SIZE: u32 = SPRITE_SIZE * SPRITE_SIZE * 2;
 const TILE_MAP_START : u32 = 0x2A000;
 const TILE_MAP_SIZE : u32 = 0x4000;
 const FRAME_BUFFER_START : u32 = 0x2E000;
-const FRAME_BUFFER_SIZE : u32 = 0x2000;
+const FRAME_BUFFER_SIZE : u32 = 0x1FD0;
 const PS2_STREAM : u32 = 0x20000;
 const UART_TX : u32 = 0x20002;
 pub const PIT_START : u32 = 0x20004;
@@ -29,7 +29,7 @@ const SCALE_REGISTER_START : u32 = 0x2FFFB; // each pixel is repeated 2^n times
 const SPRITE_MAP_START : u32 = 0x26000;
 const SPRITE_MAP_SIZE : u32 = 0x4000;
 const SPRITE_REGISTERS_START : u32 = 0x2FFD0;  // every consecutive pair of words correspond to 
-const SPIRTE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
+const SPRITE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
 
 pub struct Memory {
   ram: HashMap<u32, u8>,   
@@ -102,16 +102,18 @@ impl Memory {
             return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
         }
         if addr == PS2_STREAM {
+            // kind of a hack but this assumed people always read a double from ps2 stream
             return self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() as u8;
         }
         if addr == PS2_STREAM + 1 {
-            return (self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() >> 8) as u8;
+            // read of upper byte will cause a pop
+            return (self.io_buffer.write().unwrap().pop_front().unwrap_or(0).clone() >> 8) as u8;
         }
         if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
-            return self.sprite_map.read().unwrap().get_sprite_word(addr - SPRITE_MAP_START);
+            return self.sprite_map.read().unwrap().get_sprite_byte(addr - SPRITE_MAP_START);
         }
-        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPIRTE_REGISTERS_SIZE {
-            return self.sprite_map.read().unwrap().get_sprite_reg(addr - SPRITE_REGISTERS_START);
+        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
+            return self.sprite_map.read().unwrap().get_sprite_reg((addr - SPRITE_REGISTERS_START) as u32);
         }
         if addr == V_SCROLL_START {
             return self.vscroll_register.read().unwrap().0;
@@ -129,7 +131,7 @@ impl Memory {
             return *self.scale_register.read().unwrap();
         }
         if addr == UART_TX {
-            panic!("attempting to read output port (address {})", UART_TX);
+            panic!("attempting to read output port (address {:X})", UART_TX);
         }
         if addr == PIT_START {
             return self.pit.read().unwrap().0;
@@ -181,9 +183,9 @@ impl Memory {
             *self.scale_register.write().unwrap() = data;
         }
         if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
-            self.sprite_map.write().unwrap().set_sprite_word((addr - SPRITE_MAP_START) as u32, data);
+            self.sprite_map.write().unwrap().set_sprite_byte((addr - SPRITE_MAP_START) as u32, data);
         }
-        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPIRTE_REGISTERS_SIZE {
+        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
             self.sprite_map.write().unwrap().set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
         }
         if addr == PIT_START {
@@ -279,8 +281,8 @@ impl TileMap {
 impl Sprite {
     pub fn invisible() -> Sprite {
         Sprite {
-            x: (0xFF, 0xFF),
-            y: (0xFF, 0xFF),
+            x: (50, 0),
+            y: (50, 0),
             pixels: vec![0xFF; SPRITE_DATA_SIZE as usize],
         }
     }
@@ -295,17 +297,17 @@ impl SpriteMap {
     }
 
     // this will get a single corrsponding pixel
-    pub fn get_sprite_word(&self, addr: u32) -> u8 {
+    pub fn get_sprite_byte(&self, addr: u32) -> u8 {
         return self.sprites[(addr / SPRITE_DATA_SIZE) as usize].pixels[(addr % SPRITE_DATA_SIZE) as usize];
     }
 
-    pub fn set_sprite_word(&mut self, addr: u32, data: u8) {
+    pub fn set_sprite_byte(&mut self, addr: u32, data: u8) {
         self.sprites[(addr / SPRITE_DATA_SIZE) as usize].pixels[(addr % SPRITE_DATA_SIZE) as usize] = data;
     }
 
-    // returns the either y or x coordinate of the sprite corresponding to the addr/2, addr%2
+    // returns the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
     pub fn get_sprite_reg(&self, addr: u32) -> u8 {
-        let sprite = &self.sprites[(addr / 2) as usize];
+        let sprite = &self.sprites[(addr / 4) as usize];
         if addr % 4 == 0 {
             return sprite.x.0;
         }
@@ -320,16 +322,16 @@ impl SpriteMap {
         }
     }
 
-    // sets the either y or x coordinate of the sprite corresponding to the addr/2, addr%2
+    // sets the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
     pub fn set_sprite_reg(&mut self, addr: u32, data: u8) {
-        let sprite = &mut self.sprites[(addr / 2) as usize];
-        if addr % 2 == 0 {
+        let sprite = &mut self.sprites[(addr / 4) as usize];
+        if addr % 4 == 0 {
             sprite.x.0 = data;
         } 
-        if addr % 2 == 1 {
+        if addr % 4 == 1 {
             sprite.x.1 = data;
         }
-        if addr % 2 == 3 {
+        if addr % 4 == 2 {
             sprite.y.0 = data;
         } 
         else {

@@ -296,5 +296,5 @@ fn rfe() {
 
 #[test]
 fn rfi() {
-  run_test("tests/asm/rfi.s", 0x10000044);
+  run_test("tests/asm/rfi.s", 0x80000044);
 }

@@ -137,10 +137,6 @@ key_q:
   sys  EXIT
 
 end:
-  # empty queue
-  movi r4, PS2_ADDR
-  swa  r0, [r4]
-
   # mark interrupt as handled
   mov  r4, isr
   movi r3, 0xFFFFFFFD
@@ -178,7 +174,7 @@ _start:
 
   # set timer
   movi r4, PIT_ADDR
-  movi r3, 5000
+  movi r3, 500000
   swa  r3, [r4]
 
   # set imr

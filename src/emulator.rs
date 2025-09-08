@@ -290,9 +290,9 @@ impl Emulator {
       move || {
         self.count = 0;
         while !self.halted {
-
           self.check_for_interrupts();
           self.handle_interrupts();
+
           if !self.asleep{
             let instr = self.mem_read32(self.pc);
 
@@ -1488,6 +1488,7 @@ impl Emulator {
     // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
       // mode run
+      self.pc += 4;
     } else if op == 1 {
       // mode sleep
       self.asleep = true;
@@ -1495,7 +1496,6 @@ impl Emulator {
       // mode halt
       self.halted = true;
     }
-    self.pc += 4;
   }
 
   fn rfe(&mut self, instr : u32) {
@@ -1508,7 +1508,7 @@ impl Emulator {
     if ((instr >> 11) & 1) == 1 {
       // was rfi
       // re-enable interrupts
-      self.cregfile[3] |= 0x10000000;
+      self.cregfile[3] |= 0x80000000;
     }
 
     let ra = (instr >> 22) & 0x1F;

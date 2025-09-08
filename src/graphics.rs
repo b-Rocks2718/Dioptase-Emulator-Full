@@ -149,7 +149,7 @@ impl Graphics {
         for sprite in &sprite_map.sprites {
             for px in 0..SPRITE_SIZE {
                 for py in 0..SPRITE_SIZE {
-                    let addr = (px + py * SPRITE_SIZE) as usize;
+                    let addr = (2 * px + py * SPRITE_SIZE) as usize;
                     let tile_pixel_low = sprite.pixels[addr];
                     let tile_pixel_high = sprite.pixels[addr + 1];
                     let red = (tile_pixel_low & 0x0f) as u8 * 16;
@@ -161,8 +161,8 @@ impl Graphics {
                     }
 
                     let pixel = Rgba([red, green, blue, 255]);
-                    let final_x: u32 = ((u32::from(sprite.x.1) << 8) | u32::from(sprite.x.0)) + px;
-                    let final_y: u32 = ((u32::from(sprite.y.1) << 8) | u32::from(sprite.y.0)) + py;
+                    let final_x: u32 = (u32::from(sprite.x.1) << 8) | (u32::from(sprite.x.0) + px);
+                    let final_y: u32 = (u32::from(sprite.y.1) << 8) | (u32::from(sprite.y.0) + py);
 
                     // print the pixel rgba in the physical screen
                     for i in 0..scale {

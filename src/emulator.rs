@@ -290,6 +290,7 @@ impl Emulator {
       move || {
         self.count = 0;
         while !self.halted {
+
           self.check_for_interrupts();
           self.handle_interrupts();
           if !self.asleep{
@@ -302,6 +303,8 @@ impl Emulator {
             }
           }
           if max_iters != 0 && self.count > max_iters {
+            *ret_clone.lock().unwrap() = None;
+            *finished_clone.lock().unwrap() = true;
             return;
           }
           self.count += 1;
@@ -357,8 +360,6 @@ impl Emulator {
     if self.cregfile[3] >> 31 != 0 {
       // top bit activates/disables all interrupts
       let active_ints = self.cregfile[3] & self.cregfile[2];
-
-      println!("{}", active_ints);
 
       if active_ints == 0 {
         return;
@@ -1366,6 +1367,14 @@ impl Emulator {
 
     match imm {
       0 => {
+        // save pc and flags
+        self.cregfile[4] = self.pc;
+        self.cregfile[5] = 
+          ((self.flags[3] as u32) << 3) |
+          ((self.flags[2] as u32) << 2) |
+          ((self.flags[1] as u32) << 1) |
+          (self.flags[0] as u32);
+
         self.pc = self.mem_read32(0x00 * 4).expect("shouldnt fail");
       }
       _ => {

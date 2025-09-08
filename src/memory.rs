@@ -102,10 +102,10 @@ impl Memory {
             return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
         }
         if addr == PS2_STREAM {
-            return self.io_buffer.write().unwrap().pop_front().unwrap_or(0) as u8;
+            return self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() as u8;
         }
         if addr == PS2_STREAM + 1 {
-            return (self.io_buffer.write().unwrap().pop_front().unwrap_or(0)  >> 8) as u8;
+            return (self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() >> 8) as u8;
         }
         if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
             return self.sprite_map.read().unwrap().get_sprite_word(addr - SPRITE_MAP_START);
@@ -159,7 +159,7 @@ impl Memory {
             self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
         }
         if addr == PS2_STREAM {
-            panic!("attempting to write to read input port (address {})", PS2_STREAM);
+            self.io_buffer.write().unwrap().pop_front();
         }
         if addr == UART_TX {
             print!("{}", data as char);

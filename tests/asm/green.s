@@ -9,12 +9,17 @@
   .define VRT_TILEMAP_ADDR 0x10000000
   .define VRT_FRAMEBUFFER_ADDR 0x20000000
 
+  .define PS2_ADDR 0x20000
+
   .define USER_PID 1
 
 EXIT:
   mode halt
 
 INT_KEYBOARD:
+  # return the character causing an interrupt
+  movi r4, PS2_ADDR
+  lda  r3, [r4]
   mode halt
 
 INT_TIMER:
@@ -26,7 +31,8 @@ _start:
   mov  pid, r4 # set pid to 1
 
   # enable interrupts
-  movi r2, 0xFFFFFFFF
+  movi r3, 0xFFFFFFFF
+  mov  cr3, r3
 
   rfe  r0, r0 # jump to userland
 

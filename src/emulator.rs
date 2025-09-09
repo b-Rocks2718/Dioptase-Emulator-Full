@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
+use std::cmp;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -293,7 +294,7 @@ impl Emulator {
           self.check_for_interrupts();
           self.handle_interrupts();
 
-          if !self.asleep{
+          if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(self.cregfile[6], 1), 1)) == 0) {
             let instr = self.mem_read32(self.pc);
 
             if let Some(instr) = instr {

@@ -298,3 +298,9 @@ fn rfe() {
 fn rfi() {
   run_test("tests/asm/rfi.s", 0x80000044);
 }
+
+#[test]
+fn tlb_reg() {
+  run_test("tests/asm/tlb_reg.s", 0x000fffff);
+}
+

@@ -1369,7 +1369,9 @@ impl Emulator {
     self.cregfile[0] += 1;
 
     match imm {
-      0 => {
+      1 => {
+        // sys EXIT
+
         // save pc and flags
         self.cregfile[4] = self.pc;
         self.cregfile[5] = 
@@ -1378,7 +1380,7 @@ impl Emulator {
           ((self.flags[1] as u32) << 1) |
           (self.flags[0] as u32);
 
-        self.pc = self.mem_read32(0x00 * 4).expect("shouldnt fail");
+        self.pc = self.mem_read32(0x01 * 4).expect("shouldnt fail");
       }
       _ => {
         self.raise_exc_instr();

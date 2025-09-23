@@ -1440,7 +1440,7 @@ impl Emulator {
     let rb = (instr >> 17) & 0x1F;
 
     let rb = self.regfile[rb as usize];
-    // rb has tid (12 bits) | addr (20 bits)
+    // rb has pid (12 bits) | addr (20 bits)
     if op == 0 {
       // tlbr
       if ra != 0 {
@@ -1466,7 +1466,6 @@ impl Emulator {
     let ra = (instr >> 22) & 0x1F;
     let rb = (instr >> 17) & 0x1F;
 
-    // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
       // crmv crA, rB
       let rb = self.regfile[rb as usize];
@@ -1488,7 +1487,6 @@ impl Emulator {
   fn mode_op(&mut self, instr : u32) {
     let op = (instr >> 10) & 3;
 
-    // rb has tid (12 bits) | addr (20 bits)
     if op == 0 {
       // mode run
       self.pc += 4;

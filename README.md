@@ -2,7 +2,8 @@
 
 Emulator of both the user mode and kernel mode part of the Dioptase ISA
 
-Emulates all the IO devices other than the SD card
+Emulates all the IO devices other than the SD card.  
+I/O emulation was written by https://github.com/PaulBailey-1 and https://github.com/Jzhyang1
 
 ## Usage
 

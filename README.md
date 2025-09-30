@@ -10,6 +10,8 @@ for the [JPEB project](https://github.com/PaulBailey-1/JPEB) and re-used here.
 
 Run the emulator with `cargo run -- <file>.hex`
 
+Use the `-graphics` flag to open a window with the VGA output
+
 ## Testing
 
 Run all tests with `cargo test`

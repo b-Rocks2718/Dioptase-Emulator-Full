@@ -366,10 +366,14 @@ impl Emulator {
         return;
       }
 
-      self.save_state();
-
       // undo sleep
+      if self.asleep {
+        // move to next instruction
+        self.pc += 1;
+      }
       self.asleep = false;
+
+      self.save_state();
 
       // enter kernel mode
       self.cregfile[0] += 1;

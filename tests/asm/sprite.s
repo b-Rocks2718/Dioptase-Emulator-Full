@@ -111,3 +111,4 @@ draw_sprite_loop:
 
   # wait for keypress
   mode sleep
+  jmp draw_sprite_loop

@@ -5,6 +5,8 @@ use std::u16;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
+// TODO: add SD card interface
+
 pub const STACK_START : usize = 0x10000;
 
 pub const FRAME_WIDTH: u32 = 1024;
@@ -16,13 +18,18 @@ pub const SPRITE_SIZE: u32 = 32;
 // const SPRITES_NUM: u32 = 8;
 const SPRITE_DATA_SIZE: u32 = SPRITE_SIZE * SPRITE_SIZE * 2;
 
+const PS2_STREAM : u32 = 0x20000;
+const UART_TX : u32 = 0x20002;
+pub const PIT_START : u32 = 0x20004;
+
+const SD_SEND_BYTE : u32 = 0x201F9;
+const SD_CMD_BUF : u32  = 0x201FA;
+const SD_BUF_START : u32 = 0x20200;
+
 const TILE_MAP_START : u32 = 0x2A000;
 const TILE_MAP_SIZE : u32 = 0x4000;
 const FRAME_BUFFER_START : u32 = 0x2E000;
 const FRAME_BUFFER_SIZE : u32 = 0x1FD0;
-const PS2_STREAM : u32 = 0x20000;
-const UART_TX : u32 = 0x20002;
-pub const PIT_START : u32 = 0x20004;
 const V_SCROLL_START : u32 = 0x2FFFE;
 const H_SCROLL_START : u32 = 0x2FFFC;
 const SCALE_REGISTER_START : u32 = 0x2FFFB; // each pixel is repeated 2^n times
@@ -30,6 +37,9 @@ const SPRITE_MAP_START : u32 = 0x26000;
 const SPRITE_MAP_SIZE : u32 = 0x4000;
 const SPRITE_REGISTERS_START : u32 = 0x2FFD0;  // every consecutive pair of words correspond to 
 const SPRITE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
+
+// TODO: make sd card its own struct
+// put clock method in there
 
 pub struct Memory {
   ram: HashMap<u32, u8>,   
@@ -41,6 +51,8 @@ pub struct Memory {
   scale_register: Arc<RwLock<u8>>,
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
+  sd_card: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+  pending_interrupt: Arc<RwLock<bool>>
 }
 
 // an 80x60 framebuffer of 8-bit tile values
@@ -82,7 +94,9 @@ impl Memory {
             hscroll_register: Arc::new(RwLock::new((0, 0))),
             scale_register: Arc::new(RwLock::new(0)),
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
-            sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE)))
+            sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
+            sd_card: Arc::new(RwLock::new(HashMap::new())),
+            pending_interrupt: Arc::new(RwLock::new(false))
         }
     }
 
@@ -204,6 +218,18 @@ impl Memory {
             println!("Writing to address 0x0000: 0x{:04X}", data);
         }
         self.ram.insert(addr, data);
+    }
+
+    pub fn clock() {
+        // do stuff that should happen every clock cycle
+        
+    }
+
+    pub fn check_interrupts(&self) -> bool {
+        let result = self.pending_interrupt.read().unwrap();
+        // clear interrupt
+        *self.pending_interrupt.write().unwrap() = false;
+        return *result;
     }
 }
 

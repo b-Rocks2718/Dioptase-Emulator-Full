@@ -174,7 +174,7 @@ _start:
 
   # set timer
   movi r4, PIT_ADDR
-  movi r3, 500000
+  movi r3, 50000
   swa  r3, [r4]
 
   # set imr

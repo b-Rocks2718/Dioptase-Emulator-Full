@@ -26,7 +26,7 @@ fn run_test(asm_file : &'static str, expected : u32){
   assert!(status.success(), "assembler failed");
 
   // execute hex file
-  let cpu = Emulator::new(hex_file.to_string_lossy().to_string());
+  let cpu = Emulator::new(hex_file.to_string_lossy().to_string(), false);
   let result = cpu.run(10000, false);
   
   // check result

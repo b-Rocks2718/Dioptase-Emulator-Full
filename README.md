@@ -12,6 +12,8 @@ Run the emulator with `cargo run -- <file>.hex`
 
 Use the `-graphics` flag to open a window with the VGA output
 
+Use the `-uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
+
 ## Testing
 
 Run all tests with `cargo test`

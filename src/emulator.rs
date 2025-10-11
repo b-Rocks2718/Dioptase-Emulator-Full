@@ -64,7 +64,8 @@ pub struct Emulator {
   asleep : bool,
   halted : bool,
   timer : u32,
-  count : u32
+  count : u32,
+  use_uart_rx: bool
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -75,7 +76,7 @@ where P: AsRef<Path>, {
 
 
 impl Emulator {
-  pub fn new(path : String) -> Emulator {
+  pub fn new(path : String, use_uart_rx: bool) -> Emulator {
 
     let mut instructions = HashMap::new();
     
@@ -113,7 +114,7 @@ impl Emulator {
       pc += 4;
     }
 
-    let mem: Memory = Memory::new(instructions);
+    let mem: Memory = Memory::new(instructions, use_uart_rx);
     
     Emulator {
       kmode: true,
@@ -129,7 +130,8 @@ impl Emulator {
       asleep: false,
       halted: false,
       timer: 0,
-      count: 0
+      count: 0,
+      use_uart_rx: use_uart_rx
     }
   }
 
@@ -334,8 +336,13 @@ impl Emulator {
     let io_buf = binding.read().unwrap();
 
     if !io_buf.is_empty() {
-      // cause a keyboard interrupt
-      self.cregfile[2] |= 2;
+      if self.use_uart_rx {
+        // cause a uart interrupt
+        self.cregfile[2] |= 4;
+      } else {
+        // cause a keyboard interrupt
+        self.cregfile[2] |= 2;
+      }
     }
 
     // check for timer interrupt

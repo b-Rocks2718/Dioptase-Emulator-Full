@@ -20,6 +20,7 @@ const SPRITE_DATA_SIZE: u32 = SPRITE_SIZE * SPRITE_SIZE * 2;
 
 const PS2_STREAM : u32 = 0x20000;
 const UART_TX : u32 = 0x20002;
+const UART_RX : u32 = 0x20003;
 pub const PIT_START : u32 = 0x20004;
 
 const SD_SEND_BYTE : u32 = 0x201F9;
@@ -52,7 +53,8 @@ pub struct Memory {
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
   sd_card: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
-  pending_interrupt: Arc<RwLock<bool>>
+  pending_interrupt: Arc<RwLock<bool>>,
+  use_uart_rx: bool
 }
 
 // an 80x60 framebuffer of 8-bit tile values
@@ -83,7 +85,7 @@ pub struct Sprite {
 }
 
 impl Memory {
-    pub fn new(ram: HashMap<u32, u8>) -> Memory {
+    pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool) -> Memory {
 
         Memory {
             ram,
@@ -96,7 +98,8 @@ impl Memory {
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
             sd_card: Arc::new(RwLock::new(HashMap::new())),
-            pending_interrupt: Arc::new(RwLock::new(false))
+            pending_interrupt: Arc::new(RwLock::new(false)),
+            use_uart_rx: use_uart_rx
         }
     }
 
@@ -117,10 +120,12 @@ impl Memory {
         }
         if addr == PS2_STREAM {
             // kind of a hack but this assumed people always read a double from ps2 stream
+            if self.use_uart_rx {return 0;}
             return self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() as u8;
         }
         if addr == PS2_STREAM + 1 {
             // read of upper byte will cause a pop
+            if self.use_uart_rx {return 0;}
             return (self.io_buffer.write().unwrap().pop_front().unwrap_or(0).clone() >> 8) as u8;
         }
         if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
@@ -146,6 +151,18 @@ impl Memory {
         }
         if addr == UART_TX {
             panic!("attempting to read output port (address {:X})", UART_TX);
+        }
+        if addr == UART_RX {
+            // get value
+            if self.use_uart_rx {
+              let value = self.io_buffer.write().unwrap().pop_front().unwrap_or(0).clone();
+              if value & 0xFF00 != 0 {
+                return 0; // ignore keyup
+              }
+              return value as u8;
+            } else {
+              return 0;
+            }
         }
         if addr == PIT_START {
             return self.pit.read().unwrap().0;
@@ -175,11 +192,14 @@ impl Memory {
             self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
         }
         if addr == PS2_STREAM {
-            self.io_buffer.write().unwrap().pop_front();
+            panic!("attempting to write input port (address {:X})", PS2_STREAM);
         }
         if addr == UART_TX {
             print!("{}", data as char);
             io::stdout().flush().unwrap();
+        }
+        if addr == UART_RX {
+            panic!("attempting to write input port (address {:X})", UART_RX);
         }
         if addr == V_SCROLL_START {
             self.vscroll_register.write().unwrap().0 = data;

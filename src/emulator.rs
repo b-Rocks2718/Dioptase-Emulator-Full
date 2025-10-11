@@ -199,6 +199,10 @@ impl Emulator {
 
     self.save_state();
 
+    if self.cregfile[0] == u32::MAX {
+      panic!("too many nested exceptions!");
+    }
+
     if self.kmode {
       self.kmode = true;
       self.cregfile[0] += 1;
@@ -1378,6 +1382,9 @@ impl Emulator {
     let imm = instr & 0xFF;
 
     self.kmode = true;
+    if self.cregfile[0] == u32::MAX {
+      panic!("too many nested exceptions!");
+    }
     self.cregfile[0] += 1;
 
     match imm {
@@ -1423,6 +1430,9 @@ impl Emulator {
       self.save_state();
 
       self.kmode = true;
+      if self.cregfile[0] == u32::MAX {
+        panic!("too many nested exceptions!");
+      }
       self.cregfile[0] += 1;
 
       self.pc = self.mem_read32(0x81 * 4).expect("shouldn't fail");

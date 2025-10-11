@@ -212,3 +212,4 @@ draw_square:
 
   # wait for keypress
   mode sleep
+  mode halt # should never run

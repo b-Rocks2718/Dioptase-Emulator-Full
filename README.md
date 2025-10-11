@@ -10,9 +10,9 @@ for the [JPEB project](https://github.com/PaulBailey-1/JPEB) and re-used here.
 
 Run the emulator with `cargo run -- <file>.hex`
 
-Use the `-graphics` flag to open a window with the VGA output
+Use the `--vga` flag to open a window with the VGA output
 
-Use the `-uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
+Use the `--uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
 
 ## Testing
 

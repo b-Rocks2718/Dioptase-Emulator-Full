@@ -11,8 +11,8 @@ use emulator::Emulator;
 fn main() {
   let args = env::args().collect::<Vec<_>>();
 
-  let with_graphics = args.contains(&String::from("-graphics"));
-  let use_uart_rx = args.contains(&String::from("-uart"));
+  let with_graphics = args.contains(&String::from("--vga"));
+  let use_uart_rx = args.contains(&String::from("--uart"));
 
   if args.len() >= 2 {
     // file to run is passed as a command line argument

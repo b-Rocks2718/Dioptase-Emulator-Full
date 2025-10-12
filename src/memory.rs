@@ -5,8 +5,6 @@ use std::u16;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
-// TODO: add SD card interface
-
 pub const STACK_START : usize = 0x10000;
 
 pub const FRAME_WIDTH: u32 = 1024;
@@ -505,7 +503,6 @@ impl FrameBuffer {
     pub fn new(frame_width: u32, frame_height: u32) -> Self {
         let width = frame_width / TILE_SIZE;
         //let width = 128;
-        // TODO: think about this
         let height = frame_height / TILE_SIZE;
         FrameBuffer {
             width,

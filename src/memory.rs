@@ -42,9 +42,6 @@ const SPRITE_MAP_SIZE : u32 = 0x4000;
 const SPRITE_REGISTERS_START : u32 = 0x2FFD0;  // every consecutive pair of words correspond to 
 const SPRITE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
 
-// TODO: make sd card its own struct
-// put clock method in there
-
 pub struct Memory {
   ram: HashMap<u32, u8>,   
   frame_buffer: Arc<RwLock<FrameBuffer>>,

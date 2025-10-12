@@ -255,6 +255,11 @@ fn call() {
 }
 
 #[test]
+fn sdcard() {
+  run_test("tests/asm/sdcard.s", 0);
+}
+
+#[test]
 fn origin() {
   run_test("tests/asm/origin.s", 21);
 }
@@ -303,4 +308,3 @@ fn rfi() {
 fn tlb_reg() {
   run_test("tests/asm/tlb_reg.s", 0x000fffff);
 }
-

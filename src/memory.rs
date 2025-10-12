@@ -25,7 +25,10 @@ pub const PIT_START : u32 = 0x20004;
 
 const SD_SEND_BYTE : u32 = 0x201F9;
 const SD_CMD_BUF : u32  = 0x201FA;
+const SD_CMD_BUF_LEN: usize = 6;
 const SD_BUF_START : u32 = 0x20200;
+const SD_BLOCK_SIZE: usize = 512;
+pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
 
 const TILE_MAP_START : u32 = 0x2A000;
 const TILE_MAP_SIZE : u32 = 0x4000;
@@ -52,7 +55,7 @@ pub struct Memory {
   scale_register: Arc<RwLock<u8>>,
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
-  sd_card: Arc<RwLock<HashMap<u32, Vec<u8>>>>,
+  sd_card: Arc<RwLock<SdCard>>,
   pending_interrupt: Arc<RwLock<bool>>,
   use_uart_rx: bool
 }
@@ -84,6 +87,202 @@ pub struct Sprite {
     pub pixels: Vec<u8>, // a 32x32 tile of pixels
 }
 
+struct SdCard {
+    command: [u8; SD_CMD_BUF_LEN],
+    response: [u8; SD_CMD_BUF_LEN],
+    response_len: usize,
+    data_buffer: [u8; SD_BLOCK_SIZE],
+    storage: HashMap<u32, Vec<u8>>,
+    idle: bool,
+    initialized: bool,
+    high_capacity: bool,
+    awaiting_app_cmd: bool,
+    ocr: u32,
+    busy: bool,
+}
+
+struct SdCommandResult {
+    response_len: usize,
+    update_data_buffer: bool,
+    interrupt: bool,
+}
+
+impl SdCard {
+    fn new() -> Self {
+        SdCard {
+            command: [0; SD_CMD_BUF_LEN],
+            response: [0; SD_CMD_BUF_LEN],
+            response_len: 0,
+            data_buffer: [0; SD_BLOCK_SIZE],
+            storage: HashMap::new(),
+            idle: true,
+            initialized: false,
+            high_capacity: false,
+            awaiting_app_cmd: false,
+            ocr: 0x00FF8000,
+            busy: false,
+        }
+    }
+
+    fn status(&self) -> u8 {
+        if self.busy { 1 } else { 0 }
+    }
+
+    fn write_command_byte(&mut self, offset: usize, value: u8) {
+        if offset < SD_CMD_BUF_LEN {
+            self.command[offset] = value;
+            self.response[offset] = value;
+            if offset + 1 > self.response_len {
+                self.response_len = offset + 1;
+            }
+        }
+    }
+
+    fn write_data_byte(&mut self, offset: usize, value: u8) {
+        if offset < SD_BLOCK_SIZE {
+            self.data_buffer[offset] = value;
+        }
+    }
+
+    fn execute(&mut self) -> SdCommandResult {
+        self.busy = true;
+        let mut result = SdCommandResult {
+            response_len: 1,
+            update_data_buffer: false,
+            interrupt: true,
+        };
+
+        self.response.fill(0);
+        self.response_len = 0;
+
+        let raw_cmd = self.command[0];
+        let cmd_index = raw_cmd & 0x3F;
+        let arg = ((self.command[1] as u32) << 24)
+            | ((self.command[2] as u32) << 16)
+            | ((self.command[3] as u32) << 8)
+            | (self.command[4] as u32);
+
+        let is_acmd = cmd_index == 41;
+        if cmd_index != 55 && !is_acmd {
+            self.awaiting_app_cmd = false;
+        }
+
+        match cmd_index {
+            0 => {
+                self.idle = true;
+                self.initialized = false;
+                self.high_capacity = false;
+                self.awaiting_app_cmd = false;
+                self.set_response(&[0x01]);
+            }
+            8 => {
+                let status = if self.initialized { 0x00 } else { 0x01 };
+                let resp = [
+                    status,
+                    self.command[1],
+                    self.command[2],
+                    self.command[3],
+                    self.command[4],
+                ];
+                self.set_response(&resp);
+            }
+            55 => {
+                self.awaiting_app_cmd = true;
+                let status = if self.initialized { 0x00 } else { 0x01 };
+                self.set_response(&[status]);
+            }
+            41 => {
+                if !self.awaiting_app_cmd {
+                    self.set_response(&[0x05]);
+                } else {
+                    self.awaiting_app_cmd = false;
+                    self.initialized = true;
+                    self.idle = false;
+                    self.high_capacity = (arg & (1 << 30)) != 0;
+                    self.set_response(&[0x00]);
+                }
+            }
+            58 => {
+                let status = if self.initialized { 0x00 } else { 0x01 };
+                let mut ocr = self.ocr;
+                if self.high_capacity {
+                    ocr |= 1 << 30;
+                } else {
+                    ocr &= !(1 << 30);
+                }
+                let resp = [
+                    status,
+                    ((ocr >> 24) & 0xFF) as u8,
+                    ((ocr >> 16) & 0xFF) as u8,
+                    ((ocr >> 8) & 0xFF) as u8,
+                    (ocr & 0xFF) as u8,
+                ];
+                self.set_response(&resp);
+            }
+            17 => {
+                if !self.initialized {
+                    self.set_response(&[0x05]);
+                } else if !self.high_capacity && (arg % (SD_BLOCK_SIZE as u32) != 0) {
+                    self.set_response(&[0x05]);
+                } else {
+                    let block_index = if self.high_capacity {
+                        arg
+                    } else {
+                        arg / (SD_BLOCK_SIZE as u32)
+                    };
+                    let data = self
+                        .storage
+                        .entry(block_index)
+                        .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
+                    self.data_buffer.copy_from_slice(data.as_slice());
+                    self.set_response(&[0x00]);
+                    result.update_data_buffer = true;
+                }
+            }
+            24 => {
+                if !self.initialized {
+                    self.set_response(&[0x05]);
+                } else if !self.high_capacity && (arg % (SD_BLOCK_SIZE as u32) != 0) {
+                    self.set_response(&[0x05]);
+                } else {
+                    let block_index = if self.high_capacity {
+                        arg
+                    } else {
+                        arg / (SD_BLOCK_SIZE as u32)
+                    };
+                    let data = self
+                        .storage
+                        .entry(block_index)
+                        .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
+                    data.as_mut_slice()
+                        .copy_from_slice(&self.data_buffer);
+                    self.set_response(&[0x00]);
+                }
+            }
+            _ => {
+                self.set_response(&[0x05]);
+            }
+        }
+
+        result.response_len = self.response_len;
+        self.busy = false;
+        result
+    }
+
+    fn set_response(&mut self, bytes: &[u8]) {
+        self.response.fill(0);
+        for (i, value) in bytes.iter().enumerate() {
+            if i < SD_CMD_BUF_LEN {
+                self.response[i] = *value;
+            }
+        }
+        self.response_len = bytes.len().min(SD_CMD_BUF_LEN);
+        if self.response_len == 0 {
+            self.response_len = 1;
+        }
+    }
+}
+
 impl Memory {
     pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool) -> Memory {
 
@@ -97,7 +296,7 @@ impl Memory {
             scale_register: Arc::new(RwLock::new(0)),
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
-            sd_card: Arc::new(RwLock::new(HashMap::new())),
+            sd_card: Arc::new(RwLock::new(SdCard::new())),
             pending_interrupt: Arc::new(RwLock::new(false)),
             use_uart_rx: use_uart_rx
         }
@@ -117,6 +316,9 @@ impl Memory {
         }
         if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
+        }
+        if addr == SD_SEND_BYTE {
+            return self.sd_card.read().unwrap().status();
         }
         if addr == PS2_STREAM {
             // kind of a hack but this assumed people always read a double from ps2 stream
@@ -191,6 +393,54 @@ impl Memory {
         if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
         }
+        if addr == SD_SEND_BYTE {
+            let (response, response_len, updated_buffer, interrupt) = {
+                let mut sd = self.sd_card.write().unwrap();
+                let result = sd.execute();
+                let response = sd.response;
+                let response_len = result.response_len;
+                let buffer = if result.update_data_buffer {
+                    Some(sd.data_buffer.to_vec())
+                } else {
+                    None
+                };
+                (response, response_len, buffer, result.interrupt)
+            };
+
+            for i in 0..SD_CMD_BUF_LEN {
+                let value = if i < response_len { response[i] } else { 0 };
+                self.ram.insert(SD_CMD_BUF + i as u32, value);
+            }
+
+            if let Some(buffer) = updated_buffer {
+                for (i, value) in buffer.iter().enumerate() {
+                    self.ram.insert(SD_BUF_START + i as u32, *value);
+                }
+            }
+
+            if interrupt {
+                *self.pending_interrupt.write().unwrap() = true;
+            }
+            return;
+        }
+        if addr >= SD_CMD_BUF && addr < SD_CMD_BUF + SD_CMD_BUF_LEN as u32 {
+            let offset = (addr - SD_CMD_BUF) as usize;
+            {
+                let mut sd = self.sd_card.write().unwrap();
+                sd.write_command_byte(offset, data);
+            }
+            self.ram.insert(addr, data);
+            return;
+        }
+        if addr >= SD_BUF_START && addr < SD_BUF_START + SD_BLOCK_SIZE as u32 {
+            let offset = (addr - SD_BUF_START) as usize;
+            {
+                let mut sd = self.sd_card.write().unwrap();
+                sd.write_data_byte(offset, data);
+            }
+            self.ram.insert(addr, data);
+            return;
+        }
         if addr == PS2_STREAM {
             panic!("attempting to write input port (address {:X})", PS2_STREAM);
         }
@@ -246,10 +496,11 @@ impl Memory {
     }
 
     pub fn check_interrupts(&self) -> bool {
-        let result = self.pending_interrupt.read().unwrap();
-        // clear interrupt
-        *self.pending_interrupt.write().unwrap() = false;
-        return *result;
+        let pending = { *self.pending_interrupt.read().unwrap() };
+        if pending {
+            *self.pending_interrupt.write().unwrap() = false;
+        }
+        pending
     }
 }
 

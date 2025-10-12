@@ -7,7 +7,7 @@ use std::cmp;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::memory::{Memory, PIT_START};
+use crate::memory::{Memory, PIT_START, SD_INTERRUPT_BIT};
 use crate::graphics::Graphics;
 
 #[derive(Debug)]
@@ -347,6 +347,10 @@ impl Emulator {
         // cause a keyboard interrupt
         self.cregfile[2] |= 2;
       }
+    }
+
+    if self.memory.check_interrupts() {
+      self.cregfile[2] |= SD_INTERRUPT_BIT;
     }
 
     // check for timer interrupt

@@ -109,6 +109,7 @@ draw_sprite_loop:
   or   r3, r4, r3
   mov  imr, r3
 
+wait_for_key:
   # wait for keypress
   mode sleep
-  jmp draw_sprite_loop
+  jmp  wait_for_key

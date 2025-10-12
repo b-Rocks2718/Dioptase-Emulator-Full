@@ -327,8 +327,8 @@ impl TileMap {
 impl Sprite {
     pub fn invisible() -> Sprite {
         Sprite {
-            x: (50, 0),
-            y: (50, 0),
+            x: (0, 0),
+            y: (0, 0),
             pixels: vec![0xFF; SPRITE_DATA_SIZE as usize],
         }
     }

@@ -13,6 +13,11 @@ INT_KEYBOARD:
   movi r4, PS2_ADDR
   lda  r3, [r4]
 
+  mov  r5, r3
+  and  r5, r5, 0xFF00 # ignore keyup events
+  bnz  end
+  and  r3, r3, 0x00FF
+
   cmp  r3, KEY_A
   bz   key_a
   cmp  r3, KEY_Q
@@ -22,7 +27,7 @@ INT_KEYBOARD:
 key_q:
   movi r4, UART_ADDR
   movi r3, 10
-  swa  r3, [r4]
+  sba  r3, [r4]
   mode halt
 
 key_a:
@@ -51,14 +56,8 @@ _start:
   movi r1, 0x1000
   movi r2, 0x1000
 
-  # set imr
-  movi r3, 0x7FFFFFFF
-  mov  imr, r3
-
-  # enable interrupts
-  mov  r3, imr
-  movi r4, 0x80000000
-  or   r3, r4, r3
+  # enable keyboard interrupts (bit 1) and global enable
+  movi r3, 0x80000002
   mov  imr, r3
 
   # wait for keypress
@@ -68,7 +67,9 @@ loop:
   movi r3, 48
   lw   r5, [COUNTER]
   add  r3, r3, r5
-  swa  r3, [r4]
+  sba  r3, [r4]
+
+  add  r0, r0, r0  # allow store to commit before sleeping
 
   mode sleep
   jmp loop

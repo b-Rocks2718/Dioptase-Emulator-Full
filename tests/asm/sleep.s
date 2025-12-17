@@ -9,6 +9,11 @@
 
 INT_KEYBOARD:
 
+  # save caller registers used below
+  push r3
+  push r4
+  push r5
+
   # check key
   movi r4, PS2_ADDR
   lda  r3, [r4]
@@ -42,6 +47,11 @@ end:
   movi r3, 0xFFFFFFFD
   and  r4, r4, r3
   mov  isr, r4
+
+  # restore caller registers
+  pop  r5
+  pop  r4
+  pop  r3
 
   # return from the interrupt
   mov  r30, epc

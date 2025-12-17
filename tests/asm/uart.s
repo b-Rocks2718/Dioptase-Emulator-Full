@@ -12,15 +12,15 @@ _start:
   movi r4, UART_ADDR
 
   movi r3, H
-  swa  r3, [r4]
+  sba  r3, [r4]
   movi r3, E
-  swa  r3, [r4]
+  sba  r3, [r4]
   movi r3, L
-  swa  r3, [r4]
-  swa  r3, [r4]
+  sba  r3, [r4]
+  sba  r3, [r4]
   movi r3, O
-  swa  r3, [r4]
+  sba  r3, [r4]
   movi r3, NEWLINE
-  swa  r3, [r4]
+  sba  r3, [r4]
 
   mode halt

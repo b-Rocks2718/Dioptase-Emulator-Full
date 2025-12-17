@@ -207,6 +207,10 @@ impl Emulator {
   }
 
   fn mem_write16(&mut self, addr : u32, data : u16) -> bool {
+    if (addr & 1) != 0 {
+      // unaligned access
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
     let addr = addr & 0xFFFFFFFE;
 
     // alignment should mean these return the same value
@@ -219,6 +223,11 @@ impl Emulator {
   }
 
   fn mem_write32(&mut self, addr : u32, data : u32) -> bool {
+    if (addr & 3) != 0 {
+      // unaligned access
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
+
     let addr = addr & 0xFFFFFFFC;
 
     let w1 = self.mem_write16(addr, data as u16);
@@ -240,11 +249,19 @@ impl Emulator {
   }
 
   fn mem_read16(&mut self, addr: u32) -> Option<u16> {
+    if (addr & 1) != 0 {
+      // unaligned access
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
     self.mem_read8(addr).zip(self.mem_read8(addr + 1))
         .map(|(lo, hi)| (u16::from(hi) << 8) | u16::from(lo))
   }
 
   fn mem_read32(&mut self, addr: u32) -> Option<u32> {
+    if (addr & 3) != 0 {
+      // unaligned access
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
     self.mem_read16(addr).zip(self.mem_read16(addr + 2))
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
@@ -361,7 +378,7 @@ impl Emulator {
       // undo sleep
       if self.asleep {
         // move to next instruction
-        self.pc += 1;
+        self.pc += 4;
       }
       self.asleep = false;
 
@@ -984,7 +1001,7 @@ impl Emulator {
       }
     }
 
-    if y == 1 || y == 2 && (r_b != 0) {
+    if (y == 1 || y == 2) && (r_b != 0) {
       // pre or post increment
       self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
     }

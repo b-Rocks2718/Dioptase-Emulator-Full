@@ -6,11 +6,11 @@
 _start:
   movi r4, UART_TX_ADDR
   movi r3, UART_RX_ADDR
-  
+loop: 
   lba  r5, [r3]
   cmp  r5, r0
-  bz   _start
+  bz   loop
   add  r5, r5, 1
   sba  r5, [r4]
 
-  jmp _start
+  jmp loop

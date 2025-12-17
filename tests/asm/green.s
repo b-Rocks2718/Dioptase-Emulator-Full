@@ -72,7 +72,7 @@ userland:
 
   movi r10, 64
 draw_square_loop:
-  swa  r6, [r8], 2
+  sda  r6, [r8], 2
   add  r10, r10, -1
   bnz  draw_square_loop
 

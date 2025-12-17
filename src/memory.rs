@@ -21,6 +21,11 @@ const UART_TX : u32 = 0x20002;
 const UART_RX : u32 = 0x20003;
 pub const PIT_START : u32 = 0x20004;
 
+// SD card is memory-mapped:
+// - SD_CMD_BUF..+5: command bytes (write-only; mirrored into RAM for visibility)
+// - SD_BUF_START..+512: data buffer for single-block transfers
+// - SD_SEND_BYTE: write to execute current command and copy response/data back into RAM
+// Reads of SD_SEND_BYTE return busy status (1 while executing, else 0).
 const SD_SEND_BYTE : u32 = 0x201F9;
 const SD_CMD_BUF : u32  = 0x201FA;
 const SD_CMD_BUF_LEN: usize = 6;
@@ -83,6 +88,7 @@ pub struct Sprite {
 }
 
 struct SdCard {
+    // Minimal single-block SD card emulation backing the memory map above.
     command: [u8; SD_CMD_BUF_LEN],
     response: [u8; SD_CMD_BUF_LEN],
     response_len: usize,

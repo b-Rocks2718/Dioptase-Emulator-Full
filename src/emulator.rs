@@ -155,26 +155,6 @@ impl Emulator {
     }
   }
 
-  fn is_addr_valid(&self, addr : u32) -> bool {
-    if self.kmode {
-      if addr < 0x30000 {
-        true
-      } else if let Some(_) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        true
-      } else {
-        // TLB_KMISS
-        false
-      }
-    } else {
-      if let Some(_) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        true
-      } else {
-        // TLB_UMISS
-        false
-      }
-    }
-  }
-
   fn save_state(&mut self){
     // save state as an interrupt happens
 
@@ -214,6 +194,7 @@ impl Emulator {
     }
   }
 
+  // memory operations must be aligned
   fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
     let addr = self.convert_mem_address(addr);
 
@@ -226,22 +207,26 @@ impl Emulator {
   }
 
   fn mem_write16(&mut self, addr : u32, data : u16) -> bool {
-    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) {
-      return false;
-    }
+    let addr = addr & 0xFFFFFFFE;
 
-    self.mem_write8(addr, data as u8) &&
-    self.mem_write8(addr + 1, (data >> 8) as u8)
+    // alignment should mean these return the same value
+    let w1 = self.mem_write8(addr, data as u8);
+    let w2 = self.mem_write8(addr + 1, (data >> 8) as u8);
+
+    assert!(w1 == w2, "address misaligned or TLB broken");
+
+    return w1;
   }
 
   fn mem_write32(&mut self, addr : u32, data : u32) -> bool {
-    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) ||
-       !self.is_addr_valid(addr + 2) || !self.is_addr_valid(addr + 3) {
-      return false;
-    }
+    let addr = addr & 0xFFFFFFFC;
 
-    self.mem_write16(addr, data as u16) &&
-    self.mem_write16(addr + 2, (data >> 16) as u16)
+    let w1 = self.mem_write16(addr, data as u16);
+    let w2 = self.mem_write16(addr + 2, (data >> 16) as u16);
+
+    assert!(w1 == w2, "address misaligned or TLB broken");
+
+    return w1;
   }
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
@@ -255,19 +240,11 @@ impl Emulator {
   }
 
   fn mem_read16(&mut self, addr: u32) -> Option<u16> {
-    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) {
-      return None;
-    }
     self.mem_read8(addr).zip(self.mem_read8(addr + 1))
         .map(|(lo, hi)| (u16::from(hi) << 8) | u16::from(lo))
   }
 
   fn mem_read32(&mut self, addr: u32) -> Option<u32> {
-    if !self.is_addr_valid(addr) || !self.is_addr_valid(addr + 1) ||
-       !self.is_addr_valid(addr + 2) || !self.is_addr_valid(addr + 3) {
-      return None;
-    }
-
     self.mem_read16(addr).zip(self.mem_read16(addr + 2))
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
@@ -621,7 +598,7 @@ impl Emulator {
       self.regfile[r_a as usize] = result;
     }
     
-    self.update_flags(result, r_b, r_c);
+    self.update_flags(result, r_b, r_c, op);
 
     self.pc += 4;
 
@@ -807,7 +784,7 @@ impl Emulator {
       self.regfile[r_a as usize] = result;
     }
     
-    self.update_flags(result, r_b, imm);
+    self.update_flags(result, r_b, imm, op);
 
     self.pc += 4;
   }
@@ -832,8 +809,8 @@ impl Emulator {
     let r_a = (instr >> 22) & 0x1F;
     let r_b = (instr >> 17) & 0x1F;
     let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-    let y = (instr >> 14) & 3;
-    let z = (instr >> 12) & 3;
+    let y = (instr >> 14) & 3; // offset type: 0 = signed offset, 1 = preinc, 2 = postinc, 3 = reserved
+    let z = (instr >> 12) & 3; // shift amount
     let imm = instr & 0xFFF;
 
     // sign extend imm
@@ -851,16 +828,15 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read32(addr) {
-          data
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read32(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = data;
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -901,16 +877,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read32(addr) {
-          data
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read32(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = data;
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -941,16 +916,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read32(addr) {
-          data
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read32(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = data;
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -991,16 +965,15 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read16(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read16(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1041,16 +1014,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read16(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read16(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1081,16 +1053,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read16(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read16(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1131,16 +1102,15 @@ impl Emulator {
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read8(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read8(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1181,16 +1151,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read8(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read8(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1221,16 +1190,15 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = 
-        if let Some(data) = self.mem_read8(addr) {
-          u32::from(data)
-        } else{
-          // TLB Miss
-          self.raise_tlb_miss(addr);
-          return;
-        };
-      }
+      if let Some(data) = self.mem_read8(addr) {
+        if r_a != 0 {
+          self.regfile[r_a as usize] = u32::from(data);
+        }
+      } else{
+        // TLB Miss
+        self.raise_tlb_miss(addr);
+        return;
+      };
     } else {
       // is a store
       let data = self.regfile[r_a as usize];
@@ -1412,17 +1380,24 @@ impl Emulator {
     }
   }
 
-  fn update_flags(&mut self, result : u32, lhs : u32, rhs : u32) {
+  // carry flag handled separately in each alu operation
+  fn update_flags(&mut self, result : u32, lhs : u32, rhs : u32, op : u32) {
     let result_sign = result >> 31;
     let lhs_sign = lhs >> 31;
     let rhs_sign = rhs >> 31;
+
+    let is_sub = op == 16 || op == 17;
 
     // set the zero flag
     self.flags[1] = result == 0;
     // set the sign flag
     self.flags[2] = result_sign != 0;
     // set the overflow flag
-    self.flags[3] = (result_sign != lhs_sign) && (lhs_sign == rhs_sign);
+    self.flags[3] = if is_sub {
+      (result_sign != lhs_sign) && (lhs_sign != rhs_sign)
+    } else {
+      (result_sign != lhs_sign) && (lhs_sign == rhs_sign)
+    }
   }
 
 

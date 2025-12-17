@@ -1,7 +1,7 @@
   .kernel
 _start:
 
-  movi r7, 0xFFFFFFFF
+  movi r7, 0xFFFFFFF0
   lwa  r3, [r7] # will fail
   mode halt
 

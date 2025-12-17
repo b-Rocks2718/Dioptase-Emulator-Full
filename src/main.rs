@@ -17,10 +17,10 @@ fn main() {
   if args.len() >= 2 {
     // file to run is passed as a command line argument
     let cpu = Emulator::new(args[1].clone(), use_uart_rx);
-    let result = cpu.run(0, with_graphics).expect("did not terminate");
+    let result = cpu.run(0, with_graphics).expect("did not terminate"); // programs should return a value in r3
     println!("{:08x}", result);
   } else {
     println!("Usage: cargo run -- file.hex");
-    process::exit(64);
+    process::exit(1);
   }
 }

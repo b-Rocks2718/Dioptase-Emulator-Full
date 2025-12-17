@@ -114,6 +114,11 @@ fn subb() {
 }
 
 #[test]
+fn sub_overflow_sets_flag() {
+  run_test("tests/asm/sub_overflow.s", 1);
+}
+
+#[test]
 fn mul() {
   run_test("tests/asm/mul.s", 42);
 }
@@ -247,6 +252,11 @@ fn bps() {
 #[test]
 fn jmp() {
   run_test("tests/asm/jmp.s", 0);
+}
+
+#[test]
+fn r0_load_invariant() {
+  run_test("tests/asm/r0_load_invariant.s", 0);
 }
 
 #[test]

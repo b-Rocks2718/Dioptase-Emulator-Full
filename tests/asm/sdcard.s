@@ -125,4 +125,5 @@ _start:
   or   r7 r7 r1
 
   add  r3 r7 r0
+  mov  r1, r3
   sys  EXIT

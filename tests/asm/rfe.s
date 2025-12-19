@@ -13,5 +13,6 @@ _start:
 
   # handler should return here
   add  r3, r3, 2
+  mov  r1, r3
 
   mode halt

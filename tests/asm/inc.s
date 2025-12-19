@@ -9,6 +9,7 @@ _start:
   add  r1 r1 2
   ld   r4 [r1, DATA]
   add  r3 r4 r3
+  mov  r1, r3
   sys  EXIT # should return 0xFFFF
 
 DATA:

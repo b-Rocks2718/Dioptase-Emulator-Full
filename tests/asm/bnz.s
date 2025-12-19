@@ -9,13 +9,13 @@ _start:
   add  r3 r0 10
   cmp  r1 r2
   bnz  label # this should be taken
-  movi r3 0xE
+  movi r1 0xE
   sys  EXIT
 label:
   cmp  r1 r3
   bnz  label2 # this branch should not be taken
-  movi r3 0
+  movi r1 0
   sys  EXIT
 label2:
-  movi r3 0xF
+  movi r1 0xF
   sys  EXIT

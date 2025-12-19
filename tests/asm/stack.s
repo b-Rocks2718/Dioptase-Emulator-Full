@@ -10,5 +10,5 @@ _start:
   push r2
   push r7
   pop  r0
-  pop  r3
+  pop  r1
   sys  EXIT

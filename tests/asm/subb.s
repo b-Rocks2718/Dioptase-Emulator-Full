@@ -12,5 +12,6 @@ _start:
   sub  r2 r4 r6
   subb r3 r5 r7
   # result should be 0xFFFFFFFFFFFFFFFF
-  # r3 should have 0xFFFFFFFF
+  # r1 should have 0xFFFFFFFF
+  mov  r1, r3
   sys  EXIT

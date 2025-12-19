@@ -13,5 +13,6 @@ _start:
   addc r3 r5 r7
   addc r3 r3 1
   # result should be 0xAAAAAAACFFFFFFFE
-  # r3 should have 0xAAAAAAAD
+  # r1 should have 0xAAAAAAAD
+  mov  r1, r3
   sys  EXIT

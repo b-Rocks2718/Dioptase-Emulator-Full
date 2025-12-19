@@ -15,6 +15,7 @@ _start:
   add  r13, r10, r13
   sw   r13, [DATA_2]
   lw   r3,  [r0, DATA_2]
+  mov  r1, r3
   sys  EXIT     # should return 0x25 = 37
 
 .space 128

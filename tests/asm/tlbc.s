@@ -7,6 +7,6 @@ _start:
   add  r5, r0, 0xA
   tlbw r5, r4
   tlbc
-  tlbr r3, r4
+  tlbr r1, r4
 
   mode halt

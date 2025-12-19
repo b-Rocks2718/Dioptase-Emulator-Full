@@ -17,5 +17,6 @@ _start:
   # ensure interrupts are enabled
   mov  r4, imr
   add  r3, r4, r3
+  mov  r1, r3
 
   mode halt

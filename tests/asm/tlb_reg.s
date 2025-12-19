@@ -2,7 +2,7 @@
   # ensure address that causes miss is placed in cr7 (tlb reg)
 
 TLB_KMISS:
-  mov  r3, tlb
+  mov  r1, tlb
   mode halt
 
 _start:

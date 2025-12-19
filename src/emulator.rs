@@ -12,44 +12,192 @@ use crate::graphics::Graphics;
 
 #[derive(Debug)]
 pub struct RandomCache {
-    table : HashMap<u32, u32>,
-    size : usize,
-    capacity : usize,
+    private_table : HashMap<(u32, u32), u32>,
+    private_size : usize,
+    private_capacity : usize,
+    global_table : HashMap<u32, u32>,
+    global_size : usize,
+    global_capacity : usize,
 }
 
 impl RandomCache {
   pub fn new(capacity : usize) -> RandomCache  {
     RandomCache {
-      table : HashMap::new(),
-      size : 0,
-      capacity : capacity,
+      private_table : HashMap::new(),
+      private_size : 0,
+      private_capacity : capacity,
+      global_table : HashMap::new(),
+      global_size : 0,
+      global_capacity : capacity,
     }
   }
 
-  pub fn read(&self, key : u32) -> Option<u32> {
-    assert!(self.size <= self.capacity);
-    self.table.get(&key).copied()
-  }
+  pub fn access(&self, pid : u32, vpn : u32, operation : u32, kmode : bool) -> Option<u32> {
+    // used whenever a memory access is made
 
-  pub fn write(&mut self, key : u32, value : u32){
-    if self.size < self.capacity {
-      self.size += 1;
+    assert!(self.private_size <= self.private_capacity);
+    assert!(self.global_size <= self.global_capacity);
+
+    // operations: 0 => read, 1 => write, 2 => fetch
+
+    let key = (pid, vpn);
+    let result = self.private_table.get(&key).copied().and_then(|v|
+      if operation == 0 {
+        // read operation 
+        if v & 0x00000001 == 0 {
+          // not readable
+          println!("TLB MISS: not readable");
+          None
+        } else {
+          Some(v)
+        }
+      } else if operation == 1 {
+        // write operation
+        if v & 0x00000002 == 0 {
+          // not writable
+          println!("TLB MISS: not writable");
+          None
+        } else {
+          Some(v)
+        }
+      } else if operation == 2 {
+        // fetch operation
+        if v & 0x00000004 == 0 {
+          // not executable
+          println!("TLB MISS: not executable");
+          None
+        } else {
+          Some(v)
+        }
+      } else {
+        panic!("invalid operation code");
+      }
+    ).and_then(|v|
+      if !kmode {
+        if v & 0x00000008 == 0 {
+          // user mode access not allowed
+          None
+        } else {
+          Some(v)
+        }
+      } else {
+        Some(v)
+      }
+    ).map(|v| v & 0xFFFFF000);
+
+    if result.is_some() {
+      return result;
     } else {
-      // remove an entry
-      let evict = {
-        let mut keys = self.table.keys();
-        keys.next().cloned().expect("size was nonzero, this should work")
-      };
-      self.table.remove(&evict);
+      // try global table
+      self.global_table.get(&vpn).copied().and_then(|v|
+        if operation == 0 {
+          // read operation 
+          if v & 0x00000001 == 0 {
+            // not readable
+            None
+          } else {
+            Some(v)
+          }
+        } else if operation == 1 {
+          // write operation
+          if v & 0x00000002 == 0 {
+            // not writable
+            None
+          } else {
+            Some(v)
+          }
+        } else if operation == 2 {
+          // fetch operation
+          if v & 0x00000004 == 0 {
+            // not executable
+            None
+          } else {
+            Some(v)
+          }
+        } else {
+          panic!("invalid operation code");
+        }
+      ).and_then(|v|
+        if !kmode {
+          if v & 0x00000008 == 0 {
+            // user mode access not allowed
+            None
+          } else {
+            Some(v)
+          }
+        } else {
+          Some(v)
+        }
+      ).map(|v| v & 0xFFFFF000)
+    }
+  }
+
+  pub fn read(&self, pid : u32, vpn : u32) -> Option<u32> {
+    // used by tlbr instruction
+
+    assert!(self.private_size <= self.private_capacity);
+    assert!(self.global_size <= self.global_capacity);
+    let result = self.private_table.get(&(pid, vpn)).copied();
+
+    if result.is_some() {
+      return result;
+    } else {
+      // try global table
+      self.global_table.get(&vpn).copied()
+    }
+  }
+
+  pub fn write(&mut self, pid : u32, vpn: u32, ppn : u32){
+    if vpn & 0x00000010 != 0 {
+      // global entry
+      if self.global_size < self.global_capacity {
+        self.global_size += 1;
+      } else {
+        // remove an entry
+        let evict = {
+          let mut keys = self.global_table.keys();
+          keys.next().cloned().expect("size was nonzero, this should work")
+        };
+        self.global_table.remove(&evict);
+      }
+
+      self.global_table.insert(vpn, ppn);
+      assert!(self.global_size <= self.global_capacity);
+    } else {
+      // private entry
+      if self.private_size < self.private_capacity {
+        self.private_size += 1;
+      } else {
+        // remove an entry
+        let evict = {
+          let mut keys = self.private_table.keys();
+          keys.next().cloned().expect("size was nonzero, this should work")
+        };
+        self.private_table.remove(&evict);
+      }
+
+      self.private_table.insert((pid, vpn), ppn);
+      assert!(self.private_size <= self.private_capacity);
+    }
+  }
+
+  pub fn invalidate(&mut self, pid : u32, vpn : u32){
+    if self.private_table.contains_key(&(pid, vpn)) {
+      self.private_size -= 1;
+    }
+    if self.global_table.contains_key(&vpn) {
+      self.global_size -= 1;
     }
 
-    self.table.insert(key, value);
-    assert!(self.size <= self.capacity);
+    self.private_table.remove(&(pid, vpn));
+    self.global_table.remove(&vpn);
   }
 
   pub fn clear(&mut self){
-    self.size = 0;
-    self.table.drain();
+    self.private_size = 0;
+    self.global_size = 0;
+    self.private_table.drain();
+    self.global_table.drain();
   }
 }
 
@@ -134,19 +282,19 @@ impl Emulator {
     }
   }
 
-  fn convert_mem_address(&self, addr : u32) -> Option<u32> {
+  fn convert_mem_address(&self, addr : u32, operation : u32) -> Option<u32> {
     if self.kmode {
       if addr < 0x30000 {
         Some(addr)
-      } else if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        Some((result << 12) | (addr & 0xFFF))
+      } else if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, self.kmode) {
+        Some(result | (addr & 0xFFF))
       } else {
         // TLB_KMISS
         None
       }
     } else {
-      if let Some(result) = self.tlb.read(addr >> 12 | (self.cregfile[1] << 20)) {
-        Some((result << 12) | (addr & 0xFFF))
+      if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, self.kmode) {
+        Some(result | (addr & 0xFFF))
       } else {
         // TLB_UMISS
         None
@@ -190,7 +338,7 @@ impl Emulator {
 
   // memory operations must be aligned
   fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
-    let addr = self.convert_mem_address(addr);
+    let addr = self.convert_mem_address(addr, 1);
 
     if let Some(addr) = addr {
       self.memory.write(addr, data);
@@ -233,7 +381,7 @@ impl Emulator {
   }
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
-    let addr = self.convert_mem_address(addr);
+    let addr = self.convert_mem_address(addr, 0);
 
     if let Some(addr) = addr {
       Some(self.memory.read(addr))
@@ -258,6 +406,25 @@ impl Emulator {
     }
     self.mem_read16(addr).zip(self.mem_read16(addr + 2))
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
+  }
+
+  fn fetch(&mut self, addr: u32) -> Option<u32> {
+    if (addr & 3) != 0 {
+      // unaligned access
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
+    let addr = self.convert_mem_address(addr, 2);
+
+    if let Some(addr) = addr {
+      Some(
+        (self.memory.read(addr + 3) as u32) << 24 |
+        (self.memory.read(addr + 2) as u32) << 16 |
+        (self.memory.read(addr + 1) as u32) << 8 |
+        (self.memory.read(addr) as u32)
+      )
+    } else {
+      None
+    }
   }
 
   pub fn run(mut self, max_iters : u32, with_graphics : bool) -> Option<u32> {
@@ -289,7 +456,7 @@ impl Emulator {
           self.handle_interrupts();
 
           if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(self.cregfile[6], 1), 1)) == 0) {
-            let instr = self.mem_read32(self.pc);
+            let instr = self.fetch(self.pc);
 
             if let Some(instr) = instr {
               self.execute(instr);
@@ -306,7 +473,7 @@ impl Emulator {
         }
 
         // return the value in r3
-        *ret_clone.lock().unwrap() = Some(self.regfile[3]);
+        *ret_clone.lock().unwrap() = Some(self.regfile[1]);
         *finished_clone.lock().unwrap() = true;
       }
     });
@@ -1119,11 +1286,11 @@ impl Emulator {
     let rb = (instr >> 17) & 0x1F;
 
     let rb = self.get_reg(rb);
-    // rb has pid (12 bits) | addr (20 bits)
+    // ra has PPN, rb has VPN
     if op == 0 {
       // tlbr
       if ra != 0 {
-        if let Some(val) = self.tlb.read(rb) {
+        if let Some(val) = self.tlb.read(self.cregfile[1], rb >> 12) {
           self.write_reg(ra, val);
         } else {
           self.write_reg(ra, 0);
@@ -1132,7 +1299,10 @@ impl Emulator {
     } else if op == 1 {
       // tlbw
       let ra = self.get_reg(ra);
-      self.tlb.write(rb, ra & 0x3F);
+      self.tlb.write(self.cregfile[1], rb >> 12, ra & 0x7FFFFFF);
+    } else if op == 2 {
+      // tlbi
+      self.tlb.invalidate(self.cregfile[1], rb >> 12);
     } else {
       // tlbc
       self.tlb.clear();

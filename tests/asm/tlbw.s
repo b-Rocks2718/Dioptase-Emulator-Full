@@ -12,7 +12,8 @@ _start:
   tlbw r5, r4
 
   # enter user mode
-  rfe r0, r0
+  mov epc, r0
+  rfe
   
 EXIT:
   # change process to one with no tlb entries
@@ -20,7 +21,8 @@ EXIT:
   mov  r5, pid
   add  r5, r5, 1
   mov  pid, r5
-  rfe  r0, r0
+  mov  epc, r0
+  rfe
 
 TLB_UMISS:
   add  r3, r3, 1

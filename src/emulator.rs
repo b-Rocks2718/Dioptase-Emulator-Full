@@ -55,12 +55,12 @@ impl RandomCache {
 
 pub struct Emulator {
   kmode : bool,
-  regfile : [u32; 32],
-  cregfile : [u32; 8],
+  regfile : [u32; 32], // r0 - r31
+  cregfile : [u32; 9], // PSR, PID, ISR, IMR, EPC, FLG, CDV, TLB, KSP
+  // in FLG, flags are: carry | zero | sign | overflow
   memory : Memory,
   tlb : RandomCache,
   pc : u32,
-  flags : [bool; 4], // flags are: carry | zero | sign | overflow
   asleep : bool,
   halted : bool,
   timer : u32,
@@ -122,11 +122,10 @@ impl Emulator {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
-      cregfile: [1, 0, 0, 0, 0, 0, 0, 0],
+      cregfile: [1, 0, 0, 0, 0, 0, 0, 0, 0],
       memory: mem,
       tlb: RandomCache::new(8),
       pc: 0x400,
-      flags: [false, false, false, false],
       asleep: false,
       halted: false,
       timer: 0,
@@ -158,13 +157,8 @@ impl Emulator {
   fn save_state(&mut self){
     // save state as an interrupt happens
 
-    // save pc and flags
+    // save pc
     self.cregfile[4] = self.pc;
-    self.cregfile[5] = 
-      ((self.flags[3] as u32) << 3) |
-      ((self.flags[2] as u32) << 2) |
-      ((self.flags[1] as u32) << 1) |
-      (self.flags[0] as u32);
 
     // disable interrupts
     self.cregfile[3] &= 0x7FFFFFFF;
@@ -384,6 +378,10 @@ impl Emulator {
 
       self.save_state();
 
+      if self.cregfile[0] == u32::MAX {
+        panic!("too many nested exceptions!");
+      }
+
       // enter kernel mode
       self.cregfile[0] += 1;
       self.kmode = true;
@@ -432,6 +430,10 @@ impl Emulator {
 
     self.save_state();
 
+    if self.cregfile[0] == u32::MAX {
+      panic!("too many nested exceptions!");
+    }
+
     self.kmode = true;
     self.cregfile[0] += 1;
 
@@ -443,18 +445,18 @@ impl Emulator {
     let opcode = instr >> 27; // opcode is top 5 bits of instruction
 
     match opcode {
-      0 => self.alu_reg_op(instr),
-      1 => self.alu_imm_op(instr),
+      0 => self.alu_op(instr, false),
+      1 => self.alu_op(instr, true),
       2 => self.load_upper_immediate(instr),
-      3 => self.mem_absolute_w(instr),
-      4 => self.mem_relative_w(instr),
-      5 => self.mem_imm_w(instr),
-      6 => self.mem_absolute_d(instr),
-      7 => self.mem_relative_d(instr),
-      8 => self.mem_imm_d(instr),
-      9 => self.mem_absolute_b(instr),
-      10 => self.mem_relative_b(instr),
-      11 => self.mem_imm_b(instr),
+      3 => self.mem_absolute(instr, 2),
+      4 => self.mem_relative(instr, 2),
+      5 => self.mem_imm(instr, 2),
+      6 => self.mem_absolute(instr, 1),
+      7 => self.mem_relative(instr, 1),
+      8 => self.mem_imm(instr, 1),
+      9 => self.mem_absolute(instr, 0),
+      10 => self.mem_relative(instr, 0),
+      11 => self.mem_imm(instr, 0),
       12 => self.branch_imm(instr),
       13 => self.branch_absolute(instr),
       14 => self.branch_relative(instr),
@@ -464,161 +466,27 @@ impl Emulator {
     }
   }
 
-  fn alu_reg_op(&mut self, instr : u32) {
-    // instruction format is
-    // 00000aaaaabbbbbxxxxxxx?????ccccc
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | unused (7 bits) | op (5 bits) | r_c (5 bits)
-    let r_a = (instr >> 22) & 0x1F;
-    let r_b = (instr >> 17) & 0x1F;
-    let op = (instr >> 5) & 0x1F;
-    let r_c = instr & 0x1F;
-
-    // retrieve arguments
-    let r_b = self.regfile[r_b as usize];
-    let r_c = self.regfile[r_c as usize];
-
-    // carry flag is set differently for each instruction,
-    // so its handled here. The other flags are all handled together
-    let result = match op {
-      0 => {
-        self.flags[0] = false;
-        r_b & r_c // and
-      }, 
-      1 => {
-        self.flags[0] = false;
-        !(r_b & r_c)  // nand
-      },
-      2 => {
-        self.flags[0] = false;
-        r_b | r_c // or
-      },
-      3 => {
-        self.flags[0] = false;
-        !(r_b | r_c) // nor
-      },
-      4 => {
-        self.flags[0] = false;
-        r_b ^ r_c // xor
-      },
-      5 => {
-        self.flags[0] = false;
-        !(r_b ^ r_c) // xnor
-      },
-      6 => {
-        self.flags[0] = false;
-        !r_c // not
-      },
-      7 => {
-        // set carry flag
-        self.flags[0] = r_b >> if r_c > 0 {32 - r_c} else {0} != 0;
-        r_b << r_c // lsl
-      },
-      8 => {
-        // set carry flag
-        self.flags[0] = r_b & ((1 << r_c) - 1) != 0;
-        r_b >> r_c // lsr
-      },
-      9 => {
-        // set carry flag
-        let carry = r_b & 1;
-        let sign = r_b >> 31;
-        self.flags[0] = carry != 0;
-        (r_b >> r_c) | (0xFFFFFFFF * sign << if r_c > 0 {32 - r_c} else {0}) // asr
-      },
-      10 => {
-        // set carry flag
-        let carry = r_b >> if r_c > 0 {32 - r_c} else {0};
-        self.flags[0] = carry != 0;
-        (r_b << r_c) | carry // rotl
-      },
-      11 => {
-        // set carry flag
-        let carry = r_b & ((1 << r_c) - 1);
-        self.flags[0] = carry != 0;
-        (r_b >> r_c) | (carry << if r_c > 0 {32 - r_c} else {0}) // rotr
-      },
-      12 => {
-        // set carry flag
-        let carry = if r_c > 0 {r_b >> (32 - r_c)} else {0};
-        let old_carry = u32::from(self.flags[0]);
-        self.flags[0] = carry != 0;
-        (r_b << r_c) | if r_c > 0 {old_carry << (r_c - 1)} else {0} // lslc
-      },
-      13 => {
-        // set carry flag
-        let carry = r_b & ((1 << r_c) - 1);
-        let old_carry = u32::from(self.flags[0]);
-        self.flags[0] = carry != 0;
-        (r_b >> r_c) | (old_carry << if r_c > 0 {32 - r_c} else {0}) // lsrc
-      },
-      14 => {
-        // add
-        let result = u64::from(r_b) + u64::from(r_c);
-
-        // set the carry flag
-        self.flags[0] = result >> 32 != 0;
-
-        result as u32
-      },
-      15 => {
-        // addc
-        let result = u64::from(r_c) + u64::from(r_b) + u64::from(self.flags[0]);
-
-        // set the carry flag
-        self.flags[0] = result >> 32 != 0;
-
-        result as u32
-      },
-      16 => {
-        // sub
-
-        // two's complement
-        let r_c = (1 + u64::from(!r_c)) as u32;
-        let result = u64::from(r_c) + u64::from(r_b);
-
-        // set the carry flag
-        self.flags[0] = result >> 32 != 0;
-
-        result as u32
-      },
-      17 => {
-        // subb
-
-        // two's complement
-        let r_c = (1 + u64::from(
-          !(u32::wrapping_add(
-          u32::from(!self.flags[0]), r_c)))) as u32;
-        let result = u64::from(r_c) + u64::from(r_b);
-
-        // set the carry flag
-        self.flags[0] = result >> 32 != 0;
-
-        result as u32
-      },
-      18 => {
-        // mul
-        let result = u64::from(r_b) * u64::from(r_c);
-
-        // set the carry flag
-        self.flags[0] = result >> 32 != 0;
-
-        result as u32
-      },
-      _ => {
-        self.raise_exc_instr();
-        return;
-      }
-    };
-
-    // never update r0
-    if r_a != 0 {
-      self.regfile[r_a as usize] = result;
+  fn get_reg(&self, regnum : u32) -> u32 {
+    if self.kmode && regnum == 31 {
+      // use kernel stack pointer
+      self.cregfile[8]
+    } else {
+      // normal register access
+      self.regfile[regnum as usize]
     }
-    
-    self.update_flags(result, r_b, r_c, op);
+  }
 
-    self.pc += 4;
-
+  fn write_reg(&mut self, regnum : u32, value : u32) {
+    if self.kmode && regnum == 31 {
+      // use kernel stack pointer
+      self.cregfile[8] = value;
+    } else {
+      // normal register access
+      if regnum != 0 {
+        // r0 is always zero
+        self.regfile[regnum as usize] = value;
+      }
+    }
   }
 
   fn decode_alu_imm(&mut self, op : u32, imm : u32) -> Option<u32> {
@@ -642,116 +510,113 @@ impl Emulator {
     }
   }
 
-  fn alu_imm_op(&mut self, instr : u32) {
+  // 2nd operand is either register or immediate
+  fn alu_op(&mut self, instr : u32, imm : bool) {
     // instruction format is
-    // 00000aaaaabbbbb?????iiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (5 bits) | imm (12 bits)
+    // 00000aaaaabbbbbxxxxxxx?????ccccc
+    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | unused (7 bits) | op (5 bits) | r_c (5 bits)
     let r_a = (instr >> 22) & 0x1F;
     let r_b = (instr >> 17) & 0x1F;
-    let op = (instr >> 12) & 0x1F;
-    let imm = instr & 0xFFF;
-
-    let imm = self.decode_alu_imm(op, imm);
-
-    if let Some(_) = imm {} 
-    else {
-      return;
-    }
-
-    let imm = imm.unwrap();
+    let op = if imm {
+      (instr >> 12) & 0x1F
+    } else {
+      (instr >> 5) & 0x1F
+    };
 
     // retrieve arguments
-    let r_b = self.regfile[r_b as usize];
+    let r_b = self.get_reg(r_b);
+
+    let r_c = if imm {
+      self.decode_alu_imm(op, instr & 0xFFF).expect("immediate decoding failed")
+    } else {
+      let r_c = instr & 0x1F;
+      self.get_reg(r_c)
+    };
+
+    let prev_carry = self.cregfile[5] & 1;
+
+    self.cregfile[5] &= 0xFFFFFFF0; // clear arithmetic flags
 
     // carry flag is set differently for each instruction,
     // so its handled here. The other flags are all handled together
     let result = match op {
       0 => {
-        self.flags[0] = false;
-        r_b & imm // and
+        r_b & r_c // and
       }, 
       1 => {
-        self.flags[0] = false;
-        !(r_b & imm)  // nand
+        !(r_b & r_c)  // nand
       },
       2 => {
-        self.flags[0] = false;
-        r_b | imm // or
+        r_b | r_c // or
       },
       3 => {
-        self.flags[0] = false;
-        !(r_b | imm) // nor
+        !(r_b | r_c) // nor
       },
       4 => {
-        self.flags[0] = false;
-        r_b ^ imm // xor
+        r_b ^ r_c // xor
       },
       5 => {
-        self.flags[0] = false;
-        !(r_b ^ imm) // xnor
+        !(r_b ^ r_c) // xnor
       },
       6 => {
-        self.flags[0] = false;
-        !imm // not
+        !r_c // not
       },
       7 => {
         // set carry flag
-        self.flags[0] = r_b >> if imm > 0 {32 - imm} else {0} != 0;
-        r_b << imm // lsl
+        self.cregfile[5] |= (r_b >> if r_c > 0 {32 - r_c} else {0} != 0) as u32;
+        r_b << r_c // lsl
       },
       8 => {
         // set carry flag
-        self.flags[0] = r_b & ((1 << imm) - 1) != 0;
-        r_b >> imm // lsr
+        self.cregfile[5] |= (r_b & ((1 << r_c) - 1) != 0) as u32;
+        r_b >> r_c // lsr
       },
       9 => {
         // set carry flag
         let carry = r_b & 1;
         let sign = r_b >> 31;
-        self.flags[0] = carry != 0;
-        (r_b >> imm) | (0xFFFFFFFF * sign << if imm > 0 {32 - imm} else {0}) // asr
+        self.cregfile[5] |= carry;
+        (r_b >> r_c) | (0xFFFFFFFF * sign << if r_c > 0 {32 - r_c} else {0}) // asr
       },
       10 => {
         // set carry flag
-        let carry = r_b >> if imm > 0 {32 - imm} else {0};
-        self.flags[0] = carry != 0;
-        (r_b << imm) | carry // rotl
+        let carry = r_b >> if r_c > 0 {32 - r_c} else {0};
+        self.cregfile[5] |= (carry != 0) as u32;
+        (r_b << r_c) | carry // rotl
       },
       11 => {
         // set carry flag
-        let carry = r_b & ((1 << imm) - 1);
-        self.flags[0] = carry != 0;
-        (r_b >> imm) | (carry << if imm > 0 {32 - imm} else {0}) // rotr
+        let carry = r_b & ((1 << r_c) - 1);
+        self.cregfile[5] |= (carry != 0) as u32;
+        (r_b >> r_c) | (carry << if r_c > 0 {32 - r_c} else {0}) // rotr
       },
       12 => {
         // set carry flag
-        let carry = r_b >> if imm > 0 {32 - imm} else {0};
-        let old_carry = u32::from(self.flags[0]);
-        self.flags[0] = carry != 0;
-        (r_b << imm) | (old_carry << if imm > 0 {imm - 1} else {0}) // lslc
+        let carry = if r_c > 0 {r_b >> (32 - r_c)} else {0};
+        self.cregfile[5] |= (carry != 0) as u32;
+        (r_b << r_c) | if r_c > 0 {prev_carry << (r_c - 1)} else {0} // lslc
       },
       13 => {
         // set carry flag
-        let carry = r_b & ((1 << imm) - 1);
-        let old_carry = u32::from(self.flags[0]);
-        self.flags[0] = carry != 0;
-        (r_b >> imm) | (old_carry << if imm > 0 {32 - imm} else {0}) // lsrc
+        let carry = r_b & ((1 << r_c) - 1);
+        self.cregfile[5] |= (carry != 0) as u32;
+        (r_b >> r_c) | (prev_carry << if r_c > 0 {32 - r_c} else {0}) // lsrc
       },
       14 => {
         // add
-        let result = u64::from(r_b) + u64::from(imm);
+        let result = u64::from(r_b) + u64::from(r_c);
 
         // set the carry flag
-        self.flags[0] = result >> 32 != 0;
+        self.cregfile[5] |= (result >> 32 != 0) as u32;
 
         result as u32
       },
       15 => {
         // addc
-        let result = u64::from(imm) + u64::from(r_b) + u64::from(self.flags[0]);
+        let result = u64::from(r_c) + u64::from(r_b) + u64::from(prev_carry);
 
         // set the carry flag
-        self.flags[0] = result >> 32 != 0;
+        self.cregfile[5] |= (result >> 32 != 0) as u32;
 
         result as u32
       },
@@ -759,11 +624,17 @@ impl Emulator {
         // sub
 
         // two's complement
-        let r_b = (1 + u64::from(!r_b)) as u32;
-        let result = u64::from(imm) + u64::from(r_b);
+        // sub with immediate does imm - reg
+        let result = if imm {
+          let r_b = (1 + u64::from(!r_b)) as u32;
+          u64::from(r_c) + u64::from(r_b)
+        } else {
+          let r_c = (1 + u64::from(!r_c)) as u32;
+          u64::from(r_c) + u64::from(r_b)
+        };
 
         // set the carry flag
-        self.flags[0] = result >> 32 != 0;
+        self.cregfile[5] |= (result >> 32 != 0) as u32;
 
         result as u32
       },
@@ -771,22 +642,29 @@ impl Emulator {
         // subb
 
         // two's complement
-        let r_b = (1 + u64::from(
+        let result = if imm {
+          let r_b = (1 + u64::from(
           !(u32::wrapping_add(
-          u32::from(!self.flags[0]), r_b)))) as u32;
-        let result = u64::from(imm) + u64::from(r_b);
+          u32::from(prev_carry == 0), r_b)))) as u32;
+          u64::from(imm) + u64::from(r_b)
+        } else {
+          let r_c = (1 + u64::from(
+          !(u32::wrapping_add(u32::from(prev_carry == 0), r_c)))
+          ) as u32;
+          u64::from(r_c) + u64::from(r_b)
+        };
 
         // set the carry flag
-        self.flags[0] = result >> 32 != 0;
+        self.cregfile[5] |= (result >> 32 != 0) as u32;
 
         result as u32
       },
       18 => {
         // mul
-        let result = u64::from(r_b) * u64::from(imm);
+        let result = u64::from(r_b) * u64::from(r_c);
 
         // set the carry flag
-        self.flags[0] = result >> 32 != 0;
+        self.cregfile[5] |= (result >> 32 != 0) as u32;
 
         result as u32
       },
@@ -797,13 +675,12 @@ impl Emulator {
     };
 
     // never update r0
-    if r_a != 0 {
-      self.regfile[r_a as usize] = result;
-    }
+    self.write_reg(r_a, result);
     
-    self.update_flags(result, r_b, imm, op);
+    self.update_flags(result, r_b, r_c, op);
 
     self.pc += 4;
+
   }
 
   fn load_upper_immediate(&mut self, instr : u32){
@@ -811,14 +688,12 @@ impl Emulator {
     let r_a = (instr >> 22) & 0x1F;
     let imm = (instr & 0x03FFFFF) << 10;
 
-    if r_a != 0 {
-      self.regfile[r_a as usize] = imm;
-    }
+    self.write_reg(r_a, imm);
 
     self.pc += 4;
   }
 
-  fn mem_absolute_w(&mut self, instr : u32){
+  fn mem_absolute(&mut self, instr : u32, size : u8){
     // instruction format is
     // 00011aaaaabbbbb?yyzziiiiiiiiiiii
     // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | y (2 bits) | z (2 bits) | imm (12 bits)
@@ -841,14 +716,30 @@ impl Emulator {
     };
 
     // get addr
-    let r_b_out = self.regfile[r_b as usize];
+    let r_b_out = self.get_reg(r_b);
     let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
 
     if is_load {
-      if let Some(data) = self.mem_read32(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = data;
+      let data = match size {
+        0 => {
+          // byte
+          self.mem_read8(addr).map(|v| u32::from(v))
+        },
+        1 => {
+          // halfword
+          self.mem_read16(addr).map(|v| u32::from(v))
+        },
+        2 => {
+          // word
+          self.mem_read32(addr)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
         }
+      };
+
+      if let Some(data) = data {
+        self.write_reg(r_a, data);
       } else{
         // TLB Miss
         self.raise_tlb_miss(addr);
@@ -856,23 +747,40 @@ impl Emulator {
       };
     } else {
       // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write32(addr, data) {
+      let data = self.get_reg(r_a);
+      let success = match size {
+        0 => {
+          // byte
+          self.mem_write8(addr, data as u8)
+        },
+        1 => {
+          // halfword
+          self.mem_write16(addr, data as u16)
+        },
+        2 => {
+          // word
+          self.mem_write32(addr, data)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
+        }
+      };
+      if !success {
         // TLB Miss
         self.raise_tlb_miss(addr);
         return;
       }
     }
 
-    if (y == 1 || y == 2) && (r_b != 0) {
+    if y == 1 || y == 2 {
       // pre or post increment
-      self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
+      self.write_reg(r_b, u32::wrapping_add(r_b_out, imm));
     }
 
     self.pc += 4;
   }
 
-  fn mem_relative_w(&mut self, instr : u32){
+  fn mem_relative(&mut self, instr : u32, size : u8){
     // instruction format is
     // 00100aaaaabbbbb?iiiiiiiiiiiiiiii
     // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | imm (16 bits)
@@ -886,7 +794,7 @@ impl Emulator {
     let imm = imm | (0xFFFF0000 * ((imm >> 15) & 1));
 
     // get addr
-    let r_b_out = self.regfile[r_b as usize];
+    let r_b_out = self.get_reg(r_b);
     let addr = u32::wrapping_add(r_b_out, imm);
 
     // make addr pc-relative
@@ -894,10 +802,26 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if let Some(data) = self.mem_read32(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = data;
+      let data = match size {
+        0 => {
+          // byte
+          self.mem_read8(addr).map(|v| u32::from(v))
+        },
+        1 => {
+          // halfword
+          self.mem_read16(addr).map(|v| u32::from(v))
+        },
+        2 => {
+          // word
+          self.mem_read32(addr)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
         }
+      };
+
+      if let Some(data) = data {
+        self.write_reg(r_a, data);
       } else{
         // TLB Miss
         self.raise_tlb_miss(addr);
@@ -905,8 +829,27 @@ impl Emulator {
       };
     } else {
       // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write32(addr, data) {
+      let data = self.get_reg(r_a);
+
+      let success = match size {
+        0 => {
+          // byte
+          self.mem_write8(addr, data as u8)
+        },
+        1 => {
+          // halfword
+          self.mem_write16(addr, data as u16)
+        },
+        2 => {
+          // word
+          self.mem_write32(addr, data)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
+        }
+      };
+
+      if !success {
         // TLB Miss
         self.raise_tlb_miss(addr);
         return;
@@ -916,7 +859,7 @@ impl Emulator {
     self.pc += 4;
   }
 
-  fn mem_imm_w(&mut self, instr : u32){
+  fn mem_imm(&mut self, instr : u32, size : u8){
     // instruction format is
     // 00101aaaaa?iiiiiiiiiiiiiiiiiiiii
     // op (5 bits) | r_a (5 bits) | op (1 bit) | imm (21 bits)
@@ -933,10 +876,26 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, 4);
 
     if is_load {
-      if let Some(data) = self.mem_read32(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = data;
+      let data = match size {
+        0 => {
+          // byte
+          self.mem_read8(addr).map(|v| u32::from(v))
+        },
+        1 => {
+          // halfword
+          self.mem_read16(addr).map(|v| u32::from(v))
+        },
+        2 => {
+          // word
+          self.mem_read32(addr)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
         }
+      };
+
+      if let Some(data) = data {
+        self.write_reg(r_a, data);
       } else{
         // TLB Miss
         self.raise_tlb_miss(addr);
@@ -944,8 +903,27 @@ impl Emulator {
       };
     } else {
       // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write32(addr, data) {
+      let data = self.get_reg(r_a);
+
+      let success = match size {
+        0 => {
+          // byte
+          self.mem_write8(addr, data as u8)
+        },
+        1 => {
+          // halfword
+          self.mem_write16(addr, data as u16)
+        },
+        2 => {
+          // word
+          self.mem_write32(addr, data)
+        },
+        _ => {
+          panic!("invalid size for mem instruction");
+        }
+      };
+
+      if !success {
         // TLB Miss
         self.raise_tlb_miss(addr);
         return;
@@ -955,278 +933,37 @@ impl Emulator {
     self.pc += 4;
   }
 
-  fn mem_absolute_d(&mut self, instr : u32){
-    // instruction format is
-    // 00110aaaaabbbbb?yyzziiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | y (2 bits) | z (2 bits) | imm (12 bits)
+  fn get_branch_condition(&mut self, op: u32) -> Option<bool> {
+    let carry = (self.cregfile[5] & 1) != 0;
+    let zero = (self.cregfile[5] & 2) != 0;
+    let sign = (self.cregfile[5] & 4) != 0;
+    let overflow = (self.cregfile[5] & 8) != 0;
 
-    let r_a = (instr >> 22) & 0x1F;
-    let r_b = (instr >> 17) & 0x1F;
-    let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-    let y = (instr >> 14) & 3;
-    let z = (instr >> 12) & 3;
-    let imm = instr & 0xFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
-    // shift imm
-    let imm = imm << z;
-
-    if y >= 4 {
-      self.raise_exc_instr();
-      return;
-    };
-
-    // get addr
-    let r_b_out = self.regfile[r_b as usize];
-    let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
-
-    if is_load {
-      if let Some(data) = self.mem_read16(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write16(addr, data as u16) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
+    match op {
+      0 => Some(true), // br
+      1 => Some(zero), // bz
+      2 => Some(!zero), // bnz
+      3 => Some(sign), // bs
+      4 => Some(!sign), // bns
+      5 => Some(carry), // bc
+      6 => Some(!carry), // bnc
+      7 => Some(overflow), // bo
+      8 => Some(!overflow), // bno
+      9 => Some(!zero && !sign), // bps
+      10 => Some(zero || sign), // bnps
+      11 => Some(sign == overflow && !zero), // bg
+      12 => Some(sign == overflow), // bge
+      13 => Some(sign != overflow && !zero), // bl
+      14 => Some(sign != overflow || zero), // ble
+      15 => Some(!zero && carry), // ba
+      16 => Some(carry || zero), // bae
+      17 => Some(!carry && !zero), // bb
+      18 => Some(!carry || zero), // bbe
+      _ => {
+        self.raise_exc_instr();
+        return None;
       }
     }
-
-    if (y == 1 || y == 2) && (r_b != 0) {
-      // pre or post increment
-      self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
-    }
-
-    self.pc += 4;
-  }
-
-  fn mem_relative_d(&mut self, instr : u32){
-    // instruction format is
-    // 00111aaaaabbbbb?iiiiiiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | imm (16 bits)
-
-    let r_a = (instr >> 22) & 0x1F;
-    let r_b = (instr >> 17) & 0x1F;
-    let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-    let imm = instr & 0xFFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFFF0000 * ((imm >> 15) & 1));
-
-    // get addr
-    let r_b_out = self.regfile[r_b as usize];
-    let addr = u32::wrapping_add(r_b_out, imm);
-
-    // make addr pc-relative
-    let addr = u32::wrapping_add(addr, self.pc);
-    let addr = u32::wrapping_add(addr, 4);
-
-    if is_load {
-      if let Some(data) = self.mem_read16(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write16(addr, data as u16) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      }
-    }
-
-    self.pc += 4;
-  }
-
-  fn mem_imm_d(&mut self, instr : u32){
-    // instruction format is
-    // 01000aaaaa?iiiiiiiiiiiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | op (1 bit) | imm (21 bits)
-
-    let r_a = (instr >> 22) & 0x1F;
-    let is_load = ((instr >> 21) & 1) != 0; // is this a load? else is store
-    let imm = instr & 0x1FFFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFE00000 * ((imm >> 20) & 1));
-
-    // get addr
-    let addr = u32::wrapping_add(imm, self.pc);
-    let addr = u32::wrapping_add(addr, 4);
-
-    if is_load {
-      if let Some(data) = self.mem_read16(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write16(addr, data as u16) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      }
-    }
-
-    self.pc += 4;
-  }
-
-  fn mem_absolute_b(&mut self, instr : u32){
-    // instruction format is
-    // 01001aaaaabbbbb?yyzziiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | y (2 bits) | z (2 bits) | imm (12 bits)
-
-    let r_a = (instr >> 22) & 0x1F;
-    let r_b = (instr >> 17) & 0x1F;
-    let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-    let y = (instr >> 14) & 3;
-    let z = (instr >> 12) & 3;
-    let imm = instr & 0xFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
-    // shift imm
-    let imm = imm << z;
-
-    if y >= 4 {
-      self.raise_exc_instr();
-      return;
-    };
-
-    // get addr
-    let r_b_out = self.regfile[r_b as usize];
-    let addr = if y == 2 {r_b_out} else {u32::wrapping_add(r_b_out, imm)}; // check for postincrement
-
-    if is_load {
-      if let Some(data) = self.mem_read8(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write8(addr, data as u8) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      }
-    }
-
-    if (y == 1 || y == 2) && (r_b != 0) {
-      // pre or post increment
-      self.regfile[r_b as usize] = u32::wrapping_add(r_b_out, imm);
-    }
-
-    self.pc += 4;
-  }
-
-  fn mem_relative_b(&mut self, instr : u32){
-    // instruction format is
-    // 01010aaaaabbbbb?iiiiiiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | imm (16 bits)
-
-    let r_a = (instr >> 22) & 0x1F;
-    let r_b = (instr >> 17) & 0x1F;
-    let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-    let imm = instr & 0xFFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFFF0000 * ((imm >> 15) & 1));
-
-    // get addr
-    let r_b_out = self.regfile[r_b as usize];
-    let addr = u32::wrapping_add(r_b_out, imm);
-
-    // make addr pc-relative
-    let addr = u32::wrapping_add(addr, self.pc);
-    let addr = u32::wrapping_add(addr, 4);
-
-    if is_load {
-      if let Some(data) = self.mem_read8(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write8(addr, data as u8) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      }
-    }
-
-    self.pc += 4;
-  }
-
-  fn mem_imm_b(&mut self, instr : u32){
-    // instruction format is
-    // 01011aaaaa?iiiiiiiiiiiiiiiiiiiii
-    // op (5 bits) | r_a (5 bits) | op (1 bit) | imm (21 bits)
-
-    let r_a = (instr >> 22) & 0x1F;
-    let is_load = ((instr >> 21) & 1) != 0; // is this a load? else is store
-    let imm = instr & 0x1FFFFF;
-
-    // sign extend imm
-    let imm = imm | (0xFFE00000 * ((imm >> 20) & 1));
-
-    // get addr
-    let addr = u32::wrapping_add(imm, self.pc);
-    let addr = u32::wrapping_add(addr, 4);
-
-    if is_load {
-      if let Some(data) = self.mem_read8(addr) {
-        if r_a != 0 {
-          self.regfile[r_a as usize] = u32::from(data);
-        }
-      } else{
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      };
-    } else {
-      // is a store
-      let data = self.regfile[r_a as usize];
-      if !self.mem_write8(addr, data as u8) {
-        // TLB Miss
-        self.raise_tlb_miss(addr);
-        return;
-      }
-    }
-
-    self.pc += 4;
   }
 
   fn branch_imm(&mut self, instr : u32){
@@ -1239,36 +976,14 @@ impl Emulator {
     // sign extend
     let imm = imm | (0xFFC00000 * ((imm >> 21) & 1));
 
-    let branch = match op {
-      0 => true, // br
-      1 => self.flags[1], // bz
-      2 => !self.flags[1], // bnz
-      3 => self.flags[2], // bs
-      4 => !self.flags[2], // bns
-      5 => self.flags[0], // bc
-      6 => !self.flags[0], // bnc
-      7 => self.flags[3], // bo
-      8 => !self.flags[3], // bno
-      9 => !self.flags[1] && !self.flags[2], // bps
-      10 => self.flags[1] || self.flags[2], // bnps
-      11 => self.flags[2] == self.flags[3] && !self.flags[1], // bg
-      12 => self.flags[2] == self.flags[3], // bge
-      13 => self.flags[2] != self.flags[3] && !self.flags[1], // bl
-      14 => self.flags[2] != self.flags[3] || self.flags[1], // ble
-      15 => !self.flags[1] && self.flags[0], // ba
-      16 => self.flags[0] || self.flags[1], // bae
-      17 => !self.flags[0] && !self.flags[1], // bb
-      18 => !self.flags[0] || self.flags[1], // bbe
-      _ => {
-        self.raise_exc_instr();
-        return;
+    if let Some(branch) = self.get_branch_condition(op) {
+      if branch {
+        self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4 , imm));
+      } else {
+        self.pc += 4;
       }
-    };
-
-    if branch {
-      self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4 , imm));
     } else {
-      self.pc += 4;
+      return;
     }
 
   }
@@ -1282,41 +997,17 @@ impl Emulator {
     let r_b = instr & 0x1F;
 
     // get address
-    let r_b = self.regfile[r_b as usize];
+    let r_b = self.get_reg(r_b);
 
-    let branch = match op {
-      0 => true, // br
-      1 => self.flags[1], // bz
-      2 => !self.flags[1], // bnz
-      3 => self.flags[2], // bs
-      4 => !self.flags[2], // bns
-      5 => self.flags[0], // bc
-      6 => !self.flags[0], // bnc
-      7 => self.flags[3], // bo
-      8 => !self.flags[3], // bno
-      9 => !self.flags[1] && !self.flags[2], // bps
-      10 => self.flags[1] || self.flags[2], // bnps
-      11 => self.flags[2] == self.flags[3] && !self.flags[1], // bg
-      12 => self.flags[2] == self.flags[3], // bge
-      13 => self.flags[2] != self.flags[3] && !self.flags[1], // bl
-      14 => self.flags[2] != self.flags[3] || self.flags[1], // ble
-      15 => !self.flags[1] && self.flags[0], // ba
-      16 => self.flags[0] || self.flags[1], // bae
-      17 => !self.flags[0] && !self.flags[1], // bb
-      18 => !self.flags[0] || self.flags[1], // bbe
-      _ => {
-        self.raise_exc_instr();
-        return;
+    if let Some(branch) = self.get_branch_condition(op) {
+      if branch {
+        self.write_reg(r_a, self.pc + 4);
+        self.pc = r_b;
+      } else {
+        self.pc += 4;
       }
-    };
-
-    if branch {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = self.pc + 4;
-      }
-      self.pc = r_b;
     } else {
-      self.pc += 4;
+      return;
     }
   }
 
@@ -1329,41 +1020,17 @@ impl Emulator {
     let r_b = instr & 0x1F;
 
     // get address
-    let r_b = self.regfile[r_b as usize];
+    let r_b = self.get_reg(r_b);
 
-    let branch = match op {
-      0 => true, // br
-      1 => self.flags[1], // bz
-      2 => !self.flags[1], // bnz
-      3 => self.flags[2], // bs
-      4 => !self.flags[2], // bns
-      5 => self.flags[0], // bc
-      6 => !self.flags[0], // bnc
-      7 => self.flags[3], // bo
-      8 => !self.flags[3], // bno
-      9 => !self.flags[1] && !self.flags[2], // bps
-      10 => self.flags[1] || self.flags[2], // bnps
-      11 => self.flags[2] == self.flags[3] && !self.flags[1], // bg
-      12 => self.flags[2] == self.flags[3], // bge
-      13 => self.flags[2] != self.flags[3] && !self.flags[1], // bl
-      14 => self.flags[2] != self.flags[3] || self.flags[1], // ble
-      15 => !self.flags[1] && self.flags[0], // ba
-      16 => self.flags[0] || self.flags[1], // bae
-      17 => !self.flags[0] && !self.flags[1], // bb
-      18 => !self.flags[0] || self.flags[1], // bbe
-      _ => {
-        self.raise_exc_instr();
-        return;
+    if let Some(branch) = self.get_branch_condition(op) {
+      if branch {  
+        self.write_reg(r_a, self.pc + 4);
+        self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4, r_b));
+      } else {
+        self.pc += 4;
       }
-    };
-
-    if branch {
-      if r_a != 0 {
-        self.regfile[r_a as usize] = self.pc + 4;
-      }
-      self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4, r_b));
     } else {
-      self.pc += 4;
+      return;
     }
   }
 
@@ -1381,12 +1048,7 @@ impl Emulator {
         // sys EXIT
 
         // save pc and flags
-        self.cregfile[4] = self.pc;
-        self.cregfile[5] = 
-          ((self.flags[3] as u32) << 3) |
-          ((self.flags[2] as u32) << 2) |
-          ((self.flags[1] as u32) << 1) |
-          (self.flags[0] as u32);
+        self.cregfile[4] = self.pc + 4;
 
         self.pc = self.mem_read32(0x01 * 4).expect("shouldnt fail");
       }
@@ -1406,14 +1068,14 @@ impl Emulator {
     let is_sub = op == 16 || op == 17;
 
     // set the zero flag
-    self.flags[1] = result == 0;
+    self.cregfile[5] |= ((result == 0) as u32) << 1;
     // set the sign flag
-    self.flags[2] = result_sign != 0;
+    self.cregfile[5] |= ((result_sign != 0) as u32) << 2;
     // set the overflow flag
-    self.flags[3] = if is_sub {
-      (result_sign != lhs_sign) && (lhs_sign != rhs_sign)
+    self.cregfile[5] |= if is_sub {
+      (((result_sign != lhs_sign) && (lhs_sign != rhs_sign)) as u32) << 3
     } else {
-      (result_sign != lhs_sign) && (lhs_sign == rhs_sign)
+      (((result_sign != lhs_sign) && (lhs_sign == rhs_sign)) as u32) << 3
     }
   }
 
@@ -1456,20 +1118,20 @@ impl Emulator {
     let ra = (instr >> 22) & 0x1F;
     let rb = (instr >> 17) & 0x1F;
 
-    let rb = self.regfile[rb as usize];
+    let rb = self.get_reg(rb);
     // rb has pid (12 bits) | addr (20 bits)
     if op == 0 {
       // tlbr
       if ra != 0 {
         if let Some(val) = self.tlb.read(rb) {
-          self.regfile[ra as usize] = val;
+          self.write_reg(ra, val);
         } else {
-          self.regfile[ra as usize] = 0;
+          self.write_reg(ra, 0);
         }
       }
     } else if op == 1 {
       // tlbw
-      let ra = self.regfile[ra as usize];
+      let ra = self.get_reg(ra);
       self.tlb.write(rb, ra & 0x3F);
     } else {
       // tlbc
@@ -1483,6 +1145,9 @@ impl Emulator {
     let ra = (instr >> 22) & 0x1F;
     let rb = (instr >> 17) & 0x1F;
 
+    // don't use get_reg/write_reg here because 
+    // crmv doesn't respect the r31 => kernel stack pointer alias
+
     if op == 0 {
       // crmv crA, rB
       let rb = self.regfile[rb as usize];
@@ -1493,10 +1158,16 @@ impl Emulator {
         let rb = self.cregfile[rb as usize];
         self.regfile[ra as usize] = rb;
       }
-    } else {
+    } else if op == 2 {
       // crmv crA, crB
       let rb = self.cregfile[rb as usize];
       self.cregfile[ra as usize] = rb;
+    } else {
+      // crmv rA, rB
+      if ra != 0 {
+        let rb = self.regfile[rb as usize];
+        self.regfile[ra as usize] = rb;
+      }
     }
     self.pc += 4;
   }
@@ -1529,19 +1200,7 @@ impl Emulator {
       self.cregfile[3] |= 0x80000000;
     }
 
-    let ra = (instr >> 22) & 0x1F;
-    let rb = (instr >> 17) & 0x1F;
-
-    let ra = self.regfile[ra as usize];
-    let rb = self.regfile[rb as usize];
-
-    // restore flags
-    self.flags[3] = if (ra >> 3) & 1 != 0 {true} else {false};
-    self.flags[2] = if (ra >> 2) & 1 != 0 {true} else {false};
-    self.flags[1] = if (ra >> 1) & 1 != 0 {true} else {false};
-    self.flags[0] = if (ra >> 0) & 1 != 0 {true} else {false};
-
     // restore pc
-    self.pc = rb;
+    self.pc = self.cregfile[4];
   }
 }

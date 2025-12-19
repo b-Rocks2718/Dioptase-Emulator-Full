@@ -1,10 +1,10 @@
   .kernel
 
 EXC_INSTR:
-  mov r29, efg
-  mov r30, epc
-  add r30, r30, 4 # skip the bad instruction and then return
-  rfi r29, r30
+  mov r1, epc
+  add r1, r1, 4 # skip the bad instruction and then return
+  crmv epc, r1
+  rfi
 
 _start:
   movi r3, 0x42

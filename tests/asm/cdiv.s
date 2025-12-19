@@ -99,7 +99,7 @@ _start:
   # set square reg
   movi r3, SCALE_REG_ADDR
   movi r4, 1
-  swa  r4, [r3]
+  sba  r4, [r3]
 
 set_color:
   movi r8, TILEMAP_ADDR

@@ -12,7 +12,8 @@ _start:
   tlbw r5, r4
 
   # enter user mode
-  rfe r0, r0
+  crmv epc, r0
+  rfe
   
 EXIT:
   mode halt

@@ -1,8 +1,8 @@
   .kernel
 
-  .define PS2_ADDR 0x20000
+  .define PS2_ADDR 0x7FF0000
 
-  .define UART_ADDR 0x20002
+  .define UART_ADDR 0x7FF0002
 
   .define KEY_A 97
   .define KEY_Q 113
@@ -13,6 +13,10 @@ INT_KEYBOARD:
   push r3
   push r4
   push r5
+
+  # save flags
+  mov  r3, flg
+  push r3
 
   # check key
   movi r4, PS2_ADDR
@@ -48,23 +52,24 @@ end:
   and  r4, r4, r3
   mov  isr, r4
 
+  # restore flags
+  pop  r3
+  mov  flg, r3
+
   # restore caller registers
   pop  r5
   pop  r4
   pop  r3
 
   # return from the interrupt
-  mov  r30, epc
-  mov  r29, efg
-  rfi  r29, r30
+  rfi
 
 COUNTER:
   .fill 0
 
 _start:
   # initialize stack
-  movi r1, 0x1000
-  movi r2, 0x1000
+  movi r31, 0x1000
 
   # enable keyboard interrupts (bit 1) and global enable
   movi r3, 0x80000002
@@ -78,8 +83,6 @@ loop:
   lw   r5, [COUNTER]
   add  r3, r3, r5
   sba  r3, [r4]
-
-  add  r0, r0, r0  # allow store to commit before sleeping
 
   mode sleep
   jmp loop

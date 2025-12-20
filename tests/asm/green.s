@@ -3,13 +3,15 @@
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
 
-  .define PHY_TILEMAP_ADDR 0x2A000
-  .define PHY_FRAMEBUFFER_ADDR 0x2E000
+  .define PHY_TILEMAP_ADDR 0x7FFA000
+  .define PHY_FRAMEBUFFER_ADDR 0x7FFE000
+
+  .define VMEM_FLAGS 0x00F
 
   .define VRT_TILEMAP_ADDR 0x10000000
   .define VRT_FRAMEBUFFER_ADDR 0x20000000
 
-  .define PS2_ADDR 0x20000
+  .define PS2_ADDR 0x7FF0000
 
   .define USER_PID 1
 
@@ -19,7 +21,7 @@ EXIT:
 INT_KEYBOARD:
   # return the character causing an interrupt
   movi r4, PS2_ADDR
-  lda  r3, [r4]
+  lda  r1, [r4]
   mode halt
 
 INT_TIMER:
@@ -27,39 +29,39 @@ INT_TIMER:
 
 _start:
   call init_tlb
-  movi r4, 1
+  movi r4, USER_PID
   mov  pid, r4 # set pid to 1
 
   # enable interrupts
   movi r3, 0xFFFFFFFF
   mov  cr3, r3
 
-  rfe  r0, r0 # jump to userland
+  mov  epc, r0
+  rfe  # jump to userland
 
 init_tlb:
-  movi r3, USER_PID
-  lsl  r3, r3, 20
+  # map VRT_TILEMAP_ADDR => PHY_TILEMAP_ADDR
+  movi r2, PHY_TILEMAP_ADDR
+  movi r4, VMEM_FLAGS
+  or   r2, r2, r4
 
-  movi r5, PHY_TILEMAP_ADDR
-  movi r8, VRT_TILEMAP_ADDR
-  lsr  r5, r5, 12
-  lsr  r8, r8, 12
-  or   r8, r8, r3
-  tlbw r5, r8
+  movi r3, VRT_TILEMAP_ADDR
 
-  movi r5, PHY_FRAMEBUFFER_ADDR
-  movi r8, VRT_FRAMEBUFFER_ADDR
-  lsr  r5, r5, 12
-  lsr  r8, r8, 12
-  or   r8, r8, r3
-  tlbw r5, r8
+  tlbw r2, r3
 
-  movi r5, 0x1000
-  movi r8, 0
-  lsr  r5, r5, 12
-  lsr  r8, r8, 12
-  or   r8, r8, r3
-  tlbw r5, r8
+  # map VRT_FRAMEBUFFER_ADDR => PHY_FRAMEBUFFER_ADDR
+  movi r2, PHY_FRAMEBUFFER_ADDR
+  movi r3, VRT_FRAMEBUFFER_ADDR
+  or   r2, r2, r4
+
+  tlbw r2, r3
+
+  # map 0x00000000 => 0x0001000
+  movi r2, 0x1000
+  movi r3, 0
+  or   r2, r2, r4
+
+  tlbw r2, r3
 
   ret
 

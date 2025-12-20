@@ -4,11 +4,11 @@
   # uses a sprite instead of the framebuffer
   # uses interrupts to accomplish this
 
-  .define SPRITEMAP_0_ADDR 0x26000
-  .define SPRITE_0_X_ADDR 0x2FFD0
-  .define SPRITE_0_Y_ADDR 0x2FFD2
+  .define SPRITEMAP_0_ADDR 0x7FF6000
+  .define SPRITE_0_X_ADDR 0x7FFFFD0
+  .define SPRITE_0_Y_ADDR 0x7FFFFD2
   
-  .define PS2_ADDR 0x20000
+  .define PS2_ADDR 0x7FF0000
 
   .define KEY_W 119
   .define KEY_A 97
@@ -20,6 +20,11 @@ EXIT:
   mode halt
 
 INT_KEYBOARD:
+  push r3
+
+  # save flags
+  mov  r3, flg
+  push r3
 
   # check key
   movi r4, PS2_ADDR
@@ -79,15 +84,18 @@ end:
   and  r4, r4, r3
   mov  isr, r4
 
+  # restore flags
+  pop r3
+  mov flg, r3
+
+  pop r3
+
   # return from the interrupt
-  mov  r29, efg
-  mov  r30, epc
-  rfi  r29, r30
+  rfi
 
 _start:
   # initialize stack
-  movi r1, 0x1000
-  movi r2, 0x1000
+  movi r31, 0x1000
 
   # set imr
   movi r3, 0x7FFFFFFF

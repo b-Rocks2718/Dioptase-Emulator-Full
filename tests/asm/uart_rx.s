@@ -1,7 +1,7 @@
   .kernel
 
-  .define UART_RX_ADDR 0x20003
-  .define UART_TX_ADDR 0x20002
+  .define UART_RX_ADDR 0x7FF0003
+  .define UART_TX_ADDR 0x7FF0002
 
 _start:
   movi r4, UART_TX_ADDR

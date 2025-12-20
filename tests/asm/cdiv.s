@@ -3,14 +3,14 @@
   # a colorful square that the user can move around using the keyboard
   # uses interrupts to accomplish this
 
-  .define TILEMAP_ADDR 0x2A000
-  .define FRAMEBUFFER_ADDR 0x2E000
-  .define SCALE_REG_ADDR 0x2FFFB
-  .define HSCROLL_ADDR 0x2FFFC
-  .define VSCROLL_ADDR 0x2FFFE
-  .define PIT_ADDR 0x20004
+  .define TILEMAP_ADDR 0x7FFA000
+  .define FRAMEBUFFER_ADDR 0x7FFE000
+  .define SCALE_REG_ADDR 0x7FFFFFB
+  .define HSCROLL_ADDR 0x7FFFFFC
+  .define VSCROLL_ADDR 0x7FFFFFE
+  .define PIT_ADDR 0x7FF0004
 
-  .define PS2_ADDR 0x20000
+  .define PS2_ADDR 0x7FF0000
 
   .define KEY_X 120
   .define KEY_Z 122

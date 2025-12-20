@@ -33,6 +33,16 @@ fn run_test(asm_file : &'static str, expected : u32){
   assert_eq!(result, Some(expected));
 }
 
+// I/O tests that must be run manually (8):
+// cdiv.s (run with --vga)
+// colors.s (--vga)
+// green.s (--vga)
+// ps2.s (--vga)
+// sleep.s (--vga)
+// sprite.s (--vga)
+// uart.s
+// uart_rx.s (--vga --uart)
+
 #[test]
 fn and() {
   run_test("tests/asm/and.s", 2);

@@ -5,7 +5,7 @@ use std::u16;
 use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
-pub const STACK_START : usize = 0x10000;
+pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
 
 pub const FRAME_WIDTH: u32 = 1024;
 pub const FRAME_HEIGHT: u32 = 512;
@@ -16,33 +16,33 @@ pub const SPRITE_SIZE: u32 = 32;
 // const SPRITES_NUM: u32 = 8;
 const SPRITE_DATA_SIZE: u32 = SPRITE_SIZE * SPRITE_SIZE * 2;
 
-const PS2_STREAM : u32 = 0x20000;
-const UART_TX : u32 = 0x20002;
-const UART_RX : u32 = 0x20003;
-pub const PIT_START : u32 = 0x20004;
+const PS2_STREAM : u32 = 0x7FF0000;
+const UART_TX : u32 = 0x7FF0002;
+const UART_RX : u32 = 0x7FF0003;
+pub const PIT_START : u32 = 0x7FF0004;
 
 // SD card is memory-mapped:
 // - SD_CMD_BUF..+5: command bytes (write-only; mirrored into RAM for visibility)
 // - SD_BUF_START..+512: data buffer for single-block transfers
 // - SD_SEND_BYTE: write to execute current command and copy response/data back into RAM
 // Reads of SD_SEND_BYTE return busy status (1 while executing, else 0).
-const SD_SEND_BYTE : u32 = 0x201F9;
-const SD_CMD_BUF : u32  = 0x201FA;
+const SD_SEND_BYTE : u32 = 0x7FF01F9;
+const SD_CMD_BUF : u32  = 0x7FF01FA;
 const SD_CMD_BUF_LEN: usize = 6;
-const SD_BUF_START : u32 = 0x20200;
+const SD_BUF_START : u32 = 0x7FF0200;
 const SD_BLOCK_SIZE: usize = 512;
 pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
 
-const TILE_MAP_START : u32 = 0x2A000;
+const TILE_MAP_START : u32 = 0x7FFA000;
 const TILE_MAP_SIZE : u32 = 0x4000;
-const FRAME_BUFFER_START : u32 = 0x2E000;
+const FRAME_BUFFER_START : u32 = 0x7FFE000;
 const FRAME_BUFFER_SIZE : u32 = 0x1FD0;
-const V_SCROLL_START : u32 = 0x2FFFE;
-const H_SCROLL_START : u32 = 0x2FFFC;
-const SCALE_REGISTER_START : u32 = 0x2FFFB; // each pixel is repeated 2^n times
-const SPRITE_MAP_START : u32 = 0x26000;
+const V_SCROLL_START : u32 = 0x7FFFFFE;
+const H_SCROLL_START : u32 = 0x7FFFFFC;
+const SCALE_REGISTER_START : u32 = 0x7FFFFFB; // each pixel is repeated 2^n times
+const SPRITE_MAP_START : u32 = 0x7FF6000;
 const SPRITE_MAP_SIZE : u32 = 0x4000;
-const SPRITE_REGISTERS_START : u32 = 0x2FFD0;  // every consecutive pair of words correspond to 
+const SPRITE_REGISTERS_START : u32 = 0x7FFFFD0;  // every consecutive pair of words correspond to 
 const SPRITE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
 
 pub struct Memory {

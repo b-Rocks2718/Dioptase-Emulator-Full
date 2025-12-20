@@ -7,7 +7,7 @@ use std::cmp;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::memory::{Memory, PIT_START, SD_INTERRUPT_BIT};
+use crate::memory::{Memory, PHYSMEM_MAX, PIT_START, SD_INTERRUPT_BIT};
 use crate::graphics::Graphics;
 
 #[derive(Debug)]
@@ -46,7 +46,6 @@ impl RandomCache {
         // read operation 
         if v & 0x00000001 == 0 {
           // not readable
-          println!("TLB MISS: not readable");
           None
         } else {
           Some(v)
@@ -55,7 +54,6 @@ impl RandomCache {
         // write operation
         if v & 0x00000002 == 0 {
           // not writable
-          println!("TLB MISS: not writable");
           None
         } else {
           Some(v)
@@ -64,7 +62,6 @@ impl RandomCache {
         // fetch operation
         if v & 0x00000004 == 0 {
           // not executable
-          println!("TLB MISS: not executable");
           None
         } else {
           Some(v)
@@ -284,7 +281,7 @@ impl Emulator {
 
   fn convert_mem_address(&self, addr : u32, operation : u32) -> Option<u32> {
     if self.kmode {
-      if addr < 0x30000 {
+      if addr <= PHYSMEM_MAX {
         Some(addr)
       } else if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, self.kmode) {
         Some(result | (addr & 0xFFF))

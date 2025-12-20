@@ -6,7 +6,7 @@
 .define O 111
 .define NEWLINE 10
 
-.define UART_ADDR 0x20002
+.define UART_ADDR 0x7FF0002
 
 _start:
   movi r4, UART_ADDR

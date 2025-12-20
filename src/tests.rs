@@ -280,6 +280,11 @@ fn tlbc() {
 }
 
 #[test]
+fn tlbi() {
+  run_test("tests/asm/tlbi.s", 0x2017);
+}
+
+#[test]
 fn tlbr() {
   run_test("tests/asm/tlbr.s", 0xA);
 }
@@ -318,3 +323,39 @@ fn rfi() {
 fn tlb_reg() {
   run_test("tests/asm/tlb_reg.s", 0x000fffff);
 }
+
+#[test]
+fn syscall() {
+  run_test("tests/asm/syscall.s", 4);
+}
+
+#[test]
+fn ksp() {
+  run_test("tests/asm/ksp.s", 0xA9);
+}
+
+#[test]
+fn tlb_flags_r() {
+  run_test("tests/asm/tlb_flags_r.s", 67);
+}
+
+#[test]
+fn tlb_flags_w() {
+  run_test("tests/asm/tlb_flags_w.s", 67);
+}
+
+#[test]
+fn tlb_flags_x() {
+  run_test("tests/asm/tlb_flags_x.s", 68);
+}
+
+#[test]
+fn tlb_flags_u() {
+  run_test("tests/asm/tlb_flags_u.s", 66);
+}
+
+#[test]
+fn tlb_flags_g() {
+  run_test("tests/asm/tlb_flags_g.s", 67);
+}
+

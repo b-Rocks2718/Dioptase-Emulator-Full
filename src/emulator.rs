@@ -148,7 +148,7 @@ impl RandomCache {
   }
 
   pub fn write(&mut self, pid : u32, vpn: u32, ppn : u32){
-    if vpn & 0x00000010 != 0 {
+    if ppn & 0x00000010 != 0 {
       // global entry
       if self.global_size < self.global_capacity {
         self.global_size += 1;

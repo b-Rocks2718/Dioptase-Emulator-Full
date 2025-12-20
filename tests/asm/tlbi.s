@@ -11,7 +11,7 @@ _start:
   movi r3, 0x10000000
   tlbw r2, r3
 
-  tlbc
+  tlbi r0 # invalidate entry for VPN=0x0000
   tlbr r2, r0
   tlbr r3, r3
 

@@ -4,11 +4,11 @@
   # uses a sprite instead of the framebuffer
   # uses interrupts to accomplish this
 
-  .define SPRITEMAP_0_ADDR 0x7FF6000
-  .define SPRITE_0_X_ADDR 0x7FFFFD0
-  .define SPRITE_0_Y_ADDR 0x7FFFFD2
+  .define SPRITEMAP_0_ADDR 0x7FF0000
+  .define SPRITE_0_X_ADDR 0x7FE5B00
+  .define SPRITE_0_Y_ADDR 0x7FE5B02
   
-  .define PS2_ADDR 0x7FF0000
+  .define PS2_ADDR 0x7FE5800
 
   .define KEY_W 119
   .define KEY_A 97
@@ -98,7 +98,7 @@ _start:
   movi r31, 0x1000
 
   # set imr
-  movi r3, 0x7FFFFFFF
+  movi r3, 0x0000000F
   mov  imr, r3
 
   # load address and color

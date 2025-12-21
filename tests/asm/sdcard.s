@@ -3,9 +3,9 @@
 EXIT:
   mode halt
 
-.define SD_SEND_REG 0x7FF01F9
-.define SD_CMD_BASE 0x7FF01FA
-.define SD_BUF_BASE 0x7FF0200
+.define SD_SEND_REG 0x7FE58F9
+.define SD_CMD_BASE 0x7FE58FA
+.define SD_BUF_BASE 0x7FE5900
 
 _start:
   movi r7 0

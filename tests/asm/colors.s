@@ -3,14 +3,14 @@
   # a colorful square that the user can move around using the keyboard
   # uses interrupts to accomplish this
 
-  .define TILEMAP_ADDR 0x7FFA000
-  .define FRAMEBUFFER_ADDR 0x7FFE000
-  .define SCALE_REG_ADDR 0x7FFFFFB
-  .define HSCROLL_ADDR 0x7FFFFFC
-  .define VSCROLL_ADDR 0x7FFFFFE
-  .define PIT_ADDR 0x7FF0004
+  .define TILEMAP_ADDR 0x7FE8000
+  .define FRAMEBUFFER_ADDR 0x7FC0000
+  .define SCALE_REG_ADDR 0x7FE5B44
+  .define HSCROLL_ADDR 0x7FE5B40
+  .define VSCROLL_ADDR 0x7FE5B42
+  .define PIT_ADDR 0x7FE5804
 
-  .define PS2_ADDR 0x7FF0000
+  .define PS2_ADDR 0x7FE5800
 
   .define KEY_W 119
   .define KEY_A 97
@@ -60,7 +60,7 @@ INT_KEYBOARD:
 key_w:
   # move square up
   lw   r3, [SQUARE_INDEX]
-  add  r3, r3, -128
+  add  r3, r3, -80
   sw   r3, [SQUARE_INDEX]
   jmp  end
 
@@ -74,7 +74,7 @@ key_a:
 key_s:
   # move square down
   lw   r3, [SQUARE_INDEX]
-  add  r3, r3, 128
+  add  r3, r3, 80
   sw   r3, [SQUARE_INDEX]
   jmp  end
 
@@ -178,7 +178,7 @@ _start:
   swa  r3, [r4]
 
   # set imr
-  movi r3, 0x7FFFFFFF
+  movi r3, 0x0000000F
   mov  imr, r3
 
   # set square reg

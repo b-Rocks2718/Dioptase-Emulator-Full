@@ -1,8 +1,8 @@
   .kernel
 
-  .define PS2_ADDR 0x7FF0000
+  .define PS2_ADDR 0x7FE5800
 
-  .define UART_ADDR 0x7FF0002
+  .define UART_ADDR 0x7FE5802
 
   .define KEY_A 97
   .define KEY_Q 113

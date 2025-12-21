@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 
 pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
 
-pub const FRAME_WIDTH: u32 = 1024;
-pub const FRAME_HEIGHT: u32 = 512;
+pub const FRAME_WIDTH: u32 = 640;
+pub const FRAME_HEIGHT: u32 = 480;
 pub const TILE_WIDTH: u32 = 8;
 // const TILES_NUM: u32 = 128;
 const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH * 2;
@@ -16,34 +16,45 @@ pub const SPRITE_WIDTH: u32 = 32;
 // const SPRITES_NUM: u32 = 8;
 const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
 
-const PS2_STREAM : u32 = 0x7FF0000;
-const UART_TX : u32 = 0x7FF0002;
-const UART_RX : u32 = 0x7FF0003;
-pub const PIT_START : u32 = 0x7FF0004;
-
 // SD card is memory-mapped:
 // - SD_CMD_BUF..+5: command bytes (write-only; mirrored into RAM for visibility)
 // - SD_BUF_START..+512: data buffer for single-block transfers
 // - SD_SEND_BYTE: write to execute current command and copy response/data back into RAM
 // Reads of SD_SEND_BYTE return busy status (1 while executing, else 0).
-const SD_SEND_BYTE : u32 = 0x7FF01F9;
-const SD_CMD_BUF : u32  = 0x7FF01FA;
 const SD_CMD_BUF_LEN: usize = 6;
-const SD_BUF_START : u32 = 0x7FF0200;
 const SD_BLOCK_SIZE: usize = 512;
 pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
+pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
 
-const TILE_MAP_START : u32 = 0x7FFA000;
-const TILE_MAP_SIZE : u32 = 0x4000;
-const FRAME_BUFFER_START : u32 = 0x7FFE000;
-const FRAME_BUFFER_SIZE : u32 = 0x1FD0;
-const V_SCROLL_START : u32 = 0x7FFFFFE;
-const H_SCROLL_START : u32 = 0x7FFFFFC;
-const SCALE_REGISTER_START : u32 = 0x7FFFFFB; // each pixel is repeated 2^n times
-const SPRITE_MAP_START : u32 = 0x7FF6000;
-const SPRITE_MAP_SIZE : u32 = 0x4000;
-const SPRITE_REGISTERS_START : u32 = 0x7FFFFD0;  // every consecutive pair of words correspond to 
-const SPRITE_REGISTERS_SIZE : u32 = 0x20;     // the y and x coordinates, respectively of a sprite
+const FRAME_BUFFER_START : u32 = 0x7FC0000;
+const FRAME_BUFFER_SIZE : u32 = 0x25800; // 320 * 240 * 2 bytes
+
+const PS2_STREAM : u32 = 0x7FE5800;
+const UART_TX : u32 = 0x7FE5802;
+const UART_RX : u32 = 0x7FE5803;
+pub const PIT_START : u32 = 0x7FE5804;
+
+const SD_SEND_BYTE : u32 = 0x7FE58F9;
+const SD_CMD_BUF : u32  = 0x7FE58FA;
+const SD_BUF_START : u32 = 0x7FE5900;
+
+const SPRITE_REGISTERS_START : u32 = 0x7FE5B00;  // every consecutive pair of words correspond to 
+const SPRITE_REGISTERS_SIZE : u32 = 0x40;     // the y and x coordinates, respectively of a sprite
+
+const H_SCROLL_START : u32 = 0x7FE5B40;
+const V_SCROLL_START : u32 = 0x7FE5B42;
+
+const SCALE_REGISTER_START : u32 = 0x7FE5B44; // each pixel is repeated 2^n times
+
+const VGA_MODE_REGISTER_START : u32 = 0x7FE5B45;
+const VGA_STATUS_REGISTER_START : u32 = 0x7FE5B46;
+const VGA_FRAME_REGISTER_START : u32 = 0x7FE5B48;
+
+const TILE_MAP_START : u32 = 0x7FE8000;
+const TILE_MAP_SIZE : u32 = 0x8000;
+
+const SPRITE_MAP_START : u32 = 0x7FF0000;
+const SPRITE_MAP_SIZE : u32 = 0x8000;
 
 pub struct Memory {
   ram: HashMap<u32, u8>,   
@@ -53,17 +64,22 @@ pub struct Memory {
   vscroll_register: Arc<RwLock<(u8, u8)>>,
   hscroll_register: Arc<RwLock<(u8, u8)>>,
   scale_register: Arc<RwLock<u8>>,
+  vga_mode_register: Arc<RwLock<u8>>,
+  vga_status_register: Arc<RwLock<u8>>,
+  vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
   sd_card: Arc<RwLock<SdCard>>,
-  pending_interrupt: Arc<RwLock<bool>>,
+  pending_interrupt: Arc<RwLock<u32>>,
   use_uart_rx: bool
 }
 
 // an 80x60 framebuffer of 8-bit tile values
 pub struct FrameBuffer {
-    pub width: u32, // number of tiles in the x direction
-    pub height: u32, // number of tiles in the y direction
+    pub width_pixels: u32,
+    pub height_pixels: u32,
+    pub width_tiles: u32, // number of tiles in the x direction
+    pub height_tiles: u32, // number of tiles in the y direction
     tile_ptrs: Vec<u8>,
 }
 
@@ -295,10 +311,13 @@ impl Memory {
             vscroll_register: Arc::new(RwLock::new((0, 0))),
             hscroll_register: Arc::new(RwLock::new((0, 0))),
             scale_register: Arc::new(RwLock::new(0)),
+            vga_mode_register: Arc::new(RwLock::new(0)),
+            vga_status_register: Arc::new(RwLock::new(0)),
+            vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
             sd_card: Arc::new(RwLock::new(SdCard::new())),
-            pending_interrupt: Arc::new(RwLock::new(false)),
+            pending_interrupt: Arc::new(RwLock::new(0)),
             use_uart_rx: use_uart_rx
         }
     }
@@ -310,8 +329,14 @@ impl Memory {
     pub fn get_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> { return Arc::clone(&self.hscroll_register) }
     pub fn get_scale_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.scale_register) }
     pub fn get_sprite_map(&self) -> Arc<RwLock<SpriteMap>> { return Arc::clone(&self.sprite_map) }
+    pub fn get_vga_mode_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.vga_mode_register) }
+    pub fn get_vga_status_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.vga_status_register) }
+    pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> { return Arc::clone(&self.vga_frame_register) }
+    pub fn get_pending_interrupt(&self) -> Arc<RwLock<u32>> { return Arc::clone(&self.pending_interrupt) }
 
     pub fn read(&mut self, addr: u32) -> u8 {
+        assert!(addr <= PHYSMEM_MAX, "Physical memory address out of bounds: 0x{:08X}", addr);
+
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             return self.tile_map.read().unwrap().get_tile_byte(addr - TILE_MAP_START);
         }
@@ -352,6 +377,24 @@ impl Memory {
         else if addr == SCALE_REGISTER_START {
             return *self.scale_register.read().unwrap();
         }
+        else if addr == VGA_MODE_REGISTER_START {
+            return *self.vga_mode_register.read().unwrap();
+        }
+        else if addr == VGA_STATUS_REGISTER_START {
+            return *self.vga_status_register.read().unwrap();
+        }
+        else if addr == VGA_FRAME_REGISTER_START {
+            return self.vga_frame_register.read().unwrap().0;
+        }
+        else if addr == VGA_FRAME_REGISTER_START + 1 {
+            return self.vga_frame_register.read().unwrap().1;
+        }
+        else if addr == VGA_FRAME_REGISTER_START + 2 {
+            return self.vga_frame_register.read().unwrap().2;
+        }
+        else if addr == VGA_FRAME_REGISTER_START + 3 {
+            return self.vga_frame_register.read().unwrap().3;
+        }
         else if addr == UART_TX {
             panic!("attempting to read output port (address {:X})", UART_TX);
         }
@@ -380,7 +423,7 @@ impl Memory {
             return self.pit.read().unwrap().3;
         }
         else if addr == 0 {
-            println!("Warning: reading from address 0x00000000");
+            println!("Warning: reading from physical address 0x00000000");
         }
 
         if self.ram.contains_key(&addr) {
@@ -391,6 +434,8 @@ impl Memory {
     }
 
     pub fn write(&mut self, addr: u32, data: u8) {
+        assert!(addr <= PHYSMEM_MAX, "Physical memory address out of bounds: 0x{:08X}", addr);
+        
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             self.tile_map.write().unwrap().set_tile_byte((addr - TILE_MAP_START) as u32, data);
         }
@@ -423,7 +468,7 @@ impl Memory {
             }
 
             if interrupt {
-                *self.pending_interrupt.write().unwrap() = true;
+                *self.pending_interrupt.write().unwrap() |= SD_INTERRUPT_BIT;
             }
             return;
         }
@@ -488,9 +533,19 @@ impl Memory {
         else if addr == PIT_START + 3 {
             self.pit.write().unwrap().3 = data;
         }
-        else if addr == 0 {
-            println!("Warning: writing to address 0x00000000: 0x{:08X}", data);
+        else if addr == VGA_MODE_REGISTER_START {
+            *self.vga_mode_register.write().unwrap() = data;
         }
+        else if addr == VGA_STATUS_REGISTER_START {
+            panic!("attempting to write read-only VGA status register (0x{:08X})", VGA_STATUS_REGISTER_START);
+        }
+        else if VGA_FRAME_REGISTER_START <= addr && addr < VGA_FRAME_REGISTER_START + 4 {
+            panic!("attempting to write read-only VGA frame register (0x{:08X})", VGA_FRAME_REGISTER_START);
+        }
+        else if addr == 0 {
+            println!("Warning: writing to physical address 0x00000000: 0x{:08X}", data);
+        }
+
         self.ram.insert(addr, data);
     }
 
@@ -499,23 +554,25 @@ impl Memory {
         
     }
 
-    pub fn check_interrupts(&self) -> bool {
+    pub fn check_interrupts(&self) -> u32 {
         let pending = { *self.pending_interrupt.read().unwrap() };
-        if pending {
-            *self.pending_interrupt.write().unwrap() = false;
+        if pending != 0 {
+            *self.pending_interrupt.write().unwrap() = 0;
         }
         pending
     }
 }
 
 impl FrameBuffer {
-    pub fn new(frame_width: u32, frame_height: u32) -> Self {
-        let width = frame_width / TILE_WIDTH;
-        let height = frame_height / TILE_WIDTH;
+    pub fn new(width_pixels: u32, height_pixels: u32) -> Self {
+        let width_tiles = width_pixels / TILE_WIDTH;
+        let height_tiles = height_pixels / TILE_WIDTH;
         FrameBuffer {
-            width,
-            height,
-            tile_ptrs: vec![0; (width * height) as usize],
+            width_pixels,
+            height_pixels,
+            width_tiles,
+            height_tiles,
+            tile_ptrs: vec![0; (width_pixels * height_pixels) as usize],
         }
     }
 
@@ -537,9 +594,18 @@ impl FrameBuffer {
         }
     }
 
+    pub fn get_pixel(&self, x: u32, y: u32) -> u16 {
+        if x < self.width_pixels && y < self.height_pixels {
+            let idx: usize = (x + y * (self.width_pixels/ 2)) as usize;
+            return ((u16::from(self.tile_ptrs[2 * idx + 1])) << 8) | u16::from(self.tile_ptrs[2 * idx]);
+        } else {
+            panic!("Tile coordinates out of bounds");
+        }
+    }
+
     pub fn get_tile(&self, x: u32, y: u32) -> u8 {
-        if x < self.width && y < self.height {
-            let idx: usize = (x + y * self.width) as usize;
+        if x < self.width_tiles && y < self.height_tiles {
+            let idx: usize = (x + y * self.width_tiles) as usize;
             return self.tile_ptrs[idx];
         } else {
             panic!("Tile coordinates out of bounds");

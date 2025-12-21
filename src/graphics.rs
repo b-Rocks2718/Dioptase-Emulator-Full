@@ -17,6 +17,10 @@ pub struct Graphics {
     vscroll_register: Arc<RwLock<(u8, u8)>>,
     hscroll_register: Arc<RwLock<(u8, u8)>>,
     scale_register: Arc<RwLock<u8>>,
+    vga_mode_register: Arc<RwLock<u8>>,
+    vga_status_register: Arc<RwLock<u8>>,
+    vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
+    pending_interrupt: Arc<RwLock<u32>>,
     sprite_map: Arc<RwLock<SpriteMap>>,
 }
 
@@ -30,6 +34,10 @@ impl Graphics {
         hscroll_register: Arc<RwLock<(u8, u8)>>,
         sprite_map: Arc<RwLock<SpriteMap>>,
         scale_register: Arc<RwLock<u8>>,
+        vga_mode_register: Arc<RwLock<u8>>,
+        vga_status_register: Arc<RwLock<u8>>,
+        vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
+        pending_interrupt: Arc<RwLock<u32>>,
     ) -> Graphics {
         let mut window: PistonWindow = WindowSettings::new("Dioptase", [SCREEN_WIDTH, SCREEN_HEIGHT])
             .exit_on_esc(true)
@@ -55,7 +63,11 @@ impl Graphics {
             vscroll_register,
             hscroll_register,
             sprite_map,
+            vga_mode_register,
+            vga_status_register,
+            vga_frame_register,
             scale_register,
+            pending_interrupt
         }
     }
     
@@ -97,15 +109,13 @@ impl Graphics {
         }
     }
 
-
-    fn update(&mut self) {
-        // Updates buffer from emulated frame buffer and tile map
+    fn tile_mode_update(&mut self) {
         // draw the tiles of the frame buffer
         let fb = self.frame_buffer.read().unwrap();
         let tile_map = self.tile_map.read().unwrap();
         let scale = 1 << (*self.scale_register.read().unwrap() as u32);
-        for x in 0..fb.width {
-            for y in 0..fb.height {
+        for x in 0..fb.width_tiles {
+            for y in 0..fb.height_tiles {
                 let tile_ptr = fb.get_tile(x, y);
                 let tile = &tile_map.tiles[tile_ptr as usize];
                 for px in 0..TILE_WIDTH {
@@ -143,6 +153,64 @@ impl Graphics {
                 }
             }
         }
+    }
+
+    fn pixel_mode_update(&mut self) {
+        // draw the pixels of the frame buffer
+        let fb = self.frame_buffer.read().unwrap();
+        let scale = 1 << (*self.scale_register.read().unwrap() as u32);
+        for x in 0..(fb.width_pixels/2) {
+            for y in 0..(fb.height_pixels/2) {
+                let pixel = fb.get_pixel(x, y);
+                let red = (pixel & 0x0F) as u8 * 16;
+                let green = ((pixel & 0xF0) >> 4) as u8 * 16;
+                let blue = ((pixel & 0xF00) >> 8) as u8 * 16;
+                let pixel = Rgba([red, green, blue, 255]);
+
+                // positions in the logical screen
+                let scroll_x_pair = *self.hscroll_register.read().unwrap();
+                let scroll_y_pair = *self.vscroll_register.read().unwrap();
+                let scroll_x = (i32::from(scroll_x_pair.1) << 8) | i32::from(scroll_x_pair.0);
+                let scroll_y = (i32::from(scroll_y_pair.1) << 8) | i32::from(scroll_y_pair.0);
+                let raw_x: i32 = x as i32 + scroll_x;
+                let raw_y: i32 = y as i32 + scroll_y;
+                let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;
+                let final_y: u32 = (raw_y + FRAME_HEIGHT as i32) as u32 % FRAME_HEIGHT;
+
+                // print the pixel rgba in the physical screen
+                for i in 0..(scale+1) {
+                    for j in 0..(scale+1) {
+                        let screen_x: u32 = final_x * (scale + 1) + i;
+                        let screen_y: u32 = final_y * (scale + 1) + j;
+
+                        if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
+                            self.buffer.put_pixel(screen_x, screen_y, pixel);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    fn update(&mut self) {
+        // set status to busy
+        *self.vga_status_register.write().unwrap() = 0;
+
+        // Updates buffer from emulated frame buffer and tile map
+        
+        if *self.vga_mode_register.read().unwrap() == 0 {
+            // in tile mode
+            self.tile_mode_update();
+        } else if *self.vga_mode_register.read().unwrap() == 1 {
+            // in pixel mode
+            self.pixel_mode_update();
+        } else {
+            println!("Warning: unknown VGA mode {}", *self.vga_mode_register.read().unwrap());
+            return;
+        }
+
+        let scale = 1 << (*self.scale_register.read().unwrap() as u32);
 
         // draw the sprites of the sprite map
         let sprite_map = self.sprite_map.read().unwrap();
@@ -179,11 +247,30 @@ impl Graphics {
             }
         }
 
+        // increment frame register
+        let mut vga_frame_register = self.vga_frame_register.write().unwrap();
+        vga_frame_register.0 = vga_frame_register.0.wrapping_add(1);
+        if vga_frame_register.0 == 0 {
+            vga_frame_register.1 = vga_frame_register.1.wrapping_add(1);
+            if vga_frame_register.1 == 0 {
+                vga_frame_register.2 = vga_frame_register.2.wrapping_add(1);
+                if vga_frame_register.2 == 0 {
+                    vga_frame_register.3 = vga_frame_register.3.wrapping_add(1);
+                }
+            }
+        }
+
         // Updates texture from buffer
         self.texture = Texture::from_image(
             &mut self.window.create_texture_context(),
             &self.buffer,
             &TextureSettings::new(),
         ).unwrap();
+
+        // set status to idle
+        *self.vga_status_register.write().unwrap() = 3;
+
+        // send vblank interrupt
+        *self.pending_interrupt.write().unwrap() |= VGA_INTERRUPT_BIT;
     }
 }

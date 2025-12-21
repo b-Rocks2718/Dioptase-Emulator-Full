@@ -2,17 +2,15 @@
 
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
-
-  .define PHY_TILEMAP_ADDR 0x7FE8000
   .define PHY_FRAMEBUFFER_ADDR 0x7FC0000
 
   .define VMEM_FLAGS 0x00F
 
-  .define VRT_TILEMAP_ADDR 0x10000000
   .define VRT_FRAMEBUFFER_ADDR 0x20000000
   .define USER_PC_START 0x80000000
 
   .define PS2_ADDR 0x7FE5800
+  .define VGA_MODE_ADDR 0x7FE5B45
 
   .define USER_PID 1
 
@@ -34,6 +32,11 @@ _start:
 
   call init_tlb
 
+  # set VGA to pixel mode
+  movi r2, VGA_MODE_ADDR
+  movi r3, 0x1
+  sba  r3, [r2]
+
   # enable interrupts
   movi r3, 0x8000000F
   mov  imr, r3
@@ -43,14 +46,7 @@ _start:
   rfe  # jump to userland
 
 init_tlb:
-  # map VRT_TILEMAP_ADDR => PHY_TILEMAP_ADDR
-  movi r2, PHY_TILEMAP_ADDR
   movi r4, VMEM_FLAGS
-  or   r2, r2, r4
-
-  movi r3, VRT_TILEMAP_ADDR
-
-  tlbw r2, r3
 
   # map VRT_FRAMEBUFFER_ADDR => PHY_FRAMEBUFFER_ADDR
   movi r2, PHY_FRAMEBUFFER_ADDR
@@ -71,19 +67,14 @@ init_tlb:
   .origin 0x1000
 userland:
 
-  movi r8, VRT_TILEMAP_ADDR
-  add  r8, r8, 128
+  movi r8, VRT_FRAMEBUFFER_ADDR
   movi r6, 0xF0    # green
 
-  movi r10, 64
-draw_square_loop:
+  movi r10, 650
+draw_loop:
   sda  r6, [r8], 2
   add  r10, r10, -1
-  bnz  draw_square_loop
-
-  movi r8, VRT_FRAMEBUFFER_ADDR
-  movi r5, 1
-  swa  r5, [r8]
+  bnz  draw_loop
 
 inf_loop:
   jmp  inf_loop

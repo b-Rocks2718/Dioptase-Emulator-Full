@@ -7,7 +7,7 @@ use std::cmp;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::memory::{Memory, PHYSMEM_MAX, PIT_START, SD_INTERRUPT_BIT};
+use crate::memory::{Memory, PHYSMEM_MAX, PIT_START, SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT};
 use crate::graphics::Graphics;
 
 #[derive(Debug)]
@@ -378,6 +378,10 @@ impl Emulator {
   }
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
+    if addr == 0 {
+      println!("Warning: reading from virtual address 0x00000000");
+    }
+
     let addr = self.convert_mem_address(addr, 0);
 
     if let Some(addr) = addr {
@@ -405,14 +409,18 @@ impl Emulator {
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
   }
 
-  fn fetch(&mut self, addr: u32) -> Option<u32> {
-    if (addr & 3) != 0 {
+  fn fetch(&mut self, vaddr: u32) -> Option<u32> {
+    if (vaddr & 3) != 0 {
       // unaligned access
-      println!("Warning: unaligned memory access at {:08x}", addr);
+      println!("Warning: unaligned memory access at {:08x}", vaddr);
     }
-    let addr = self.convert_mem_address(addr, 2);
+    if vaddr == 0 {
+      println!("Warning: fetching from virtual address 0x00000000");
+    }
 
-    if let Some(addr) = addr {
+    let paddr = self.convert_mem_address(vaddr, 2);
+
+    if let Some(addr) = paddr {
       Some(
         (self.memory.read(addr + 3) as u32) << 24 |
         (self.memory.read(addr + 2) as u32) << 16 |
@@ -435,6 +443,10 @@ impl Emulator {
         self.memory.get_hscroll_register(),
         self.memory.get_sprite_map(),
         self.memory.get_scale_register(),
+        self.memory.get_vga_mode_register(),
+        self.memory.get_vga_status_register(),
+        self.memory.get_vga_frame_register(),
+        self.memory.get_pending_interrupt()
       ));
     }
 
@@ -501,16 +513,25 @@ impl Emulator {
       }
     }
 
-    if self.memory.check_interrupts() {
+    let ints = self.memory.check_interrupts();
+
+    if ints & SD_INTERRUPT_BIT != 0 {
       self.cregfile[2] |= SD_INTERRUPT_BIT;
     }
+    if ints & VGA_INTERRUPT_BIT != 0 {
+      self.cregfile[2] |= VGA_INTERRUPT_BIT;
+    }
+    
 
     // check for timer interrupt
     if self.timer == 0 {
       // check if timer was set
       let old_kmode = self.kmode;
       self.kmode = true;
-      let v = self.mem_read32(PIT_START).unwrap();
+      let v = (self.memory.read(PIT_START + 3) as u32) << 24 |
+              (self.memory.read(PIT_START + 2) as u32) << 16 |
+              (self.memory.read(PIT_START + 1) as u32) << 8 |
+              (self.memory.read(PIT_START) as u32);
       self.kmode = old_kmode;
       if v != 0 {
         // reset timer

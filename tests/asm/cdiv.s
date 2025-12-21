@@ -1,17 +1,17 @@
   .kernel
 
-  # a colorful square that the user can move around using the keyboard
-  # uses interrupts to accomplish this
+  # changes the color of the tilemap based on timer interrupts
+  # changes the speed of the color change based on keyboard input
+  # X to speed up, Z to slow down, Q to quit
 
-  .define TILEMAP_ADDR 0x7FFA000
-  .define FRAMEBUFFER_ADDR 0x7FFE000
-  .define SCALE_REG_ADDR 0x7FFFFFB
-  .define HSCROLL_ADDR 0x7FFFFFC
-  .define VSCROLL_ADDR 0x7FFFFFE
-  .define PIT_ADDR 0x7FF0004
+  .define TILEMAP_ADDR 0x7FE8000
+  .define FRAMEBUFFER_ADDR 0x7FC0000
+  .define SCALE_REG_ADDR 0x7FE5B44
+  .define HSCROLL_ADDR 0x7FE5B40
+  .define VSCROLL_ADDR 0x7FE5B42
+  .define PIT_ADDR 0x7FE5804
 
-  .define PS2_ADDR 0x7FF0000
-
+  .define PS2_ADDR 0x7FE5800
   .define KEY_X 120
   .define KEY_Z 122
   .define KEY_Q 113
@@ -93,7 +93,7 @@ _start:
   mov  cdv, r3
 
   # set imr
-  movi r3, 0x7FFFFFFF
+  movi r3, 0x0000000F
   mov  imr, r3
 
   # set square reg

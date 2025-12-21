@@ -9,12 +9,12 @@ pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
 
 pub const FRAME_WIDTH: u32 = 1024;
 pub const FRAME_HEIGHT: u32 = 512;
-pub const TILE_SIZE: u32 = 8;
+pub const TILE_WIDTH: u32 = 8;
 // const TILES_NUM: u32 = 128;
-const TILE_DATA_SIZE: u32 = TILE_SIZE * TILE_SIZE * 2;
-pub const SPRITE_SIZE: u32 = 32;
+const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH * 2;
+pub const SPRITE_WIDTH: u32 = 32;
 // const SPRITES_NUM: u32 = 8;
-const SPRITE_DATA_SIZE: u32 = SPRITE_SIZE * SPRITE_SIZE * 2;
+const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
 
 const PS2_STREAM : u32 = 0x7FF0000;
 const UART_TX : u32 = 0x7FF0002;
@@ -315,47 +315,47 @@ impl Memory {
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             return self.tile_map.read().unwrap().get_tile_byte(addr - TILE_MAP_START);
         }
-        if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
+        else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
         }
-        if addr == SD_SEND_BYTE {
+        else if addr == SD_SEND_BYTE {
             return self.sd_card.read().unwrap().status();
         }
-        if addr == PS2_STREAM {
+        else if addr == PS2_STREAM {
             // kind of a hack but this assumed people always read a double from ps2 stream
             if self.use_uart_rx {return 0;}
             return self.io_buffer.write().unwrap().front().unwrap_or(&0).clone() as u8;
         }
-        if addr == PS2_STREAM + 1 {
+        else if addr == PS2_STREAM + 1 {
             // read of upper byte will cause a pop
             if self.use_uart_rx {return 0;}
             return (self.io_buffer.write().unwrap().pop_front().unwrap_or(0).clone() >> 8) as u8;
         }
-        if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
+        else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
             return self.sprite_map.read().unwrap().get_sprite_byte(addr - SPRITE_MAP_START);
         }
-        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
+        else if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
             return self.sprite_map.read().unwrap().get_sprite_reg((addr - SPRITE_REGISTERS_START) as u32);
         }
-        if addr == V_SCROLL_START {
+        else if addr == V_SCROLL_START {
             return self.vscroll_register.read().unwrap().0;
         }
-        if addr == V_SCROLL_START + 1 {
+        else if addr == V_SCROLL_START + 1 {
             return self.vscroll_register.read().unwrap().1;
         }
-        if addr == H_SCROLL_START {
+        else if addr == H_SCROLL_START {
             return self.hscroll_register.read().unwrap().0;
         }
-        if addr == H_SCROLL_START + 1 {
+        else if addr == H_SCROLL_START + 1 {
             return self.hscroll_register.read().unwrap().1;
         }
-        if addr == SCALE_REGISTER_START {
+        else if addr == SCALE_REGISTER_START {
             return *self.scale_register.read().unwrap();
         }
-        if addr == UART_TX {
+        else if addr == UART_TX {
             panic!("attempting to read output port (address {:X})", UART_TX);
         }
-        if addr == UART_RX {
+        else if addr == UART_RX {
             // get value
             if self.use_uart_rx {
               let value = self.io_buffer.write().unwrap().pop_front().unwrap_or(0).clone();
@@ -367,17 +367,20 @@ impl Memory {
               return 0;
             }
         }
-        if addr == PIT_START {
+        else if addr == PIT_START {
             return self.pit.read().unwrap().0;
         }
-        if addr == PIT_START + 1 {
+        else if addr == PIT_START + 1 {
             return self.pit.read().unwrap().1;
         }
-        if addr == PIT_START + 2 {
+        else if addr == PIT_START + 2 {
             return self.pit.read().unwrap().2;
         }
-        if addr == PIT_START + 3 {
+        else if addr == PIT_START + 3 {
             return self.pit.read().unwrap().3;
+        }
+        else if addr == 0 {
+            println!("Warning: reading from address 0x00000000");
         }
 
         if self.ram.contains_key(&addr) {
@@ -391,10 +394,10 @@ impl Memory {
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             self.tile_map.write().unwrap().set_tile_byte((addr - TILE_MAP_START) as u32, data);
         }
-        if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
+        else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
         }
-        if addr == SD_SEND_BYTE {
+        else if addr == SD_SEND_BYTE {
             let (response, response_len, updated_buffer, interrupt) = {
                 let mut sd = self.sd_card.write().unwrap();
                 let result = sd.execute();
@@ -424,7 +427,7 @@ impl Memory {
             }
             return;
         }
-        if addr >= SD_CMD_BUF && addr < SD_CMD_BUF + SD_CMD_BUF_LEN as u32 {
+        else if addr >= SD_CMD_BUF && addr < SD_CMD_BUF + SD_CMD_BUF_LEN as u32 {
             let offset = (addr - SD_CMD_BUF) as usize;
             {
                 let mut sd = self.sd_card.write().unwrap();
@@ -433,7 +436,7 @@ impl Memory {
             self.ram.insert(addr, data);
             return;
         }
-        if addr >= SD_BUF_START && addr < SD_BUF_START + SD_BLOCK_SIZE as u32 {
+        else if addr >= SD_BUF_START && addr < SD_BUF_START + SD_BLOCK_SIZE as u32 {
             let offset = (addr - SD_BUF_START) as usize;
             {
                 let mut sd = self.sd_card.write().unwrap();
@@ -442,51 +445,51 @@ impl Memory {
             self.ram.insert(addr, data);
             return;
         }
-        if addr == PS2_STREAM {
+        else if addr == PS2_STREAM {
             panic!("attempting to write input port (address {:X})", PS2_STREAM);
         }
-        if addr == UART_TX {
+        else if addr == UART_TX {
             print!("{}", data as char);
             io::stdout().flush().unwrap();
         }
-        if addr == UART_RX {
+        else if addr == UART_RX {
             panic!("attempting to write input port (address {:X})", UART_RX);
         }
-        if addr == V_SCROLL_START {
+        else if addr == V_SCROLL_START {
             self.vscroll_register.write().unwrap().0 = data;
         }
-        if addr == V_SCROLL_START + 1 {
+        else if addr == V_SCROLL_START + 1 {
             self.vscroll_register.write().unwrap().1 = data;
         }
-        if addr == H_SCROLL_START {
+        else if addr == H_SCROLL_START {
             self.hscroll_register.write().unwrap().0 = data;
         }
-        if addr == H_SCROLL_START + 1 {
+        else if addr == H_SCROLL_START + 1 {
             self.hscroll_register.write().unwrap().1 = data;
         }
-        if addr == SCALE_REGISTER_START {
+        else if addr == SCALE_REGISTER_START {
             *self.scale_register.write().unwrap() = data;
         }
-        if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
+        else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
             self.sprite_map.write().unwrap().set_sprite_byte((addr - SPRITE_MAP_START) as u32, data);
         }
-        if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
+        else if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
             self.sprite_map.write().unwrap().set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
         }
-        if addr == PIT_START {
+        else if addr == PIT_START {
             self.pit.write().unwrap().0 = data;
         }
-        if addr == PIT_START + 1 {
+        else if addr == PIT_START + 1 {
             self.pit.write().unwrap().1 = data;
         }
-        if addr == PIT_START + 2 {
+        else if addr == PIT_START + 2 {
             self.pit.write().unwrap().2 = data;
         }
-        if addr == PIT_START + 3 {
+        else if addr == PIT_START + 3 {
             self.pit.write().unwrap().3 = data;
         }
-        if addr == 0 {
-            println!("Writing to address 0x0000: 0x{:04X}", data);
+        else if addr == 0 {
+            println!("Warning: writing to address 0x00000000: 0x{:08X}", data);
         }
         self.ram.insert(addr, data);
     }
@@ -507,9 +510,8 @@ impl Memory {
 
 impl FrameBuffer {
     pub fn new(frame_width: u32, frame_height: u32) -> Self {
-        let width = frame_width / TILE_SIZE;
-        //let width = 128;
-        let height = frame_height / TILE_SIZE;
+        let width = frame_width / TILE_WIDTH;
+        let height = frame_height / TILE_WIDTH;
         FrameBuffer {
             width,
             height,
@@ -548,30 +550,30 @@ impl FrameBuffer {
 impl Tile {
     pub fn black() -> Tile {
         Tile {
-            pixels: vec![0; TILE_DATA_SIZE as usize]
+            pixels: vec![0; TILE_SIZE as usize]
         }
     }
     pub fn white() -> Tile {
         Tile {
-            pixels: vec![0xff; TILE_DATA_SIZE as usize]
+            pixels: vec![0xff; TILE_SIZE as usize]
         }
     }
 }
 
 impl TileMap {
     pub fn new(size: u32) -> TileMap {
-        let tiles = vec![Tile::black(); size as usize];
+        let tiles = vec![Tile::black(); (size / TILE_SIZE) as usize];
         TileMap { 
             tiles
         }
     }
 
     pub fn get_tile_byte(&self, addr: u32) -> u8 {
-        return self.tiles[(addr / TILE_DATA_SIZE) as usize].pixels[(addr % TILE_DATA_SIZE) as usize];
+        return self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize];
     }
 
     pub fn set_tile_byte(&mut self, addr: u32, data: u8) {
-        self.tiles[(addr / TILE_DATA_SIZE) as usize].pixels[(addr % TILE_DATA_SIZE) as usize] = data;
+        self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize] = data;
     }
 }
 
@@ -580,7 +582,7 @@ impl Sprite {
         Sprite {
             x: (0, 0),
             y: (0, 0),
-            pixels: vec![0xFF; SPRITE_DATA_SIZE as usize],
+            pixels: vec![0xFF; SPRITE_SIZE as usize],
         }
     }
 }
@@ -595,23 +597,24 @@ impl SpriteMap {
 
     // this will get a single corrsponding pixel
     pub fn get_sprite_byte(&self, addr: u32) -> u8 {
-        return self.sprites[(addr / SPRITE_DATA_SIZE) as usize].pixels[(addr % SPRITE_DATA_SIZE) as usize];
+        return self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize];
     }
 
     pub fn set_sprite_byte(&mut self, addr: u32, data: u8) {
-        self.sprites[(addr / SPRITE_DATA_SIZE) as usize].pixels[(addr % SPRITE_DATA_SIZE) as usize] = data;
+        self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize] = data;
     }
 
     // returns the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
     pub fn get_sprite_reg(&self, addr: u32) -> u8 {
-        let sprite = &self.sprites[(addr / 4) as usize];
+        let addr = addr as usize;
+        let sprite = &self.sprites[addr / 4];
         if addr % 4 == 0 {
             return sprite.x.0;
         }
-        if addr % 4 == 1 {
+        else if addr % 4 == 1 {
             return sprite.x.1;
         } 
-        if addr % 4 == 2 {
+        else if addr % 4 == 2 {
             return sprite.y.0;
         }
         else {
@@ -621,14 +624,15 @@ impl SpriteMap {
 
     // sets the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
     pub fn set_sprite_reg(&mut self, addr: u32, data: u8) {
-        let sprite = &mut self.sprites[(addr / 4) as usize];
+        let addr = addr as usize;
+        let sprite = &mut self.sprites[addr / 4];
         if addr % 4 == 0 {
             sprite.x.0 = data;
         } 
-        if addr % 4 == 1 {
+        else if addr % 4 == 1 {
             sprite.x.1 = data;
         }
-        if addr % 4 == 2 {
+        else if addr % 4 == 2 {
             sprite.y.0 = data;
         } 
         else {

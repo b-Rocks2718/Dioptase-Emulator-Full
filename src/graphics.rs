@@ -108,9 +108,9 @@ impl Graphics {
             for y in 0..fb.height {
                 let tile_ptr = fb.get_tile(x, y);
                 let tile = &tile_map.tiles[tile_ptr as usize];
-                for px in 0..TILE_SIZE {
-                    for py in 0..TILE_SIZE {
-                        let addr = (2 * px + py * TILE_SIZE) as usize;
+                for px in 0..TILE_WIDTH {
+                    for py in 0..TILE_WIDTH {
+                        let addr = (2 * px + py * TILE_WIDTH) as usize;
                         let tile_pixel_low = tile.pixels[addr];
                         let tile_pixel_high = tile.pixels[addr + 1];
                         let red = (tile_pixel_low & 0x0f) as u8 * 16;
@@ -123,8 +123,8 @@ impl Graphics {
                         let scroll_y_pair = *self.vscroll_register.read().unwrap();
                         let scroll_x = (i32::from(scroll_x_pair.1) << 8) | i32::from(scroll_x_pair.0);
                         let scroll_y = (i32::from(scroll_y_pair.1) << 8) | i32::from(scroll_y_pair.0);
-                        let raw_x: i32 = (x * TILE_SIZE) as i32 + px as i32 + scroll_x;
-                        let raw_y: i32 = (y * TILE_SIZE) as i32 + py as i32 + scroll_y;
+                        let raw_x: i32 = (x * TILE_WIDTH) as i32 + px as i32 + scroll_x;
+                        let raw_y: i32 = (y * TILE_WIDTH) as i32 + py as i32 + scroll_y;
                         let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;
                         let final_y: u32 = (raw_y + FRAME_HEIGHT as i32) as u32 % FRAME_HEIGHT;
 
@@ -147,9 +147,9 @@ impl Graphics {
         // draw the sprites of the sprite map
         let sprite_map = self.sprite_map.read().unwrap();
         for sprite in &sprite_map.sprites {
-            for px in 0..SPRITE_SIZE {
-                for py in 0..SPRITE_SIZE {
-                    let addr = (2 * px + py * SPRITE_SIZE) as usize;
+            for px in 0..SPRITE_WIDTH {
+                for py in 0..SPRITE_WIDTH {
+                    let addr = (2 * px + py * SPRITE_WIDTH) as usize;
                     let tile_pixel_low = sprite.pixels[addr];
                     let tile_pixel_high = sprite.pixels[addr + 1];
                     let red = (tile_pixel_low & 0x0f) as u8 * 16;

@@ -50,6 +50,8 @@ const VGA_MODE_REGISTER_START : u32 = 0x7FE5B45;
 const VGA_STATUS_REGISTER_START : u32 = 0x7FE5B46;
 const VGA_FRAME_REGISTER_START : u32 = 0x7FE5B48;
 
+pub const CLK_REG_START : u32 = 0x7FE5B4C;
+
 const TILE_MAP_START : u32 = 0x7FE8000;
 const TILE_MAP_SIZE : u32 = 0x8000;
 
@@ -67,6 +69,7 @@ pub struct Memory {
   vga_mode_register: Arc<RwLock<u8>>,
   vga_status_register: Arc<RwLock<u8>>,
   vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
+  clk_register: Arc<RwLock<(u8, u8, u8, u8)>>,
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
   sd_card: Arc<RwLock<SdCard>>,
@@ -314,6 +317,7 @@ impl Memory {
             vga_mode_register: Arc::new(RwLock::new(0)),
             vga_status_register: Arc::new(RwLock::new(0)),
             vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
+            clk_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
             sd_card: Arc::new(RwLock::new(SdCard::new())),
@@ -421,6 +425,18 @@ impl Memory {
         }
         else if addr == PIT_START + 3 {
             return self.pit.read().unwrap().3;
+        }
+        else if addr == CLK_REG_START {
+            return self.clk_register.read().unwrap().0;
+        }
+        else if addr == CLK_REG_START + 1 {
+            return self.clk_register.read().unwrap().1;
+        }
+        else if addr == CLK_REG_START + 2 {
+            return self.clk_register.read().unwrap().2;
+        }
+        else if addr == CLK_REG_START + 3 {
+            return self.clk_register.read().unwrap().3;
         }
         else if addr == 0 {
             println!("Warning: reading from physical address 0x00000000");
@@ -532,6 +548,18 @@ impl Memory {
         }
         else if addr == PIT_START + 3 {
             self.pit.write().unwrap().3 = data;
+        }
+        else if addr == CLK_REG_START {
+            self.clk_register.write().unwrap().0 = data;
+        }
+        else if addr == CLK_REG_START + 1 {
+            self.clk_register.write().unwrap().1 = data;
+        }
+        else if addr == CLK_REG_START + 2 {
+            self.clk_register.write().unwrap().2 = data;
+        }
+        else if addr == CLK_REG_START + 3 {
+            self.clk_register.write().unwrap().3 = data;
         }
         else if addr == VGA_MODE_REGISTER_START {
             *self.vga_mode_register.write().unwrap() = data;

@@ -7,7 +7,13 @@ use std::cmp;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::memory::{Memory, PHYSMEM_MAX, PIT_START, SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT};
+use crate::memory::{
+  Memory, 
+  PHYSMEM_MAX, 
+  PIT_START, CLK_REG_START,
+  SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT
+};
+
 use crate::graphics::Graphics;
 
 #[derive(Debug)]
@@ -147,33 +153,41 @@ impl RandomCache {
   pub fn write(&mut self, pid : u32, vpn: u32, ppn : u32){
     if ppn & 0x00000010 != 0 {
       // global entry
-      if self.global_size < self.global_capacity {
-        self.global_size += 1;
-      } else {
-        // remove an entry
-        let evict = {
-          let mut keys = self.global_table.keys();
-          keys.next().cloned().expect("size was nonzero, this should work")
-        };
-        self.global_table.remove(&evict);
+      if !self.global_table.contains_key(&vpn) {
+        if self.global_size < self.global_capacity {
+          self.global_size += 1;
+        } else {
+          // remove an entry
+          let evict = {
+            let mut keys = self.global_table.keys();
+            keys.next().cloned().expect("size was nonzero, this should work")
+          };
+          self.global_table.remove(&evict);
+        }
       }
 
+      // will replace old mapping if one existed
       self.global_table.insert(vpn, ppn);
       assert!(self.global_size <= self.global_capacity);
+
     } else {
       // private entry
-      if self.private_size < self.private_capacity {
-        self.private_size += 1;
-      } else {
-        // remove an entry
-        let evict = {
-          let mut keys = self.private_table.keys();
-          keys.next().cloned().expect("size was nonzero, this should work")
-        };
-        self.private_table.remove(&evict);
+      if !self.private_table.contains_key(&(pid, vpn)) {
+        if self.private_size < self.private_capacity {
+          self.private_size += 1;
+        } else {
+          // remove an entry
+          let evict = {
+            let mut keys = self.private_table.keys();
+            keys.next().cloned().expect("size was nonzero, this should work")
+          };
+          self.private_table.remove(&evict);
+        }
       }
 
+      // will replace old mapping if one existed
       self.private_table.insert((pid, vpn), ppn);
+
       assert!(self.private_size <= self.private_capacity);
     }
   }
@@ -464,7 +478,13 @@ impl Emulator {
           self.check_for_interrupts();
           self.handle_interrupts();
 
-          if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(self.cregfile[6], 1), 1)) == 0) {
+          let clk_divider = 
+              (self.memory.read(CLK_REG_START + 3) as u32) << 24 |
+              (self.memory.read(CLK_REG_START + 2) as u32) << 16 |
+              (self.memory.read(CLK_REG_START + 1) as u32) << 8 |
+              (self.memory.read(CLK_REG_START) as u32);
+
+          if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
             let instr = self.fetch(self.pc);
 
             if let Some(instr) = instr {

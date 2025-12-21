@@ -10,6 +10,7 @@
   .define HSCROLL_ADDR 0x7FE5B40
   .define VSCROLL_ADDR 0x7FE5B42
   .define PIT_ADDR 0x7FE5804
+  .define CLK_DIV_ADDR 0x7FE5B4C
 
   .define PS2_ADDR 0x7FE5800
   .define KEY_X 120
@@ -35,16 +36,18 @@ INT_KEYBOARD:
 
 key_x:
   # make it faster
-  mov  r3, cdv
+  movi r4, CLK_DIV_ADDR
+  lwa  r3, [r4]
   lsr  r3, r3, 1
-  mov  cdv, r3
+  swa  r3  [r4]
   jmp end
 
 key_z:
   # make it slower
-  mov  r3, cdv
+  movi r4, CLK_DIV_ADDR
+  lwa  r3, [r4]
   lsl  r3, r3, 1
-  mov  cdv, r3
+  swa  r3, [r4]
   jmp end
 
 key_q:
@@ -90,7 +93,8 @@ _start:
 
   # set clock divider
   movi r3, 0x1000
-  mov  cdv, r3
+  movi r4, CLK_DIV_ADDR
+  swa  r3, [r4]
 
   # set imr
   movi r3, 0x0000000F

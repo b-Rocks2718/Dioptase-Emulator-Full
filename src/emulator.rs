@@ -16,6 +16,8 @@ use crate::memory::{
 
 use crate::graphics::Graphics;
 
+mod debugger;
+
 #[derive(Debug)]
 pub struct RandomCache {
     private_table : HashMap<(u32, u32), u32>,
@@ -210,12 +212,37 @@ impl RandomCache {
     self.private_table.drain();
     self.global_table.drain();
   }
+
+  fn debug_dump(&self) {
+    println!(
+      "TLB private: {}/{} entries",
+      self.private_size, self.private_capacity
+    );
+    if self.private_table.is_empty() {
+      println!("  (empty)");
+    } else {
+      for ((pid, vpn), entry) in &self.private_table {
+        println!("  pid {:08X} vpn {:08X} -> {:08X}", pid, vpn, entry);
+      }
+    }
+    println!(
+      "TLB global: {}/{} entries",
+      self.global_size, self.global_capacity
+    );
+    if self.global_table.is_empty() {
+      println!("  (empty)");
+    } else {
+      for (vpn, entry) in &self.global_table {
+        println!("  vpn {:08X} -> {:08X}", vpn, entry);
+      }
+    }
+  }
 }
 
 pub struct Emulator {
   kmode : bool,
   regfile : [u32; 32], // r0 - r31
-  cregfile : [u32; 9], // PSR, PID, ISR, IMR, EPC, FLG, CDV, TLB, KSP
+  cregfile : [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, CDV, TLB, KSP, CID, MBI, MBO
   // in FLG, flags are: carry | zero | sign | overflow
   memory : Memory,
   tlb : RandomCache,
@@ -224,7 +251,9 @@ pub struct Emulator {
   halted : bool,
   timer : u32,
   count : u32,
-  use_uart_rx: bool
+  use_uart_rx: bool,
+  watchpoints: Vec<Watchpoint>,
+  watchpoint_hit: Option<WatchpointHit>,
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -233,55 +262,127 @@ where P: AsRef<Path>, {
     Ok(io::BufReader::new(file).lines())
 }
 
+// Label -> address list (labels can appear multiple times across sections).
+type LabelMap = HashMap<String, Vec<u32>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchKind {
+  Read,
+  Write,
+  ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchAccess {
+  Read,
+  Write,
+}
+
+// Single-byte watchpoints tracked by exact address.
+#[derive(Clone, Copy, Debug)]
+struct Watchpoint {
+  addr: u32,
+  kind: WatchKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WatchpointHit {
+  addr: u32,
+  access: WatchAccess,
+  value: u8,
+}
+
+fn parse_hex_u32(token: &str) -> Option<u32> {
+  let s = token.trim();
+  let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+  if s.is_empty() {
+    return None;
+  }
+  u32::from_str_radix(s, 16).ok()
+}
+
+fn add_label(labels: &mut LabelMap, name: &str, addr: u32) {
+  let entry = labels.entry(name.to_string()).or_default();
+  if !entry.contains(&addr) {
+    entry.push(addr);
+  }
+}
+
+// Parse assembler debug label lines: "#label <name> <addr>".
+fn parse_label_line(line: &str, labels: &mut LabelMap) -> bool {
+  let mut parts = line.split_whitespace();
+  match parts.next() {
+    Some("#label") => {
+      if let (Some(name), Some(addr_str)) = (parts.next(), parts.next()) {
+        if let Some(addr) = parse_hex_u32(addr_str) {
+          add_label(labels, name, addr);
+          return true;
+        }
+      }
+    }
+    _ => {}
+  }
+  false
+}
+
+// Load hex (or .debug) program and collect any embedded labels.
+fn load_program(path: &str) -> (HashMap<u32, u8>, LabelMap) {
+  let mut instructions = HashMap::new();
+  let mut labels = LabelMap::new();
+
+  let lines = read_lines(path).expect("Couldn't open input file");
+  let mut pc: u32 = 0;
+  for line in lines.map_while(Result::ok) {
+    let line = line.trim();
+    if line.is_empty() {
+      continue;
+    }
+
+    if line.starts_with('#') {
+      // Debug label lines are prefixed with '#'.
+      parse_label_line(line, &mut labels);
+      continue;
+    }
+    if line.starts_with(';') || line.starts_with("//") {
+      continue;
+    }
+
+    if let Some(rest) = line.strip_prefix('@') {
+      let addr_str = rest.trim();
+      let addr = u32::from_str_radix(addr_str, 16).expect("Invalid address") * 4;
+      pc = addr;
+      continue;
+    }
+
+    let instruction = u32::from_str_radix(line, 16).expect("Error parsing hex file");
+
+    instructions.insert(pc, instruction as u8);
+    instructions.insert(pc + 1, (instruction >> 8) as u8);
+    instructions.insert(pc + 2, (instruction >> 16) as u8);
+    instructions.insert(pc + 3, (instruction >> 24) as u8);
+
+    pc += 4;
+  }
+
+  (instructions, labels)
+}
 
 impl Emulator {
   pub fn new(path : String, use_uart_rx: bool) -> Emulator {
+    let (instructions, _labels) = load_program(&path);
+    Emulator::from_instructions(instructions, use_uart_rx)
+  }
 
-    let mut instructions = HashMap::new();
-    
-    // read in binary file
-    let lines = read_lines(path).expect("Couldn't open input file");
-    // Consumes the iterator, returns an (Optional) String
-    let mut pc : u32 = 0;
-    for line in lines.map_while(Result::ok) {
-      
-      let bytes = line.as_bytes();
-      if bytes.is_empty() {
-        continue;
-      }
-
-      match bytes[0] {
-        b'@' => {
-          // Slice starting from index 1 (safe for ASCII)
-          let addr_str = &line[1..];
-          let addr = u32::from_str_radix(addr_str, 16).expect("Invalid address") * 4;
-          pc = addr;
-          continue;
-        }
-        _ => ()
-      }
-
-      // read one instruction
-      let instruction = u32::from_str_radix(&line, 16).expect("Error parsing hex file");
-
-      // write one instruction
-      instructions.insert(pc, instruction as u8);
-      instructions.insert(pc + 1, (instruction >> 8) as u8);
-      instructions.insert(pc + 2, (instruction >> 16) as u8);
-      instructions.insert(pc + 3, (instruction >> 24) as u8);
-
-      pc += 4;
-    }
-
+  pub fn from_instructions(instructions: HashMap<u32, u8>, use_uart_rx: bool) -> Emulator {
     let mem: Memory = Memory::new(instructions, use_uart_rx);
-    
+
     Emulator {
       kmode: true,
       regfile: [0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
-      cregfile: [1, 0, 0, 0, 0, 0, 0, 0, 0],
+      cregfile: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
       memory: mem,
       tlb: RandomCache::new(8),
       pc: 0x400,
@@ -289,7 +390,30 @@ impl Emulator {
       halted: false,
       timer: 0,
       count: 0,
-      use_uart_rx: use_uart_rx
+      use_uart_rx: use_uart_rx,
+      watchpoints: Vec::new(),
+      watchpoint_hit: None,
+    }
+  }
+
+  // Record the first watchpoint hit so the debugger can stop after stepping.
+  fn maybe_watch(&mut self, addr: u32, access: WatchAccess, value: u8) {
+    if self.watchpoint_hit.is_some() || self.watchpoints.is_empty() {
+      return;
+    }
+    for wp in &self.watchpoints {
+      if wp.addr == addr {
+        let matches = match (wp.kind, access) {
+          (WatchKind::Read, WatchAccess::Read) => true,
+          (WatchKind::Write, WatchAccess::Write) => true,
+          (WatchKind::ReadWrite, _) => true,
+          _ => false,
+        };
+        if matches {
+          self.watchpoint_hit = Some(WatchpointHit { addr, access, value });
+          break;
+        }
+      }
     }
   }
 
@@ -349,9 +473,11 @@ impl Emulator {
 
   // memory operations must be aligned
   fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
+    let vaddr = addr;
     let addr = self.convert_mem_address(addr, 1);
 
     if let Some(addr) = addr {
+      self.maybe_watch(vaddr, WatchAccess::Write, data);
       self.memory.write(addr, data);
       true
     } else {
@@ -396,10 +522,13 @@ impl Emulator {
       println!("Warning: reading from virtual address 0x00000000");
     }
 
+    let vaddr = addr;
     let addr = self.convert_mem_address(addr, 0);
 
     if let Some(addr) = addr {
-      Some(self.memory.read(addr))
+      let value = self.memory.read(addr);
+      self.maybe_watch(vaddr, WatchAccess::Read, value);
+      Some(value)
     } else {
       None
     }
@@ -421,6 +550,31 @@ impl Emulator {
     }
     self.mem_read16(addr).zip(self.mem_read16(addr + 2))
         .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
+  }
+
+  fn read_phys32(&mut self, addr: u32) -> Option<u32> {
+    if addr > PHYSMEM_MAX || addr + 3 > PHYSMEM_MAX {
+      return None;
+    }
+    Some(
+      (self.memory.read(addr + 3) as u32) << 24 |
+      (self.memory.read(addr + 2) as u32) << 16 |
+      (self.memory.read(addr + 1) as u32) << 8 |
+      (self.memory.read(addr) as u32)
+    )
+  }
+
+  // Debug reads bypass watchpoints so inspection doesn't change execution flow.
+  fn read_phys8_debug(&mut self, addr: u32) -> Option<u8> {
+    if addr > PHYSMEM_MAX {
+      return None;
+    }
+    Some(self.memory.read(addr))
+  }
+
+  // Debug reads bypass watchpoints so inspection doesn't change execution flow.
+  fn read_virt8_debug(&mut self, addr: u32) -> Option<u8> {
+    self.convert_mem_address(addr, 0).map(|paddr| self.memory.read(paddr))
   }
 
   fn fetch(&mut self, vaddr: u32) -> Option<u32> {

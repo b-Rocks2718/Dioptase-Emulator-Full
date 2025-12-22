@@ -4,8 +4,10 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use std::cmp;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::memory::{
   Memory, 
@@ -17,6 +19,13 @@ use crate::memory::{
 use crate::graphics::Graphics;
 
 mod debugger;
+
+// Global toggle for interrupt tracing output.
+static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_trace_interrupts(enabled: bool) {
+  TRACE_INTERRUPTS.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Debug)]
 pub struct RandomCache {
@@ -239,18 +248,401 @@ impl RandomCache {
   }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Scheduler policy for multicore execution.
+pub enum ScheduleMode {
+  Free,
+  RoundRobin,
+  Random,
+}
+
+impl ScheduleMode {
+  pub fn parse(token: &str) -> Option<Self> {
+    match token.to_ascii_lowercase().as_str() {
+      "free" => Some(ScheduleMode::Free),
+      "rr" | "round-robin" | "roundrobin" => Some(ScheduleMode::RoundRobin),
+      "rand" | "random" => Some(ScheduleMode::Random),
+      _ => None,
+    }
+  }
+}
+
+struct SchedulerState {
+  // Next core allowed to execute in non-free scheduling modes.
+  next_core: usize,
+  // Per-core halt tracking for scheduling decisions.
+  halted: Vec<bool>,
+  // Global stop flag shared by all cores.
+  done: bool,
+  // RNG seed used by random scheduling.
+  seed: u64,
+}
+
+struct Scheduler {
+  mode: ScheduleMode,
+  cores: usize,
+  state: Mutex<SchedulerState>,
+  cv: Condvar,
+}
+
+impl Scheduler {
+  fn new(mode: ScheduleMode, cores: usize) -> Arc<Scheduler> {
+    let mut seed = seed_from_time();
+    let halted = vec![false; cores];
+    let next_core = if mode == ScheduleMode::Random {
+      choose_random_core(&mut seed, &halted).unwrap_or(0)
+    } else {
+      0
+    };
+    Arc::new(Scheduler {
+      mode,
+      cores,
+      state: Mutex::new(SchedulerState {
+        next_core,
+        halted,
+        done: false,
+        seed,
+      }),
+      cv: Condvar::new(),
+    })
+  }
+
+  fn wait_turn(&self, core_id: usize) -> bool {
+    let mut state = self.state.lock().unwrap();
+    loop {
+      if state.done || state.halted[core_id] {
+        return false;
+      }
+      if state.next_core == core_id {
+        return true;
+      }
+      // Block until the scheduler hands this core the next turn.
+      state = self.cv.wait(state).unwrap();
+    }
+  }
+
+  fn finish_turn(&self, core_id: usize) {
+    let mut state = self.state.lock().unwrap();
+    if state.done {
+      self.cv.notify_all();
+      return;
+    }
+    // Pick the next runnable core based on the chosen scheduling policy.
+    match pick_next_core(self.mode, self.cores, core_id, &mut state) {
+      Some(next) => state.next_core = next,
+      None => state.done = true,
+    }
+    self.cv.notify_all();
+  }
+
+  fn mark_halted(&self, core_id: usize) {
+    let mut state = self.state.lock().unwrap();
+    state.halted[core_id] = true;
+    if state.halted.iter().all(|halted| *halted) {
+      state.done = true;
+      self.cv.notify_all();
+      return;
+    }
+    // If the scheduled core halted, advance to a still-runnable core.
+    if state.halted[state.next_core] {
+      match pick_next_core(self.mode, self.cores, state.next_core, &mut state) {
+        Some(next) => state.next_core = next,
+        None => state.done = true,
+      }
+    }
+    self.cv.notify_all();
+  }
+
+  fn stop(&self) {
+    let mut state = self.state.lock().unwrap();
+    state.done = true;
+    self.cv.notify_all();
+  }
+}
+
+fn seed_from_time() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_nanos() as u64)
+    .unwrap_or(0)
+}
+
+fn next_rand_u32(seed: &mut u64) -> u32 {
+  *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+  (*seed >> 32) as u32
+}
+
+fn choose_random_core(seed: &mut u64, halted: &[bool]) -> Option<usize> {
+  let active = halted.iter().filter(|h| !**h).count();
+  if active == 0 {
+    return None;
+  }
+  let target = (next_rand_u32(seed) as usize) % active;
+  let mut seen = 0usize;
+  for (idx, is_halted) in halted.iter().enumerate() {
+    if !*is_halted {
+      if seen == target {
+        return Some(idx);
+      }
+      seen += 1;
+    }
+  }
+  None
+}
+
+fn pick_next_core(
+  mode: ScheduleMode,
+  cores: usize,
+  current: usize,
+  state: &mut SchedulerState,
+) -> Option<usize> {
+  match mode {
+    ScheduleMode::Random => choose_random_core(&mut state.seed, &state.halted),
+    ScheduleMode::RoundRobin => {
+      for offset in 1..=cores {
+        let idx = (current + offset) % cores;
+        if !state.halted[idx] {
+          return Some(idx);
+        }
+      }
+      None
+    }
+    ScheduleMode::Free => {
+      for (idx, halted) in state.halted.iter().enumerate() {
+        if !*halted {
+          return Some(idx);
+        }
+      }
+      None
+    }
+  }
+}
+
+const TIMER_INTERRUPT_BIT: u32 = 1 << 0;
+const KB_INTERRUPT_BIT: u32 = 1 << 1;
+const UART_INTERRUPT_BIT: u32 = 1 << 2;
+const IPI_INTERRUPT_BIT: u32 = 1 << 5;
+
+fn format_interrupts(bits: u32) -> String {
+  let mut parts = Vec::new();
+  if (bits & TIMER_INTERRUPT_BIT) != 0 {
+    parts.push("timer");
+  }
+  if (bits & KB_INTERRUPT_BIT) != 0 {
+    parts.push("keyboard");
+  }
+  if (bits & UART_INTERRUPT_BIT) != 0 {
+    parts.push("uart");
+  }
+  if (bits & SD_INTERRUPT_BIT) != 0 {
+    parts.push("sd");
+  }
+  if (bits & VGA_INTERRUPT_BIT) != 0 {
+    parts.push("vga");
+  }
+  if (bits & IPI_INTERRUPT_BIT) != 0 {
+    parts.push("ipi");
+  }
+  if parts.is_empty() {
+    "none".to_string()
+  } else {
+    parts.join("|")
+  }
+}
+
+struct InterruptRouteState {
+  // Round-robin pointers for device interrupts routed to a single core.
+  next_kb: usize,
+  next_uart: usize,
+  next_sd: usize,
+  next_vga: usize,
+  // Track which core currently has a pending KB/UART interrupt.
+  kb_inflight: Option<usize>,
+  uart_inflight: Option<usize>,
+}
+
+struct InterruptController {
+  cores: usize,
+  // Per-core pending interrupt bits delivered on the next tick.
+  pending: Vec<AtomicU32>,
+  // Per-core IPI payload storage (copied into MBI on delivery).
+  ipi_payload: Vec<AtomicU32>,
+  routes: Mutex<InterruptRouteState>,
+}
+
+impl InterruptController {
+  fn new(cores: usize) -> Arc<InterruptController> {
+    Arc::new(InterruptController {
+      cores,
+      pending: (0..cores).map(|_| AtomicU32::new(0)).collect(),
+      ipi_payload: (0..cores).map(|_| AtomicU32::new(0)).collect(),
+      routes: Mutex::new(InterruptRouteState {
+        next_kb: 0,
+        next_uart: 0,
+        next_sd: 0,
+        next_vga: 0,
+        kb_inflight: None,
+        uart_inflight: None,
+      }),
+    })
+  }
+
+  fn set_pending_bits(&self, core: usize, bits: u32) {
+    self.pending[core].fetch_or(bits, Ordering::Release);
+  }
+
+  fn take_pending(&self, core: usize) -> u32 {
+    self.pending[core].swap(0, Ordering::AcqRel)
+  }
+
+  fn read_ipi_payload(&self, core: usize) -> u32 {
+    self.ipi_payload[core].load(Ordering::Acquire)
+  }
+
+  fn write_ipi_payload(&self, core: usize, value: u32) {
+    self.ipi_payload[core].store(value, Ordering::Release);
+  }
+
+  fn send_ipi(&self, target: usize, value: u32) -> bool {
+    if target >= self.cores {
+      return false;
+    }
+    // MBI carries the payload, ISR bit signals delivery.
+    self.write_ipi_payload(target, value);
+    self.set_pending_bits(target, IPI_INTERRUPT_BIT);
+    true
+  }
+
+  fn send_ipi_all(&self, sender: usize, value: u32) -> u32 {
+    let mut mask = 0u32;
+    for core in 0..self.cores {
+      if core == sender {
+        continue;
+      }
+      if self.send_ipi(core, value) {
+        mask |= 1u32 << core;
+      }
+    }
+    mask
+  }
+
+  fn dispatch_input(&self, use_uart_rx: bool, io_nonempty: bool) {
+    let mut routes = self.routes.lock().unwrap();
+    if use_uart_rx {
+      let bit = UART_INTERRUPT_BIT;
+      if io_nonempty && routes.uart_inflight.is_none() {
+        // Route the next UART interrupt to a single core in round-robin order.
+        let core = routes.next_uart % self.cores;
+        routes.next_uart = (routes.next_uart + 1) % self.cores;
+        routes.uart_inflight = Some(core);
+        self.set_pending_bits(core, bit);
+      }
+    } else {
+      let bit = KB_INTERRUPT_BIT;
+      if io_nonempty && routes.kb_inflight.is_none() {
+        // Route the next keyboard interrupt to a single core in round-robin order.
+        let core = routes.next_kb % self.cores;
+        routes.next_kb = (routes.next_kb + 1) % self.cores;
+        routes.kb_inflight = Some(core);
+        self.set_pending_bits(core, bit);
+      }
+    }
+  }
+
+  fn dispatch_device_interrupts(&self, pending: u32) {
+    if pending == 0 {
+      return;
+    }
+    let mut routes = self.routes.lock().unwrap();
+    if pending & SD_INTERRUPT_BIT != 0 {
+      // SD interrupts go to one core at a time, round-robin.
+      let core = routes.next_sd % self.cores;
+      routes.next_sd = (routes.next_sd + 1) % self.cores;
+      self.set_pending_bits(core, SD_INTERRUPT_BIT);
+    }
+    if pending & VGA_INTERRUPT_BIT != 0 {
+      // VGA interrupts go to one core at a time, round-robin.
+      let core = routes.next_vga % self.cores;
+      routes.next_vga = (routes.next_vga + 1) % self.cores;
+      self.set_pending_bits(core, VGA_INTERRUPT_BIT);
+    }
+  }
+
+  fn ack_input(&self, core: usize, cleared_bits: u32) {
+    if cleared_bits == 0 {
+      return;
+    }
+    let mut routes = self.routes.lock().unwrap();
+    if (cleared_bits & KB_INTERRUPT_BIT) != 0 {
+      if routes.kb_inflight == Some(core) {
+        routes.kb_inflight = None;
+      }
+    }
+    if (cleared_bits & UART_INTERRUPT_BIT) != 0 {
+      if routes.uart_inflight == Some(core) {
+        routes.uart_inflight = None;
+      }
+    }
+  }
+}
+
+struct RunShared {
+  // Global stop signal shared by all cores.
+  stop: AtomicBool,
+  // Track how many cores have exited their run loops.
+  halted: AtomicUsize,
+  // Per-core return values (r1) recorded on exit.
+  results: Mutex<Vec<Option<u32>>>,
+  // Shared completion flag for graphics and multi-core coordination.
+  finished: Arc<Mutex<bool>>,
+  cores: usize,
+}
+
+impl RunShared {
+  fn new(cores: usize, finished: Arc<Mutex<bool>>) -> RunShared {
+    RunShared {
+      stop: AtomicBool::new(false),
+      halted: AtomicUsize::new(0),
+      results: Mutex::new(vec![None; cores]),
+      finished,
+      cores,
+    }
+  }
+
+  fn should_stop(&self) -> bool {
+    self.stop.load(Ordering::Relaxed)
+  }
+
+  fn request_stop(&self) {
+    self.stop.store(true, Ordering::Relaxed);
+    *self.finished.lock().unwrap() = true;
+  }
+
+  fn record_exit(&self, core_id: usize, value: u32) {
+    self.results.lock().unwrap()[core_id] = Some(value);
+    let halted = self.halted.fetch_add(1, Ordering::Relaxed) + 1;
+    if halted == self.cores {
+      *self.finished.lock().unwrap() = true;
+    }
+  }
+}
+
 pub struct Emulator {
   kmode : bool,
   regfile : [u32; 32], // r0 - r31
-  cregfile : [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, CDV, TLB, KSP, CID, MBI, MBO
+  cregfile : [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, unused, TLB, KSP, CID, MBI, MBO
   // in FLG, flags are: carry | zero | sign | overflow
-  memory : Memory,
+  memory : Arc<Memory>,
+  interrupts: Arc<InterruptController>,
   tlb : RandomCache,
   pc : u32,
   asleep : bool,
+  // Distinguish "mode sleep" from a core that starts asleep.
+  sleep_armed: bool,
   halted : bool,
   timer : u32,
   count : u32,
+  core_id: u32,
   use_uart_rx: bool,
   watchpoints: Vec<Watchpoint>,
   watchpoint_hit: Option<WatchpointHit>,
@@ -374,7 +766,24 @@ impl Emulator {
   }
 
   pub fn from_instructions(instructions: HashMap<u32, u8>, use_uart_rx: bool) -> Emulator {
-    let mem: Memory = Memory::new(instructions, use_uart_rx);
+    let memory: Arc<Memory> = Arc::new(Memory::new(instructions, use_uart_rx));
+    let interrupts = InterruptController::new(1);
+    Emulator::from_shared(memory, interrupts, use_uart_rx, 0)
+  }
+
+  fn from_shared(
+    memory: Arc<Memory>,
+    interrupts: Arc<InterruptController>,
+    use_uart_rx: bool,
+    core_id: u32,
+  ) -> Emulator {
+    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // CID is a read-only core identifier.
+    cregfile[9] = core_id;
+    if core_id != 0 {
+      // Allow IPI wakeups on secondary cores by default.
+      cregfile[3] = 0x80000020;
+    }
 
     Emulator {
       kmode: true,
@@ -382,17 +791,68 @@ impl Emulator {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0],
-      cregfile: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-      memory: mem,
-      tlb: RandomCache::new(8),
+      cregfile,
+      memory,
+      interrupts,
+      tlb: RandomCache::new(32),
       pc: 0x400,
-      asleep: false,
+      asleep: core_id != 0,
+      sleep_armed: false,
       halted: false,
       timer: 0,
       count: 0,
-      use_uart_rx: use_uart_rx,
+      core_id,
+      use_uart_rx,
       watchpoints: Vec::new(),
       watchpoint_hit: None,
+    }
+  }
+
+  fn read_isr(&self) -> u32 {
+    self.cregfile[2]
+  }
+
+  fn write_isr(&mut self, value: u32) {
+    let old = self.cregfile[2];
+    self.cregfile[2] = value;
+    // Let the interrupt controller know when input interrupts are cleared.
+    let cleared = old & !value;
+    if cleared != 0 {
+      self.interrupts.ack_input(self.core_id as usize, cleared);
+    }
+  }
+
+  fn set_isr_bits(&mut self, bits: u32) {
+    self.cregfile[2] |= bits;
+  }
+
+  fn read_mbi(&self) -> u32 {
+    self.cregfile[10]
+  }
+
+  fn write_mbi(&mut self, value: u32) {
+    self.cregfile[10] = value;
+  }
+
+  fn read_creg(&self, idx: usize) -> u32 {
+    match idx {
+      // ISR and MBI are core-local control registers.
+      2 => self.read_isr(),
+      10 => self.read_mbi(),
+      _ => self.cregfile[idx],
+    }
+  }
+
+  fn write_creg(&mut self, idx: usize, value: u32) {
+    match idx {
+      // Route ISR/MBI through helpers so we can track clears and core-local state.
+      2 => self.write_isr(value),
+      9 => {
+        // CID is read-only.
+        println!("Warning: attempt to write read-only CID register");
+      }
+      10 => self.write_mbi(value),
+      _ => self.cregfile[idx] = value,
     }
   }
 
@@ -491,14 +951,19 @@ impl Emulator {
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
     let addr = addr & 0xFFFFFFFE;
-
-    // alignment should mean these return the same value
-    let w1 = self.mem_write8(addr, data as u8);
-    let w2 = self.mem_write8(addr + 1, (data >> 8) as u8);
-
-    assert!(w1 == w2, "address misaligned or TLB broken");
-
-    return w1;
+    let bytes = data.to_le_bytes();
+    let mut addrs = [0u32; 2];
+    for (i, slot) in addrs.iter_mut().enumerate() {
+      if let Some(paddr) = self.convert_mem_address(addr + i as u32, 1) {
+        *slot = paddr;
+      } else {
+        return false;
+      }
+    }
+    self.maybe_watch(addr, WatchAccess::Write, bytes[0]);
+    self.maybe_watch(addr + 1, WatchAccess::Write, bytes[1]);
+    self.memory.write_phys_bytes(&addrs, &bytes);
+    true
   }
 
   fn mem_write32(&mut self, addr : u32, data : u32) -> bool {
@@ -508,13 +973,20 @@ impl Emulator {
     }
 
     let addr = addr & 0xFFFFFFFC;
-
-    let w1 = self.mem_write16(addr, data as u16);
-    let w2 = self.mem_write16(addr + 2, (data >> 16) as u16);
-
-    assert!(w1 == w2, "address misaligned or TLB broken");
-
-    return w1;
+    let bytes = data.to_le_bytes();
+    let mut addrs = [0u32; 4];
+    for (i, slot) in addrs.iter_mut().enumerate() {
+      if let Some(paddr) = self.convert_mem_address(addr + i as u32, 1) {
+        *slot = paddr;
+      } else {
+        return false;
+      }
+    }
+    for (i, byte) in bytes.iter().enumerate() {
+      self.maybe_watch(addr + i as u32, WatchAccess::Write, *byte);
+    }
+    self.memory.write_phys_bytes(&addrs, &bytes);
+    true
   }
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
@@ -539,8 +1011,22 @@ impl Emulator {
       // unaligned access
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
-    self.mem_read8(addr).zip(self.mem_read8(addr + 1))
-        .map(|(lo, hi)| (u16::from(hi) << 8) | u16::from(lo))
+    if addr == 0 {
+      println!("Warning: reading from virtual address 0x00000000");
+    }
+    let mut addrs = [0u32; 2];
+    for (i, slot) in addrs.iter_mut().enumerate() {
+      if let Some(paddr) = self.convert_mem_address(addr + i as u32, 0) {
+        *slot = paddr;
+      } else {
+        return None;
+      }
+    }
+    let mut bytes = [0u8; 2];
+    self.memory.read_phys_bytes(&addrs, &mut bytes);
+    self.maybe_watch(addr, WatchAccess::Read, bytes[0]);
+    self.maybe_watch(addr + 1, WatchAccess::Read, bytes[1]);
+    Some(u16::from_le_bytes(bytes))
   }
 
   fn mem_read32(&mut self, addr: u32) -> Option<u32> {
@@ -548,20 +1034,73 @@ impl Emulator {
       // unaligned access
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
-    self.mem_read16(addr).zip(self.mem_read16(addr + 2))
-        .map(|(lo, hi)| (u32::from(hi) << 16) | u32::from(lo))
+    if addr == 0 {
+      println!("Warning: reading from virtual address 0x00000000");
+    }
+    let mut addrs = [0u32; 4];
+    for (i, slot) in addrs.iter_mut().enumerate() {
+      if let Some(paddr) = self.convert_mem_address(addr + i as u32, 0) {
+        *slot = paddr;
+      } else {
+        return None;
+      }
+    }
+    let mut bytes = [0u8; 4];
+    self.memory.read_phys_bytes(&addrs, &mut bytes);
+    for (i, byte) in bytes.iter().enumerate() {
+      self.maybe_watch(addr + i as u32, WatchAccess::Read, *byte);
+    }
+    Some(u32::from_le_bytes(bytes))
+  }
+
+  fn mem_atomic_swap32(&mut self, addr: u32, value: u32) -> Option<u32> {
+    if (addr & 3) != 0 {
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
+    let addr = addr & 0xFFFFFFFC;
+    let read_addr = self.convert_mem_address(addr, 0)?;
+    let write_addr = self.convert_mem_address(addr, 1)?;
+    if read_addr != write_addr {
+      return None;
+    }
+    let prev = self.memory.atomic_swap_u32(read_addr, value);
+    let prev_bytes = prev.to_le_bytes();
+    let new_bytes = value.to_le_bytes();
+    for i in 0..4 {
+      let vaddr = addr + i as u32;
+      self.maybe_watch(vaddr, WatchAccess::Read, prev_bytes[i]);
+      self.maybe_watch(vaddr, WatchAccess::Write, new_bytes[i]);
+    }
+    Some(prev)
+  }
+
+  fn mem_atomic_add32(&mut self, addr: u32, value: u32) -> Option<u32> {
+    if (addr & 3) != 0 {
+      println!("Warning: unaligned memory access at {:08x}", addr);
+    }
+    let addr = addr & 0xFFFFFFFC;
+    let read_addr = self.convert_mem_address(addr, 0)?;
+    let write_addr = self.convert_mem_address(addr, 1)?;
+    if read_addr != write_addr {
+      return None;
+    }
+    let prev = self.memory.atomic_add_u32(read_addr, value);
+    let next = u32::wrapping_add(prev, value);
+    let prev_bytes = prev.to_le_bytes();
+    let next_bytes = next.to_le_bytes();
+    for i in 0..4 {
+      let vaddr = addr + i as u32;
+      self.maybe_watch(vaddr, WatchAccess::Read, prev_bytes[i]);
+      self.maybe_watch(vaddr, WatchAccess::Write, next_bytes[i]);
+    }
+    Some(prev)
   }
 
   fn read_phys32(&mut self, addr: u32) -> Option<u32> {
     if addr > PHYSMEM_MAX || addr + 3 > PHYSMEM_MAX {
       return None;
     }
-    Some(
-      (self.memory.read(addr + 3) as u32) << 24 |
-      (self.memory.read(addr + 2) as u32) << 16 |
-      (self.memory.read(addr + 1) as u32) << 8 |
-      (self.memory.read(addr) as u32)
-    )
+    Some(self.memory.read_u32(addr))
   }
 
   // Debug reads bypass watchpoints so inspection doesn't change execution flow.
@@ -589,15 +1128,28 @@ impl Emulator {
     let paddr = self.convert_mem_address(vaddr, 2);
 
     if let Some(addr) = paddr {
-      Some(
-        (self.memory.read(addr + 3) as u32) << 24 |
-        (self.memory.read(addr + 2) as u32) << 16 |
-        (self.memory.read(addr + 1) as u32) << 8 |
-        (self.memory.read(addr) as u32)
-      )
+      Some(self.memory.read_u32(addr))
     } else {
       None
     }
+  }
+
+  fn tick(&mut self) {
+    self.check_for_interrupts();
+    self.handle_interrupts();
+
+    let clk_divider = self.memory.read_u32(CLK_REG_START);
+
+    if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
+      let instr = self.fetch(self.pc);
+
+      if let Some(instr) = instr {
+        self.execute(instr);
+      } else {
+        self.raise_tlb_miss(self.pc);
+      }
+    }
+    self.count = self.count.wrapping_add(1);
   }
 
   pub fn run(mut self, max_iters : u32, with_graphics : bool) -> Option<u32> {
@@ -629,30 +1181,12 @@ impl Emulator {
       move || {
         self.count = 0;
         while !self.halted {
-          self.check_for_interrupts();
-          self.handle_interrupts();
-
-          let clk_divider = 
-              (self.memory.read(CLK_REG_START + 3) as u32) << 24 |
-              (self.memory.read(CLK_REG_START + 2) as u32) << 16 |
-              (self.memory.read(CLK_REG_START + 1) as u32) << 8 |
-              (self.memory.read(CLK_REG_START) as u32);
-
-          if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
-            let instr = self.fetch(self.pc);
-
-            if let Some(instr) = instr {
-              self.execute(instr);
-            } else {
-              self.raise_tlb_miss(self.pc);
-            }
-          }
+          self.tick();
           if max_iters != 0 && self.count > max_iters {
             *ret_clone.lock().unwrap() = None;
             *finished_clone.lock().unwrap() = true;
             return;
           }
-          self.count += 1;
         }
 
         // return the value in r3
@@ -671,48 +1205,109 @@ impl Emulator {
     return *ret.lock().unwrap();
   }
 
+  pub fn run_multicore(
+    path: String,
+    cores: usize,
+    sched: ScheduleMode,
+    max_iters: u32,
+    with_graphics: bool,
+    use_uart_rx: bool,
+  ) -> Option<u32> {
+    assert!((1..=4).contains(&cores), "cores must be in 1..=4");
+    let (instructions, _labels) = load_program(&path);
+    let memory: Arc<Memory> = Arc::new(Memory::new(instructions, use_uart_rx));
+    let interrupts = InterruptController::new(cores);
+
+    let finished = Arc::new(Mutex::new(false));
+    let shared = Arc::new(RunShared::new(cores, Arc::clone(&finished)));
+
+    let scheduler = match sched {
+      ScheduleMode::Free => None,
+      _ => Some(Scheduler::new(sched, cores)),
+    };
+
+    let mut graphics = None;
+    if with_graphics {
+      graphics = Some(Graphics::new(
+        memory.get_frame_buffer(),
+        memory.get_tile_map(),
+        memory.get_io_buffer(),
+        memory.get_vscroll_register(),
+        memory.get_hscroll_register(),
+        memory.get_sprite_map(),
+        memory.get_scale_register(),
+        memory.get_vga_mode_register(),
+        memory.get_vga_status_register(),
+        memory.get_vga_frame_register(),
+        memory.get_pending_interrupt(),
+      ));
+    }
+
+    let mut handles = Vec::new();
+    for core_id in 0..cores {
+      let cpu = Emulator::from_shared(
+        Arc::clone(&memory),
+        Arc::clone(&interrupts),
+        use_uart_rx,
+        core_id as u32,
+      );
+      // Each core runs in its own thread to allow real races.
+      let shared_clone = Arc::clone(&shared);
+      let scheduler_clone = scheduler.clone();
+      let handle = thread::spawn(move || {
+        run_core_loop(cpu, max_iters, scheduler_clone, shared_clone, core_id);
+      });
+      handles.push(handle);
+    }
+
+    if let Some(mut graphics) = graphics {
+      graphics.start(Arc::clone(&finished), false);
+    }
+
+    for handle in handles {
+      handle.join().unwrap();
+    }
+
+    // Return value is r1 from core 0.
+    let results = shared.results.lock().unwrap();
+    results.get(0).copied().unwrap_or(None)
+  }
+
   fn check_for_interrupts(&mut self) {
 
     // check if io buf is nonempty
-    let binding = self.memory.get_io_buffer();
-    let io_buf = binding.read().unwrap();
-
-    if !io_buf.is_empty() {
-      if self.use_uart_rx {
-        // cause a uart interrupt
-        self.cregfile[2] |= 4;
-      } else {
-        // cause a keyboard interrupt
-        self.cregfile[2] |= 2;
-      }
-    }
+    let io_nonempty = {
+      let binding = self.memory.get_io_buffer();
+      let io_buf = binding.read().unwrap();
+      !io_buf.is_empty()
+    };
+    self.interrupts.dispatch_input(self.use_uart_rx, io_nonempty);
 
     let ints = self.memory.check_interrupts();
-
-    if ints & SD_INTERRUPT_BIT != 0 {
-      self.cregfile[2] |= SD_INTERRUPT_BIT;
-    }
-    if ints & VGA_INTERRUPT_BIT != 0 {
-      self.cregfile[2] |= VGA_INTERRUPT_BIT;
-    }
+    self.interrupts.dispatch_device_interrupts(ints);
     
+    let pending = self.interrupts.take_pending(self.core_id as usize);
+    if pending != 0 {
+      // IPI payloads are copied into the core-local MBI register.
+      if (pending & IPI_INTERRUPT_BIT) != 0 {
+        self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
+      }
+      self.cregfile[2] |= pending;
+    }
 
     // check for timer interrupt
     if self.timer == 0 {
       // check if timer was set
       let old_kmode = self.kmode;
       self.kmode = true;
-      let v = (self.memory.read(PIT_START + 3) as u32) << 24 |
-              (self.memory.read(PIT_START + 2) as u32) << 16 |
-              (self.memory.read(PIT_START + 1) as u32) << 8 |
-              (self.memory.read(PIT_START) as u32);
+      let v = self.memory.read_u32(PIT_START);
       self.kmode = old_kmode;
       if v != 0 {
         // reset timer
         self.timer = v;
 
         // trigger timer interrupt
-        self.cregfile[2] |= 1;
+        self.set_isr_bits(TIMER_INTERRUPT_BIT);
       }
     } else {
       self.timer -= 1;
@@ -722,18 +1317,31 @@ impl Emulator {
   fn handle_interrupts(&mut self){
     if self.cregfile[3] >> 31 != 0 {
       // top bit activates/disables all interrupts
-      let active_ints = self.cregfile[3] & self.cregfile[2];
+      let active_ints = self.cregfile[3] & self.read_isr();
 
       if active_ints == 0 {
         return;
       }
 
-      // undo sleep
+      if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+        println!(
+          "[core {}] interrupt {} (active={:08X} imr={:08X} pc={:08X})",
+          self.core_id,
+          format_interrupts(active_ints),
+          active_ints,
+          self.cregfile[3],
+          self.pc
+        );
+      }
+
+      // Undo sleep; "mode sleep" advances to the next instruction.
       if self.asleep {
-        // move to next instruction
-        self.pc += 4;
+        if self.sleep_armed {
+          self.pc += 4;
+        }
       }
       self.asleep = false;
+      self.sleep_armed = false;
 
       self.save_state();
 
@@ -1330,25 +1938,18 @@ impl Emulator {
     let r_c_out = self.get_reg(r_c);
     let addr = u32::wrapping_add(r_b_out, imm);
 
-    let data = self.mem_read32(addr);
+    let data = match type_ {
+      0 => self.mem_atomic_add32(addr, r_c_out),
+      1 => self.mem_atomic_swap32(addr, r_c_out),
+      _ => panic!("invalid atomic type"),
+    };
     if let Some(data) = data {
       self.write_reg(r_a, data);
-      match type_ {
-        0 => {
-          // fadd
-          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
-        }
-        1 => {
-          // swap
-          self.mem_write32(addr, r_c_out);
-        }
-        _ => panic!("invalid atomic type"),
-      };
-    } else{
+    } else {
       // TLB Miss
       self.raise_tlb_miss(addr);
       return;
-    };
+    }
 
     self.pc += 4;
   }
@@ -1376,25 +1977,18 @@ impl Emulator {
     let addr = u32::wrapping_add(addr, self.pc);
     let addr = u32::wrapping_add(addr, 4);
 
-    let data = self.mem_read32(addr);
+    let data = match type_ {
+      0 => self.mem_atomic_add32(addr, r_c_out),
+      1 => self.mem_atomic_swap32(addr, r_c_out),
+      _ => panic!("invalid atomic type"),
+    };
     if let Some(data) = data {
       self.write_reg(r_a, data);
-      match type_ {
-        0 => {
-          // fadd
-          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
-        }
-        1 => {
-          // swap
-          self.mem_write32(addr, r_c_out);
-        }
-        _ => panic!("invalid atomic type"),
-      };
-    } else{
+    } else {
       // TLB Miss
       self.raise_tlb_miss(addr);
       return;
-    };
+    }
 
     self.pc += 4;
   }
@@ -1419,25 +2013,18 @@ impl Emulator {
     let addr = u32::wrapping_add(imm, self.pc);
     let addr = u32::wrapping_add(addr, 4);
 
-    let data = self.mem_read32(addr);
+    let data = match type_ {
+      0 => self.mem_atomic_add32(addr, r_c_out),
+      1 => self.mem_atomic_swap32(addr, r_c_out),
+      _ => panic!("invalid atomic type"),
+    };
     if let Some(data) = data {
       self.write_reg(r_a, data);
-      match type_ {
-        0 => {
-          // fadd
-          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
-        }
-        1 => {
-          // swap
-          self.mem_write32(addr, r_c_out);
-        }
-        _ => panic!("invalid atomic type"),
-      };
-    } else{
+    } else {
       // TLB Miss
       self.raise_tlb_miss(addr);
       return;
-    };
+    }
 
     self.pc += 4;
   }
@@ -1615,6 +2202,7 @@ impl Emulator {
       1 => self.crmv_op(instr),
       2 => self.mode_op(instr),
       3 => self.rfe(instr),
+      4 => self.ipi_op(instr),
       _ => {
         self.raise_exc_instr();
         return;
@@ -1663,17 +2251,17 @@ impl Emulator {
     if op == 0 {
       // crmv crA, rB
       let rb = self.regfile[rb as usize];
-      self.cregfile[ra as usize] = rb;
+      self.write_creg(ra as usize, rb);
     } else if op == 1 {
       // crmv rA, crB
       if ra != 0 {
-        let rb = self.cregfile[rb as usize];
+        let rb = self.read_creg(rb as usize);
         self.regfile[ra as usize] = rb;
       }
     } else if op == 2 {
       // crmv crA, crB
-      let rb = self.cregfile[rb as usize];
-      self.cregfile[ra as usize] = rb;
+      let rb = self.read_creg(rb as usize);
+      self.write_creg(ra as usize, rb);
     } else {
       // crmv rA, rB
       if ra != 0 {
@@ -1681,6 +2269,28 @@ impl Emulator {
         self.regfile[ra as usize] = rb;
       }
     }
+    self.pc += 4;
+  }
+
+  fn ipi_op(&mut self, instr: u32) {
+    let ra = (instr >> 22) & 0x1F;
+    let all = ((instr >> 11) & 1) != 0;
+    // Payload comes from MBO (cr11).
+    let payload = self.cregfile[11];
+
+    if all {
+      let mask = self.interrupts.send_ipi_all(self.core_id as usize, payload);
+      if ra != 0 {
+        self.write_reg(ra, mask);
+      }
+    } else {
+      let target = (instr & 0x3) as usize;
+      let success = self.interrupts.send_ipi(target, payload);
+      if ra != 0 {
+        self.write_reg(ra, if success { 1 } else { 0 });
+      }
+    }
+
     self.pc += 4;
   }
 
@@ -1693,6 +2303,8 @@ impl Emulator {
     } else if op == 1 {
       // mode sleep
       self.asleep = true;
+      // Mark as a sleep instruction so interrupts advance PC.
+      self.sleep_armed = true;
     } else {
       // mode halt
       self.halted = true;
@@ -1715,4 +2327,70 @@ impl Emulator {
     // restore pc
     self.pc = self.cregfile[4];
   }
+}
+
+fn run_core_loop(
+  mut cpu: Emulator,
+  max_iters: u32,
+  scheduler: Option<Arc<Scheduler>>,
+  shared: Arc<RunShared>,
+  core_id: usize,
+) {
+  cpu.count = 0;
+  loop {
+    if shared.should_stop() {
+      if let Some(sched) = &scheduler {
+        sched.stop();
+      }
+      break;
+    }
+    if let Some(sched) = &scheduler {
+      // Non-free scheduling blocks until this core is chosen.
+      if !sched.wait_turn(core_id) {
+        break;
+      }
+    }
+    if shared.should_stop() {
+      if let Some(sched) = &scheduler {
+        sched.stop();
+      }
+      break;
+    }
+    if cpu.halted {
+      // Any core halting stops the entire system.
+      shared.request_stop();
+      if let Some(sched) = &scheduler {
+        sched.mark_halted(core_id);
+        sched.stop();
+      }
+      break;
+    }
+
+    // Advance one CPU tick per scheduling turn.
+    cpu.tick();
+
+    if cpu.halted {
+      // Any core halting stops the entire system.
+      shared.request_stop();
+      if let Some(sched) = &scheduler {
+        sched.mark_halted(core_id);
+        sched.stop();
+      }
+      break;
+    }
+
+    if max_iters != 0 && cpu.count > max_iters {
+      shared.request_stop();
+      if let Some(sched) = &scheduler {
+        sched.stop();
+      }
+      break;
+    }
+
+    if let Some(sched) = &scheduler {
+      sched.finish_turn(core_id);
+    }
+  }
+
+  shared.record_exit(core_id, cpu.regfile[1]);
 }

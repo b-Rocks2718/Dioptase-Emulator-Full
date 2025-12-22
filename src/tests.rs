@@ -6,7 +6,41 @@ use std::process::Command;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
+use std::sync::Once;
+
+#[cfg(test)]
 use super::*;
+
+#[cfg(test)]
+use crate::emulator::ScheduleMode;
+
+#[cfg(test)]
+fn build_assembler() {
+  static BUILD: Once = Once::new();
+  BUILD.call_once(|| {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let asm_dir = manifest.join("../../Dioptase-Assembler");
+    // Build the assembler once so tests can run in clean environments.
+    let status = Command::new("make")
+      .current_dir(asm_dir)
+      .status()
+      .expect("failed to run make for assembler");
+    assert!(status.success(), "assembler build failed");
+  });
+}
+
+#[cfg(test)]
+fn assembler_path() -> PathBuf {
+  let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let path = manifest.join("../../Dioptase-Assembler/build/assembler");
+  if path.exists() {
+    return path;
+  }
+  // Build on-demand if the binary isn't present yet.
+  build_assembler();
+  assert!(path.exists(), "assembler not found at {}", path.display());
+  path
+}
 
 #[cfg(test)]
 fn run_test(asm_file : &'static str, expected : u32){
@@ -19,7 +53,8 @@ fn run_test(asm_file : &'static str, expected : u32){
   };
 
   // assemble test case
-  let status = Command::new("../../Dioptase-Assembler/build/assembler")
+  let assembler = assembler_path();
+  let status = Command::new(&assembler)
     .args([asm_file, "-o", hex_file.to_str().unwrap()])
     .status()
     .expect("failed to run assembler");
@@ -33,9 +68,36 @@ fn run_test(asm_file : &'static str, expected : u32){
   assert_eq!(result, Some(expected));
 }
 
+#[cfg(test)]
+fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
+  let hex_file = {
+    let asm_path = Path::new(asm_file);
+    let stem = asm_path.file_stem().unwrap();
+    PathBuf::from("tests/hex").join(format!("{}.hex", stem.to_string_lossy()))
+  };
+
+  let assembler = assembler_path();
+  let status = Command::new(&assembler)
+    .args([asm_file, "-o", hex_file.to_str().unwrap()])
+    .status()
+    .expect("failed to run assembler");
+  assert!(status.success(), "assembler failed");
+
+  let result = Emulator::run_multicore(
+    hex_file.to_string_lossy().to_string(),
+    cores,
+    ScheduleMode::RoundRobin,
+    200000,
+    false,
+    false,
+  );
+  assert_eq!(result, Some(expected));
+}
+
 // I/O tests that must be run manually (10):
 // cdiv.s (run with --vga)
 // colors.s (--vga)
+// multicore_colors.s (--vga --cores 4)
 // green.s (--vga)
 // ps2.s (--vga)
 // sleep.s (--vga)
@@ -158,6 +220,21 @@ fn mem_wr() {
 #[test]
 fn mem_da() {
   run_test("tests/asm/mem_da.s", 0x4242);
+}
+
+#[test]
+fn multicore_ipi_wakeup() {
+  run_multicore_test("tests/asm/multicore_ipi.s", 0x42, 2);
+}
+
+#[test]
+fn multicore_non_atomic_race() {
+  run_multicore_test("tests/asm/multicore_race.s", 1, 2);
+}
+
+#[test]
+fn multicore_atomic_add() {
+  run_multicore_test("tests/asm/multicore_atomic.s", 2, 2);
 }
 
 #[test]

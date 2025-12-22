@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 use std::u16;
 use std::io::{self, Write};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
 
@@ -59,7 +59,7 @@ const SPRITE_MAP_START : u32 = 0x7FF0000;
 const SPRITE_MAP_SIZE : u32 = 0x8000;
 
 pub struct Memory {
-  ram: HashMap<u32, u8>,   
+  ram: Mutex<HashMap<u32, u8>>,
   frame_buffer: Arc<RwLock<FrameBuffer>>,
   tile_map: Arc<RwLock<TileMap>>, 
   io_buffer: Arc<RwLock<VecDeque<u16>>>,
@@ -307,7 +307,7 @@ impl Memory {
     pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool) -> Memory {
 
         Memory {
-            ram,
+            ram: Mutex::new(ram),
             frame_buffer: Arc::new(RwLock::new(FrameBuffer::new(FRAME_WIDTH, FRAME_HEIGHT))),
             tile_map: Arc::new(RwLock::new(TileMap::new(TILE_MAP_SIZE))),
             io_buffer: Arc::new(RwLock::new(VecDeque::new())),
@@ -338,7 +338,60 @@ impl Memory {
     pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> { return Arc::clone(&self.vga_frame_register) }
     pub fn get_pending_interrupt(&self) -> Arc<RwLock<u32>> { return Arc::clone(&self.pending_interrupt) }
 
-    pub fn read(&mut self, addr: u32) -> u8 {
+    pub fn read(&self, addr: u32) -> u8 {
+        let mut ram = self.ram.lock().unwrap();
+        self.read_internal(addr, &mut ram)
+    }
+
+    pub fn read_u16(&self, addr: u32) -> u16 {
+        let addr = addr & 0xFFFFFFFE;
+        let mut ram = self.ram.lock().unwrap();
+        let lo = self.read_internal(addr, &mut ram);
+        let hi = self.read_internal(addr + 1, &mut ram);
+        (u16::from(hi) << 8) | u16::from(lo)
+    }
+
+    pub fn read_u32(&self, addr: u32) -> u32 {
+        let addr = addr & 0xFFFFFFFC;
+        let mut ram = self.ram.lock().unwrap();
+        self.read_u32_internal(addr, &mut ram)
+    }
+
+    // Read specific physical addresses under one lock to avoid tearing.
+    pub fn read_phys_bytes(&self, addrs: &[u32], out: &mut [u8]) {
+        assert_eq!(addrs.len(), out.len());
+        let mut ram = self.ram.lock().unwrap();
+        for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
+            *slot = self.read_internal(*addr, &mut ram);
+        }
+    }
+
+    pub fn atomic_swap_u32(&self, addr: u32, value: u32) -> u32 {
+        let addr = addr & 0xFFFFFFFC;
+        let mut ram = self.ram.lock().unwrap();
+        let prev = self.read_u32_internal(addr, &mut ram);
+        self.write_u32_internal(addr, value, &mut ram);
+        prev
+    }
+
+    pub fn atomic_add_u32(&self, addr: u32, value: u32) -> u32 {
+        let addr = addr & 0xFFFFFFFC;
+        let mut ram = self.ram.lock().unwrap();
+        let prev = self.read_u32_internal(addr, &mut ram);
+        let next = u32::wrapping_add(prev, value);
+        self.write_u32_internal(addr, next, &mut ram);
+        prev
+    }
+
+    fn read_u32_internal(&self, addr: u32, ram: &mut HashMap<u32, u8>) -> u32 {
+        let b0 = self.read_internal(addr, ram) as u32;
+        let b1 = self.read_internal(addr + 1, ram) as u32;
+        let b2 = self.read_internal(addr + 2, ram) as u32;
+        let b3 = self.read_internal(addr + 3, ram) as u32;
+        (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+    }
+
+    fn read_internal(&self, addr: u32, ram: &mut HashMap<u32, u8>) -> u8 {
         assert!(addr <= PHYSMEM_MAX, "Physical memory address out of bounds: 0x{:08X}", addr);
 
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
@@ -442,14 +495,44 @@ impl Memory {
             println!("Warning: reading from physical address 0x00000000");
         }
 
-        if self.ram.contains_key(&addr) {
-            return self.ram[&addr];
-        } else {
-            return 0;
+        ram.get(&addr).copied().unwrap_or(0)
+    }
+
+    pub fn write(&self, addr: u32, data: u8) {
+        let mut ram = self.ram.lock().unwrap();
+        self.write_internal(addr, data, &mut ram);
+    }
+
+    pub fn write_u16(&self, addr: u32, data: u16) {
+        let addr = addr & 0xFFFFFFFE;
+        let mut ram = self.ram.lock().unwrap();
+        self.write_internal(addr, data as u8, &mut ram);
+        self.write_internal(addr + 1, (data >> 8) as u8, &mut ram);
+    }
+
+    pub fn write_u32(&self, addr: u32, data: u32) {
+        let addr = addr & 0xFFFFFFFC;
+        let mut ram = self.ram.lock().unwrap();
+        self.write_u32_internal(addr, data, &mut ram);
+    }
+
+    // Write specific physical addresses under one lock to avoid tearing.
+    pub fn write_phys_bytes(&self, addrs: &[u32], data: &[u8]) {
+        assert_eq!(addrs.len(), data.len());
+        let mut ram = self.ram.lock().unwrap();
+        for (addr, byte) in addrs.iter().zip(data.iter()) {
+            self.write_internal(*addr, *byte, &mut ram);
         }
     }
 
-    pub fn write(&mut self, addr: u32, data: u8) {
+    fn write_u32_internal(&self, addr: u32, data: u32, ram: &mut HashMap<u32, u8>) {
+        self.write_internal(addr, data as u8, ram);
+        self.write_internal(addr + 1, (data >> 8) as u8, ram);
+        self.write_internal(addr + 2, (data >> 16) as u8, ram);
+        self.write_internal(addr + 3, (data >> 24) as u8, ram);
+    }
+
+    fn write_internal(&self, addr: u32, data: u8, ram: &mut HashMap<u32, u8>) {
         assert!(addr <= PHYSMEM_MAX, "Physical memory address out of bounds: 0x{:08X}", addr);
         
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
@@ -474,12 +557,12 @@ impl Memory {
 
             for i in 0..SD_CMD_BUF_LEN {
                 let value = if i < response_len { response[i] } else { 0 };
-                self.ram.insert(SD_CMD_BUF + i as u32, value);
+                ram.insert(SD_CMD_BUF + i as u32, value);
             }
 
             if let Some(buffer) = updated_buffer {
                 for (i, value) in buffer.iter().enumerate() {
-                    self.ram.insert(SD_BUF_START + i as u32, *value);
+                    ram.insert(SD_BUF_START + i as u32, *value);
                 }
             }
 
@@ -494,7 +577,7 @@ impl Memory {
                 let mut sd = self.sd_card.write().unwrap();
                 sd.write_command_byte(offset, data);
             }
-            self.ram.insert(addr, data);
+            ram.insert(addr, data);
             return;
         }
         else if addr >= SD_BUF_START && addr < SD_BUF_START + SD_BLOCK_SIZE as u32 {
@@ -503,7 +586,7 @@ impl Memory {
                 let mut sd = self.sd_card.write().unwrap();
                 sd.write_data_byte(offset, data);
             }
-            self.ram.insert(addr, data);
+            ram.insert(addr, data);
             return;
         }
         else if addr == PS2_STREAM {
@@ -574,7 +657,7 @@ impl Memory {
             println!("Warning: writing to physical address 0x00000000: 0x{:08X}", data);
         }
 
-        self.ram.insert(addr, data);
+        ram.insert(addr, data);
     }
 
     pub fn clock() {

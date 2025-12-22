@@ -2,22 +2,24 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn find_emulator_bin() -> PathBuf {
+// Search for the emulator binary in Cargo's env vars and target dirs.
+fn locate_emulator_bin() -> (Option<PathBuf>, Vec<PathBuf>) {
   let name = "Dioptase-Emulator-Full";
   let direct = format!("CARGO_BIN_EXE_{}", name);
   if let Ok(val) = std::env::var(&direct) {
     let path = PathBuf::from(val);
     if path.exists() {
-      return path;
+      return (Some(path), Vec::new());
     }
   }
   let underscored = format!("CARGO_BIN_EXE_{}", name.replace('-', "_"));
   if let Ok(val) = std::env::var(&underscored) {
     let path = PathBuf::from(val);
     if path.exists() {
-      return path;
+      return (Some(path), Vec::new());
     }
   }
 
@@ -45,11 +47,42 @@ fn find_emulator_bin() -> PathBuf {
       for suffix in ["", ".exe"] {
         let candidate = dir.join("debug").join(format!("{}{}", name, suffix));
         if candidate.exists() {
-          return candidate;
+          return (Some(candidate), tried);
         }
         tried.push(candidate);
       }
     }
+  }
+
+  (None, tried)
+}
+
+// Build the emulator binary once if it isn't found.
+fn build_emulator_bin() {
+  static BUILD: Once = Once::new();
+  BUILD.call_once(|| {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+      .expect("CARGO_MANIFEST_DIR not set");
+    let status = Command::new("cargo")
+      .args(["build", "--bin", "Dioptase-Emulator-Full"])
+      .current_dir(manifest_dir)
+      .status()
+      .expect("failed to run cargo build");
+    assert!(status.success(), "failed to build emulator binary");
+  });
+}
+
+fn find_emulator_bin() -> PathBuf {
+  let (found, _) = locate_emulator_bin();
+  if let Some(path) = found {
+    return path;
+  }
+
+  // If the test runs without a built binary, compile it on demand.
+  build_emulator_bin();
+  let (found, tried) = locate_emulator_bin();
+  if let Some(path) = found {
+    return path;
   }
 
   let tried_list = tried
@@ -58,8 +91,8 @@ fn find_emulator_bin() -> PathBuf {
     .collect::<Vec<_>>()
     .join("\n");
   panic!(
-    "Missing emulator binary env var for {}\nTried:\n{}",
-    name, tried_list
+    "Missing emulator binary env var for Dioptase-Emulator-Full\nTried:\n{}",
+    tried_list
   );
 }
 

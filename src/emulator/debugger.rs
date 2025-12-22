@@ -273,28 +273,28 @@ impl Emulator {
     }
     println!(
       "PSR: {:08X} PID: {:08X} ISR: {:08X} IMR: {:08X} EPC: {:08X}",
-      self.cregfile[0], self.cregfile[1], self.cregfile[2], self.cregfile[3], self.cregfile[4]
+      self.read_creg(0), self.read_creg(1), self.read_creg(2), self.read_creg(3), self.read_creg(4)
     );
     println!(
       "FLG: {:08X} CDV: {:08X} TLB: {:08X} KSP: {:08X}",
-      self.cregfile[5], self.cregfile[6], self.cregfile[7], self.cregfile[8]
+      self.read_creg(5), self.read_creg(6), self.read_creg(7), self.read_creg(8)
     );
   }
 
   fn print_cregs(&self) {
     println!("kmode: {}", self.kmode);
-    println!("cr0 (psr): {:08X}", self.cregfile[0]);
-    println!("cr1 (pid): {:08X}", self.cregfile[1]);
-    println!("cr2 (isr): {:08X}", self.cregfile[2]);
-    println!("cr3 (imr): {:08X}", self.cregfile[3]);
-    println!("cr4 (epc): {:08X}", self.cregfile[4]);
-    println!("cr5 (flg): {:08X}", self.cregfile[5]);
-    println!("cr6 (cdv): {:08X}", self.cregfile[6]);
-    println!("cr7 (tlb): {:08X}", self.cregfile[7]);
-    println!("cr8 (ksp): {:08X}", self.cregfile[8]);
-    println!("cr9 (cid): {:08X}", self.cregfile[9]);
-    println!("cr10 (mbi): {:08X}", self.cregfile[10]);
-    println!("cr11 (mbo): {:08X}", self.cregfile[11]);
+    println!("cr0 (psr): {:08X}", self.read_creg(0));
+    println!("cr1 (pid): {:08X}", self.read_creg(1));
+    println!("cr2 (isr): {:08X}", self.read_creg(2));
+    println!("cr3 (imr): {:08X}", self.read_creg(3));
+    println!("cr4 (epc): {:08X}", self.read_creg(4));
+    println!("cr5 (flg): {:08X}", self.read_creg(5));
+    println!("cr6 (cdv): {:08X}", self.read_creg(6));
+    println!("cr7 (tlb): {:08X}", self.read_creg(7));
+    println!("cr8 (ksp): {:08X}", self.read_creg(8));
+    println!("cr9 (cid): {:08X}", self.read_creg(9));
+    println!("cr10 (mbi): {:08X}", self.read_creg(10));
+    println!("cr11 (mbo): {:08X}", self.read_creg(11));
   }
 
   fn print_single_reg(&self, token: &str) -> bool {
@@ -317,51 +317,51 @@ impl Emulator {
         return true;
       }
       "ksp" => {
-        println!("ksp (cr8) = {:08X}", self.cregfile[8]);
+        println!("ksp (cr8) = {:08X}", self.read_creg(8));
         return true;
       }
       "psr" => {
-        println!("psr (cr0) = {:08X}", self.cregfile[0]);
+        println!("psr (cr0) = {:08X}", self.read_creg(0));
         return true;
       }
       "pid" => {
-        println!("pid (cr1) = {:08X}", self.cregfile[1]);
+        println!("pid (cr1) = {:08X}", self.read_creg(1));
         return true;
       }
       "isr" => {
-        println!("isr (cr2) = {:08X}", self.cregfile[2]);
+        println!("isr (cr2) = {:08X}", self.read_creg(2));
         return true;
       }
       "imr" => {
-        println!("imr (cr3) = {:08X}", self.cregfile[3]);
+        println!("imr (cr3) = {:08X}", self.read_creg(3));
         return true;
       }
       "epc" => {
-        println!("epc (cr4) = {:08X}", self.cregfile[4]);
+        println!("epc (cr4) = {:08X}", self.read_creg(4));
         return true;
       }
       "flg" => {
-        println!("flg (cr5) = {:08X}", self.cregfile[5]);
+        println!("flg (cr5) = {:08X}", self.read_creg(5));
         return true;
       }
       "cdv" => {
-        println!("cdv (cr6) = {:08X}", self.cregfile[6]);
+        println!("cdv (cr6) = {:08X}", self.read_creg(6));
         return true;
       }
       "tlb" => {
-        println!("tlb (cr7) = {:08X}", self.cregfile[7]);
+        println!("tlb (cr7) = {:08X}", self.read_creg(7));
         return true;
       }
       "cid" => {
-        println!("cid (cr9) = {:08X}", self.cregfile[9]);
+        println!("cid (cr9) = {:08X}", self.read_creg(9));
         return true;
       }
       "mbi" => {
-        println!("mbi (cr10) = {:08X}", self.cregfile[10]);
+        println!("mbi (cr10) = {:08X}", self.read_creg(10));
         return true;
       }
       "mbo" => {
-        println!("mbo (cr11) = {:08X}", self.cregfile[11]);
+        println!("mbo (cr11) = {:08X}", self.read_creg(11));
         return true;
       }
       _ => {}
@@ -379,7 +379,7 @@ impl Emulator {
     if let Some(num) = token.strip_prefix("cr") {
       if let Ok(idx) = num.parse::<usize>() {
         if idx < self.cregfile.len() {
-          println!("cr{} = {:08X}", idx, self.cregfile[idx]);
+          println!("cr{} = {:08X}", idx, self.read_creg(idx));
           return true;
         }
       }
@@ -408,51 +408,51 @@ impl Emulator {
         return true;
       }
       "psr" => {
-        self.cregfile[0] = value;
+        self.write_creg(0, value);
         return true;
       }
       "pid" => {
-        self.cregfile[1] = value;
+        self.write_creg(1, value);
         return true;
       }
       "isr" => {
-        self.cregfile[2] = value;
+        self.write_creg(2, value);
         return true;
       }
       "imr" => {
-        self.cregfile[3] = value;
+        self.write_creg(3, value);
         return true;
       }
       "epc" => {
-        self.cregfile[4] = value;
+        self.write_creg(4, value);
         return true;
       }
       "flg" => {
-        self.cregfile[5] = value;
+        self.write_creg(5, value);
         return true;
       }
       "cdv" => {
-        self.cregfile[6] = value;
+        self.write_creg(6, value);
         return true;
       }
       "tlb" => {
-        self.cregfile[7] = value;
+        self.write_creg(7, value);
         return true;
       }
       "ksp" => {
-        self.cregfile[8] = value;
+        self.write_creg(8, value);
         return true;
       }
       "cid" => {
-        self.cregfile[9] = value;
+        self.write_creg(9, value);
         return true;
       }
       "mbi" => {
-        self.cregfile[10] = value;
+        self.write_creg(10, value);
         return true;
       }
       "mbo" => {
-        self.cregfile[11] = value;
+        self.write_creg(11, value);
         return true;
       }
       _ => {}
@@ -470,7 +470,7 @@ impl Emulator {
     if let Some(num) = token.strip_prefix("cr") {
       if let Ok(idx) = num.parse::<usize>() {
         if idx < self.cregfile.len() {
-          self.cregfile[idx] = value;
+          self.write_creg(idx, value);
           return true;
         }
       }

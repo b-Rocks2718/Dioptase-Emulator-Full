@@ -653,19 +653,38 @@ impl Emulator {
       0 => self.alu_op(instr, false),
       1 => self.alu_op(instr, true),
       2 => self.load_upper_immediate(instr),
+      
+      // 32 bit mem instructions
       3 => self.mem_absolute(instr, 2),
       4 => self.mem_relative(instr, 2),
       5 => self.mem_imm(instr, 2),
+      
+      // 16 bit mem instructions
       6 => self.mem_absolute(instr, 1),
       7 => self.mem_relative(instr, 1),
       8 => self.mem_imm(instr, 1),
+      
+      // 8 bit mem instructions
       9 => self.mem_absolute(instr, 0),
       10 => self.mem_relative(instr, 0),
       11 => self.mem_imm(instr, 0),
+
       12 => self.branch_imm(instr),
       13 => self.branch_absolute(instr),
       14 => self.branch_relative(instr),
+
       15 => self.syscall(instr),
+
+      // fadd
+      16 => self.atomic_absolute(instr, 0),
+      17 => self.atomic_relative(instr, 0),
+      18 => self.atomic_imm(instr, 0),
+
+      // swap
+      19 => self.atomic_absolute(instr, 1),
+      20 => self.atomic_relative(instr, 1),
+      21 => self.atomic_imm(instr, 1),
+
       31 => self.kernel_instr(instr),
       _ => self.raise_exc_instr(),
     }
@@ -1134,6 +1153,137 @@ impl Emulator {
         return;
       }
     }
+
+    self.pc += 4;
+  }
+
+  fn atomic_absolute(&mut self, instr : u32, type_ : u8){
+    // instruction format is
+    // 10000aaaaabbbbbccccciiiiiiiiiiii - fadd
+    // opcode is 10011 for swap
+    // op (5 bits) | r_a (5 bits) | r_c (5 bits) | r_b (5 bits) | imm (12 bits)
+
+    let r_a = (instr >> 22) & 0x1F;
+    let r_c = (instr >> 17) & 0x1F;
+    let r_b = (instr >> 12) & 0x1F;
+    let imm = instr & 0xFFF;
+
+    // sign extend imm
+    let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
+
+    // get addr
+    let r_b_out = self.get_reg(r_b);
+    let r_c_out = self.get_reg(r_c);
+    let addr = u32::wrapping_add(r_b_out, imm);
+
+    let data = self.mem_read32(addr);
+    if let Some(data) = data {
+      self.write_reg(r_a, data);
+      match type_ {
+        0 => {
+          // fadd
+          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
+        }
+        1 => {
+          // swap
+          self.mem_write32(addr, r_c_out);
+        }
+        _ => panic!("invalid atomic type"),
+      };
+    } else{
+      // TLB Miss
+      self.raise_tlb_miss(addr);
+      return;
+    };
+
+    self.pc += 4;
+  }
+
+  fn atomic_relative(&mut self, instr : u32, type_ : u8){
+    // instruction format is
+    // 10001aaaaabbbbbccccciiiiiiiiiiii
+    // or opcode is 10100
+    // op (5 bits) | r_a (5 bits) | r_c (5 bits) | r_b (5 bits) | imm (12 bits)
+
+    let r_a = (instr >> 22) & 0x1F;
+    let r_c = (instr >> 17) & 0x1F;
+    let r_b = (instr >> 12) & 0x1F;
+    let imm = instr & 0xFFF;
+
+    // sign extend imm
+    let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
+
+    // get addr
+    let r_b_out = self.get_reg(r_b);
+    let r_c_out = self.get_reg(r_c);
+    let addr = u32::wrapping_add(r_b_out, imm);
+
+    // make addr pc-relative
+    let addr = u32::wrapping_add(addr, self.pc);
+    let addr = u32::wrapping_add(addr, 4);
+
+    let data = self.mem_read32(addr);
+    if let Some(data) = data {
+      self.write_reg(r_a, data);
+      match type_ {
+        0 => {
+          // fadd
+          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
+        }
+        1 => {
+          // swap
+          self.mem_write32(addr, r_c_out);
+        }
+        _ => panic!("invalid atomic type"),
+      };
+    } else{
+      // TLB Miss
+      self.raise_tlb_miss(addr);
+      return;
+    };
+
+    self.pc += 4;
+  }
+
+  fn atomic_imm(&mut self, instr : u32, type_ : u8){
+    // instruction format is
+    // 10010aaaaabbbbbiiiiiiiiiiiiiiiii
+    // or opcode is 10101
+    // op (5 bits) | r_a (5 bits) | r_b (5 bits) | imm (17 bits)
+
+    let r_a = (instr >> 22) & 0x1F;
+    let r_c = (instr >> 17) & 0x1F;
+    let imm = instr & 0x1FFFF;
+
+    // sign extend imm
+    let imm = imm | (0xFFFE0000 * ((imm >> 16) & 1));
+
+    // get addr
+    let r_c_out = self.get_reg(r_c);
+
+    // make addr pc-relative
+    let addr = u32::wrapping_add(imm, self.pc);
+    let addr = u32::wrapping_add(addr, 4);
+
+    let data = self.mem_read32(addr);
+    if let Some(data) = data {
+      self.write_reg(r_a, data);
+      match type_ {
+        0 => {
+          // fadd
+          self.mem_write32(addr, u32::wrapping_add(r_c_out, data));
+        }
+        1 => {
+          // swap
+          self.mem_write32(addr, r_c_out);
+        }
+        _ => panic!("invalid atomic type"),
+      };
+    } else{
+      // TLB Miss
+      self.raise_tlb_miss(addr);
+      return;
+    };
 
     self.pc += 4;
   }

@@ -371,3 +371,12 @@ fn tlb_flags_g() {
   run_test("tests/asm/tlb_flags_g.s", 67);
 }
 
+#[test]
+fn atomic_fadd() {
+  run_test("tests/asm/atomic_fadd.s", 0x6D);
+}
+
+#[test]
+fn atomic_swap() {
+  run_test("tests/asm/atomic_swap.s", 0x164);
+}

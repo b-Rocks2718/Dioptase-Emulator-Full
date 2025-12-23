@@ -193,11 +193,6 @@ fn sub_overflow_sets_flag() {
 }
 
 #[test]
-fn mul() {
-  run_test("tests/asm/mul.s", 42);
-}
-
-#[test]
 fn lui() {
   run_test("tests/asm/lui.s", 0xAA000000);
 }

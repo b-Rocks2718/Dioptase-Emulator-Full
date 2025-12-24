@@ -18,6 +18,7 @@ fn main() {
   let mut trace_interrupts = false;
   let mut cores: usize = 1;
   let mut sched = ScheduleMode::Free;
+  let mut max_cycles: u32 = 0;
   let mut path: Option<String> = None;
 
   let mut iter = args.iter().skip(1).peekable();
@@ -47,6 +48,16 @@ fn main() {
           process::exit(1);
         });
       }
+      "--max-cycles" => {
+        let value = iter.next().unwrap_or_else(|| {
+          println!("Missing value for --max-cycles");
+          process::exit(1);
+        });
+        max_cycles = value.parse::<u32>().unwrap_or_else(|_| {
+          println!("Invalid max cycle count: {}", value);
+          process::exit(1);
+        });
+      }
       _ if arg.starts_with("--cores=") => {
         let value = &arg["--cores=".len()..];
         cores = value.parse::<usize>().unwrap_or_else(|_| {
@@ -61,6 +72,13 @@ fn main() {
           process::exit(1);
         });
       }
+      _ if arg.starts_with("--max-cycles=") => {
+        let value = &arg["--max-cycles=".len()..];
+        max_cycles = value.parse::<u32>().unwrap_or_else(|_| {
+          println!("Invalid max cycle count: {}", value);
+          process::exit(1);
+        });
+      }
       _ if arg.starts_with('-') => {
         println!("Unknown flag: {}", arg);
         process::exit(1);
@@ -69,7 +87,7 @@ fn main() {
         if path.is_none() {
           path = Some(arg.clone());
         } else {
-          println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random]");
+          println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
           process::exit(1);
         }
       }
@@ -89,6 +107,9 @@ fn main() {
       if sched != ScheduleMode::Free {
         println!("Warning: --sched is ignored in debug mode");
       }
+      if max_cycles != 0 {
+        println!("Warning: --max-cycles is ignored in debug mode");
+      }
       Emulator::debug(path, use_uart_rx);
     } else {
       if cores == 0 || cores > 4 {
@@ -97,16 +118,16 @@ fn main() {
       }
       if cores == 1 {
         let cpu = Emulator::new(path, use_uart_rx);
-        let result = cpu.run(0, with_graphics).expect("did not terminate"); // programs should return a value in r1
+        let result = cpu.run(max_cycles, with_graphics).expect("did not terminate"); // programs should return a value in r1
         println!("{:08x}", result);
       } else {
-        let result = Emulator::run_multicore(path, cores, sched, 0, with_graphics, use_uart_rx)
+        let result = Emulator::run_multicore(path, cores, sched, max_cycles, with_graphics, use_uart_rx)
           .expect("did not terminate");
         println!("{:08x}", result);
       }
     }
   } else {
-    println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random]");
+    println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
     process::exit(1);
   }
 }

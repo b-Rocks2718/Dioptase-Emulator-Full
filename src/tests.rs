@@ -32,7 +32,7 @@ fn build_assembler() {
 #[cfg(test)]
 fn assembler_path() -> PathBuf {
   let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-  let path = manifest.join("../../Dioptase-Assembler/build/assembler");
+  let path = manifest.join("../../Dioptase-Assembler/build/basm");
   if path.exists() {
     return path;
   }

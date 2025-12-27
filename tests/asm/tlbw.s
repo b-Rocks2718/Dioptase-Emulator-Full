@@ -1,4 +1,4 @@
-  .kernel
+  .global _start
 _start:
   # set pid to 1
   movi r4, 1

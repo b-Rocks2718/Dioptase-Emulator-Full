@@ -1,5 +1,5 @@
-  .kernel
 
+  .global _start
 EXC_INSTR:
   mov r1, epc
   add r1, r1, 4 # skip the bad instruction and then return

@@ -1,8 +1,7 @@
-  .kernel
-
 EXIT:
   mode halt
 
+  .global _start
 _start:
   movi r4 0xFFFFFFFF
   movi r5 0xAAAAAAAA # 64 bit integer 0xAAAAFFFF stored in r4 + r5

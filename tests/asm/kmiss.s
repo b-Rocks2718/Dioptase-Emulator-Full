@@ -1,4 +1,4 @@
-  .kernel
+  .global _start
 _start:
 
   movi r7, 0xFFFFFFF0

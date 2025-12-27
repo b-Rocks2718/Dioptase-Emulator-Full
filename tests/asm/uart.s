@@ -1,5 +1,5 @@
-  .kernel
 
+  .global _start
 .define H 104
 .define E 101
 .define L 108

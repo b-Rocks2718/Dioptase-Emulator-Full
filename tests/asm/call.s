@@ -1,8 +1,7 @@
-  .kernel
-
 EXIT:
   mode halt
 
+  .global _start
 _start:
   call far_label
   sys  EXIT # should return 42

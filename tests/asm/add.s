@@ -1,8 +1,7 @@
-  .kernel
-
 EXIT:
   mode halt
 
+  .global _start
 _start:
   add  r5 r0 10
   add  r7 r0 11

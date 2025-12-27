@@ -1,5 +1,5 @@
-  .kernel
 
+  .global _start
 EXIT:
   mode halt
 

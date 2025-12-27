@@ -1,8 +1,8 @@
-  .kernel
 
   # a colorful square that the user can move around using the keyboard
   # uses interrupts to accomplish this
 
+  .global _start
   .define TILEMAP_ADDR 0x7FE8000
   .define FRAMEBUFFER_ADDR 0x7FC0000
   .define SCALE_REG_ADDR 0x7FE5B44

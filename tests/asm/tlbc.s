@@ -1,4 +1,4 @@
-  .kernel
+  .global _start
 _start:
   # set up tlb
 

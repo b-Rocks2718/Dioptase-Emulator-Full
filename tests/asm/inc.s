@@ -1,8 +1,7 @@
-  .kernel
-
 EXIT:
   mode halt
 
+  .global _start
 _start:
   mov  r1 r0
   ld   r3 [r1, DATA]

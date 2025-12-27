@@ -1,8 +1,7 @@
-  .kernel
-
 EXIT:
   mode halt
 
+  .global _start
 _start:
   movi r1 0x7FFFFFFF
   movi r2 3

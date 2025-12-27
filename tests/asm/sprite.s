@@ -1,9 +1,9 @@
-  .kernel
 
   # a colorful square that the user can move around using the keyboard
   # uses a sprite instead of the framebuffer
   # uses interrupts to accomplish this
 
+  .global _start
   .define SPRITEMAP_0_ADDR 0x7FF0000
   .define SPRITE_0_X_ADDR 0x7FE5B00
   .define SPRITE_0_Y_ADDR 0x7FE5B02

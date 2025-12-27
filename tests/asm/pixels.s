@@ -1,7 +1,7 @@
-  .kernel
 
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
+  .global _start
   .define PHY_FRAMEBUFFER_ADDR 0x7FC0000
 
   .define VMEM_FLAGS 0x00F

@@ -55,7 +55,7 @@ fn run_test(asm_file : &'static str, expected : u32){
   // assemble test case
   let assembler = assembler_path();
   let status = Command::new(&assembler)
-    .args([asm_file, "-o", hex_file.to_str().unwrap()])
+    .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel"])
     .status()
     .expect("failed to run assembler");
   assert!(status.success(), "assembler failed");
@@ -78,7 +78,7 @@ fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
 
   let assembler = assembler_path();
   let status = Command::new(&assembler)
-    .args([asm_file, "-o", hex_file.to_str().unwrap()])
+    .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel"])
     .status()
     .expect("failed to run assembler");
   assert!(status.success(), "assembler failed");

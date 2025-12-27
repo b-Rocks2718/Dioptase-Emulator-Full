@@ -1,5 +1,3 @@
-  .kernel
-
   # a colorful square that the user can move around using the keyboard
   # uses interrupts to accomplish this
 
@@ -167,6 +165,7 @@ SQUARE_INDEX:
 COLOR: 
   .fill 0xFF00FF00
 
+  .global _start
 _start:
   # initialize stack
   movi r1, 0x1000

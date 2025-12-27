@@ -1,5 +1,3 @@
-  .kernel
-
   # changes the color of the tilemap based on timer interrupts
   # changes the speed of the color change based on keyboard input
   # X to speed up, Z to slow down, Q to quit
@@ -81,6 +79,7 @@ INT_TIMER:
 COLOR: 
   .fill 0xFF00FF00
 
+  .global _start
 _start:
   # initialize stack
   movi r1, 0x1000

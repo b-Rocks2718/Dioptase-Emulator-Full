@@ -1,5 +1,5 @@
-  .kernel
 
+  .global _start
   .define PS2_ADDR 0x7FE5800
   .define UART_TX_ADDR 0x7FE5802
 

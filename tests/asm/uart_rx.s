@@ -1,5 +1,5 @@
-  .kernel
 
+  .global _start
   .define UART_RX_ADDR 0x7FE5803
   .define UART_TX_ADDR 0x7FE5802
 

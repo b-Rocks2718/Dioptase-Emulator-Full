@@ -1,5 +1,3 @@
-  .kernel
-
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
 
@@ -28,6 +26,7 @@ INT_KEYBOARD:
 INT_TIMER:
   mode halt
 
+  .global _start
 _start:
   movi r4, USER_PID
   mov  pid, r4 # set pid to 1

@@ -1,4 +1,4 @@
-  .kernel
+  .global _start
 _start:
   movi r1, 1
   movi r2, 2

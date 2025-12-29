@@ -1,9 +1,12 @@
 
 #[cfg(test)]
-use std::process::Command;
+use std::fs;
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::process::Command;
 
 #[cfg(test)]
 use std::sync::Once;
@@ -43,7 +46,14 @@ fn assembler_path() -> PathBuf {
 }
 
 #[cfg(test)]
+fn ensure_hex_dir() {
+  let hex_dir = Path::new("tests/hex");
+  fs::create_dir_all(hex_dir).expect("failed to create tests/hex dir");
+}
+
+#[cfg(test)]
 fn run_test(asm_file : &'static str, expected : u32){
+  ensure_hex_dir();
 
   // Build hex file path by replacing asm path prefix/suffix
   let hex_file = {
@@ -70,6 +80,8 @@ fn run_test(asm_file : &'static str, expected : u32){
 
 #[cfg(test)]
 fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
+  ensure_hex_dir();
+
   let hex_file = {
     let asm_path = Path::new(asm_file);
     let stem = asm_path.file_stem().unwrap();

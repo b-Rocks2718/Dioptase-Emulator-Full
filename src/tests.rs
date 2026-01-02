@@ -18,6 +18,16 @@ use super::*;
 use crate::emulator::ScheduleMode;
 
 #[cfg(test)]
+fn assembler_profile() -> &'static str {
+  // Match the assembler build to the test binary profile.
+  if cfg!(debug_assertions) {
+    "debug"
+  } else {
+    "release"
+  }
+}
+
+#[cfg(test)]
 fn build_assembler() {
   static BUILD: Once = Once::new();
   BUILD.call_once(|| {
@@ -25,6 +35,7 @@ fn build_assembler() {
     let asm_dir = manifest.join("../../Dioptase-Assembler");
     // Build the assembler once so tests can run in clean environments.
     let status = Command::new("make")
+      .arg(assembler_profile())
       .current_dir(asm_dir)
       .status()
       .expect("failed to run make for assembler");
@@ -35,7 +46,11 @@ fn build_assembler() {
 #[cfg(test)]
 fn assembler_path() -> PathBuf {
   let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-  let path = manifest.join("../../Dioptase-Assembler/build/basm");
+  let path = manifest
+    .join("../../Dioptase-Assembler")
+    .join("build")
+    .join(assembler_profile())
+    .join("basm");
   if path.exists() {
     return path;
   }

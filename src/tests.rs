@@ -220,6 +220,26 @@ fn sub_overflow_sets_flag() {
 }
 
 #[test]
+fn sxtb() {
+  run_test("tests/asm/sxtb.s", 0x000000FF);
+}
+
+#[test]
+fn sxtd() {
+  run_test("tests/asm/sxtd.s", 0x0000FFFF);
+}
+
+#[test]
+fn tncb() {
+  run_test("tests/asm/tncb.s", 0x00000081);
+}
+
+#[test]
+fn tncd() {
+  run_test("tests/asm/tncd.s", 0x00008001);
+}
+
+#[test]
 fn lui() {
   run_test("tests/asm/lui.s", 0xAA000000);
 }

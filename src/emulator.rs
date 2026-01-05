@@ -1646,14 +1646,31 @@ impl Emulator {
         result as u32
       },
       18 => {
-        // mul
-        let result = u64::from(r_b) * u64::from(r_c);
-
-        // set the carry flag
-        self.cregfile[5] |= (result >> 32 != 0) as u32;
-
-        result as u32
-      },
+        // sxtb (sign extend byte)
+        let byte = r_c & 0xFF;
+        if (byte & 0x80) != 0 {
+          byte | 0xFFFFFF00
+        } else {
+          byte
+        }
+      }
+      19 => {
+        // sxtd (sign extend double)
+        let half = r_c & 0xFFFF;
+        if (half & 0x8000) != 0 {
+          half | 0xFFFF0000
+        } else {
+          half
+        }
+      }
+      20 => {
+        // tncb (truncate to byte)
+        r_c & 0xFF
+      }
+      21 => {
+        // tncd (truncate to double)
+        r_c & 0xFFFF
+      }
       _ => {
         self.raise_exc_instr();
         return;

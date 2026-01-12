@@ -194,7 +194,7 @@ fn disassemble_mem(opcode: u32, instr: u32) -> String {
 
 fn disassemble_branch_imm(instr: u32) -> String {
     let op = (instr >> 22) & 0x1F;
-    let imm = sign_extend(instr & 0x3FFFFF, 22);
+    let imm = sign_extend((instr & 0x3FFFFF) << 2, 22);
     let Some(name) = branch_name(op) else {
         return format!("data {}", fmt_imm_hex(instr));
     };

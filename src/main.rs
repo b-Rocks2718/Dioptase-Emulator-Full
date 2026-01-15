@@ -15,6 +15,7 @@ fn main() {
   let mut with_graphics = false;
   let mut use_uart_rx = false;
   let mut debug = false;
+  let mut debugc = false;
   let mut trace_interrupts = false;
   let mut cores: usize = 1;
   let mut sched = ScheduleMode::Free;
@@ -27,6 +28,7 @@ fn main() {
       "--vga" => with_graphics = true,
       "--uart" => use_uart_rx = true,
       "--debug" => debug = true,
+      "--debugc" => debugc = true,
       "--trace-ints" | "--trace-interrupts" => trace_interrupts = true,
       "--cores" => {
         let value = iter.next().unwrap_or_else(|| {
@@ -87,7 +89,7 @@ fn main() {
         if path.is_none() {
           path = Some(arg.clone());
         } else {
-          println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
+          println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
           process::exit(1);
         }
       }
@@ -96,8 +98,26 @@ fn main() {
 
   if let Some(path) = path {
     set_trace_interrupts(trace_interrupts);
+    if debug && debugc {
+      println!("Error: --debug and --debugc are mutually exclusive");
+      process::exit(1);
+    }
     // file to run is passed as a command line argument
-    if debug {
+    if debugc {
+      if with_graphics {
+        println!("Warning: --vga is ignored in debugc mode");
+      }
+      if cores != 1 {
+        println!("Warning: --cores is ignored in debugc mode");
+      }
+      if sched != ScheduleMode::Free {
+        println!("Warning: --sched is ignored in debugc mode");
+      }
+      if max_cycles != 0 {
+        println!("Warning: --max-cycles is ignored in debugc mode");
+      }
+      Emulator::debug_c(path, use_uart_rx);
+    } else if debug {
       if with_graphics {
         println!("Warning: --vga is ignored in debug mode");
       }
@@ -127,7 +147,7 @@ fn main() {
       }
     }
   } else {
-    println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
+    println!("Usage: cargo run -- <file>.hex [--vga] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N]");
     process::exit(1);
   }
 }

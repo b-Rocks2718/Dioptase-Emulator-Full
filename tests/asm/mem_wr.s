@@ -18,7 +18,7 @@ _start:
   mov  r1, r3
   sys  EXIT     # should return 0x25 = 37
 
-.space 128
+.space 512
 .fill 0x22222222
 DATA_2: .fill 38
 .fill 0x33333333

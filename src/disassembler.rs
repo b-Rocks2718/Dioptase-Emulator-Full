@@ -1,3 +1,5 @@
+// Disassembler written by Codex
+
 fn sign_extend(value: u32, bits: u8) -> i32 {
     let shift = 32 - bits;
     ((value << shift) as i32) >> shift

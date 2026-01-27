@@ -1,6 +1,3 @@
-EXIT:
-  mode halt
-
   .global _start
 _start:
   movi r4 0xFFFFFFFF
@@ -14,4 +11,4 @@ _start:
   # result should be 0xAAAAAAACFFFFFFFE
   # r1 should have 0xAAAAAAAD
   mov  r1, r3
-  sys  EXIT
+  mode halt

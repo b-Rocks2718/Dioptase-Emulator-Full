@@ -1,8 +1,10 @@
 
   .global _start
-EXIT:
-  mode halt
+  # Interrupt vector table entry used by this test.
+  .origin 0x3D4 # IVT IPI (0xF5 * 4)
+  .fill INT_IPI
 
+  .origin 0x400
 _start:
   # Split execution by core id.
   mov  r1, cid
@@ -33,7 +35,7 @@ wait_done:
   # Expect the counter to be 2 with atomic ops.
   lwa  r10 [r4, 0]
   mov  r1, r10
-  sys  EXIT
+  mode halt
 
 core1:
   # Atomic increment, then signal done.

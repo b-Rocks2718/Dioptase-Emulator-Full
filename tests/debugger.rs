@@ -127,15 +127,15 @@ r
 info regs
 info cregs
 info tlb
-info p 0x400
-info v 0x400
-x p 0x400 4
-x v 0x400 4
+info p 0x00
+info v 0x00
+x p 0x00 4
+x v 0x00 4
 set reg r1 0x10
 info r1
-watch w 0x400
+watch w 0x00
 watchs
-unwatch 0x400
+unwatch 0x00
 q
 ";
   {
@@ -150,11 +150,11 @@ q
   assert!(output.status.success(), "emulator failed: {}", stderr);
   assert!(stdout.contains("Breakpoint set at 00000400"));
   assert!(stdout.contains("TLB private"));
-  assert!(stdout.contains("paddr 00000400"));
-  assert!(stdout.contains("vaddr 00000400"));
+  assert!(stdout.contains("paddr 00000000"));
+  assert!(stdout.contains("vaddr 00000000"));
   assert!(stdout.contains("r1 = 00000010"));
-  assert!(stdout.contains("Watchpoint set at 00000400"));
-  assert!(stdout.contains("Watchpoint removed at 00000400"));
+  assert!(stdout.contains("Watchpoint set at 00000000"));
+  assert!(stdout.contains("Watchpoint removed at 00000000"));
 
   let _ = fs::remove_file(debug_file);
 }

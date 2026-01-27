@@ -889,12 +889,24 @@ impl Emulator {
     }
   }
 
-  pub fn debug(path: String, use_uart_rx: bool) {
+  pub fn debug(
+    path: String,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
+  ) {
     let image = load_program(&path);
     let labels_by_addr = build_labels_by_addr(&image.labels);
     let mut breakpoints: HashSet<u32> = HashSet::new();
     let mut watchpoints: Vec<Watchpoint> = Vec::new();
-    let mut cpu = Emulator::from_instructions(image.instructions.clone(), use_uart_rx);
+    let mut cpu = Emulator::from_instructions(
+      image.instructions.clone(),
+      use_uart_rx,
+      sd_dma_ticks_per_word,
+      sd0_image,
+      sd1_image,
+    );
     cpu.set_watchpoints(&watchpoints);
 
     println!("Debug mode:");
@@ -957,7 +969,13 @@ impl Emulator {
           println!("  q                 quit");
         }
         "r" => {
-          cpu = Emulator::from_instructions(image.instructions.clone(), use_uart_rx);
+          cpu = Emulator::from_instructions(
+            image.instructions.clone(),
+            use_uart_rx,
+            sd_dma_ticks_per_word,
+            sd0_image,
+            sd1_image,
+          );
           cpu.set_watchpoints(&watchpoints);
           match run_until_breakpoint(&mut cpu, &breakpoints) {
             RunOutcome::Breakpoint(addr) => {
@@ -1172,7 +1190,13 @@ impl Emulator {
     }
   }
 
-  pub fn debug_c(path: String, use_uart_rx: bool) {
+  pub fn debug_c(
+    path: String,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
+  ) {
     let image = load_program(&path);
     let mut lines = image.debug.lines.clone();
     lines.sort_by_key(|line| line.addr);
@@ -1201,7 +1225,13 @@ impl Emulator {
     }
 
     let mut breakpoints: HashSet<u32> = HashSet::new();
-    let mut cpu = Emulator::from_instructions(image.instructions.clone(), use_uart_rx);
+    let mut cpu = Emulator::from_instructions(
+      image.instructions.clone(),
+      use_uart_rx,
+      sd_dma_ticks_per_word,
+      sd0_image,
+      sd1_image,
+    );
 
     println!("C debug mode:");
     println!("  r                   reset and run until break/halt");
@@ -1253,7 +1283,13 @@ impl Emulator {
           println!("  q                   quit");
         }
         "r" => {
-          cpu = Emulator::from_instructions(image.instructions.clone(), use_uart_rx);
+          cpu = Emulator::from_instructions(
+            image.instructions.clone(),
+            use_uart_rx,
+            sd_dma_ticks_per_word,
+            sd0_image,
+            sd1_image,
+          );
           match run_until_breakpoint(&mut cpu, &breakpoints) {
             RunOutcome::Breakpoint(addr) => {
               print_c_location(addr, line_for_pc(&lines, addr));

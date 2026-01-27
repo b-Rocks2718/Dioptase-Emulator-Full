@@ -1,6 +1,3 @@
-EXIT:
-  mode halt
-
   .global _start
 _start:
   movi r2 0xFFFFFF7F
@@ -8,4 +5,4 @@ _start:
   sxtb r4 r2
   sxtb r5 r3
   sub  r1 r4 r5
-  sys  EXIT # should return 0x000000FF
+  mode halt # should return 0x000000FF

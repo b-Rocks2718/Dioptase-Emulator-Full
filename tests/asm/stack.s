@@ -1,7 +1,5 @@
 
   .global _start
-EXIT:
-  mode halt
 
 _start:
   movi sp 0x20000 # keep stack in physical memory for this test
@@ -11,4 +9,4 @@ _start:
   push r7
   pop  r0
   pop  r1
-  sys  EXIT
+  mode halt

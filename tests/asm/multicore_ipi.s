@@ -1,8 +1,10 @@
 
   .global _start
-EXIT:
-  mode halt
+  # Interrupt vector table entry used by this test.
+  .origin 0x3D4 # IVT IPI (0xF5 * 4)
+  .fill INT_IPI
 
+  .origin 0x400
 _start:
   # Split execution by core id.
   mov  r1, cid
@@ -23,7 +25,7 @@ wait_flag:
   add  r5 r5 r0
   bz   wait_flag
   mov  r1, r5
-  sys  EXIT
+  mode halt
 
 core1:
   # Stay asleep until the IPI wakes us.

@@ -1,4 +1,9 @@
   .global _start
+  # Interrupt vector table entry used by this test.
+  .origin 0x204 # IVT EXC_PRIV (0x81 * 4)
+  .fill EXIT
+
+  .origin 0x400
 _start:
   # set pid to 1
   movi r4, 1
@@ -24,4 +29,4 @@ EXIT:
   .origin 0x1000
 userland:
   movi r31, 0x42 # should be the real r31
-  sys  EXIT
+  mode halt

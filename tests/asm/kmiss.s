@@ -1,4 +1,9 @@
   .global _start
+  # Interrupt vector table entry used by this test.
+  .origin 0x20C # IVT TLB_KMISS (0x83 * 4)
+  .fill TLB_KMISS
+
+  .origin 0x400
 _start:
 
   movi r7, 0xFFFFFFF0

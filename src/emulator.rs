@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::memory::{
   Memory, 
   PHYSMEM_MAX, 
-  PIT_START, CLK_REG_START,
-  SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT
+  CLK_REG_START,
+  SdSlot,
+  SD_INTERRUPT_BIT, SD2_INTERRUPT_BIT, VGA_INTERRUPT_BIT
 };
 
 use crate::graphics::Graphics;
@@ -435,7 +436,10 @@ fn format_interrupts(bits: u32) -> String {
     parts.push("uart");
   }
   if (bits & SD_INTERRUPT_BIT) != 0 {
-    parts.push("sd");
+    parts.push("sd0");
+  }
+  if (bits & SD2_INTERRUPT_BIT) != 0 {
+    parts.push("sd1");
   }
   if (bits & VGA_INTERRUPT_BIT) != 0 {
     parts.push("vga");
@@ -455,6 +459,7 @@ struct InterruptRouteState {
   next_kb: usize,
   next_uart: usize,
   next_sd: usize,
+  next_sd2: usize,
   next_vga: usize,
   // Track which core currently has a pending KB/UART interrupt.
   kb_inflight: Option<usize>,
@@ -480,6 +485,7 @@ impl InterruptController {
         next_kb: 0,
         next_uart: 0,
         next_sd: 0,
+        next_sd2: 0,
         next_vga: 0,
         kb_inflight: None,
         uart_inflight: None,
@@ -560,11 +566,23 @@ impl InterruptController {
       routes.next_sd = (routes.next_sd + 1) % self.cores;
       self.set_pending_bits(core, SD_INTERRUPT_BIT);
     }
+    if pending & SD2_INTERRUPT_BIT != 0 {
+      // SD2 interrupts go to one core at a time, round-robin.
+      let core = routes.next_sd2 % self.cores;
+      routes.next_sd2 = (routes.next_sd2 + 1) % self.cores;
+      self.set_pending_bits(core, SD2_INTERRUPT_BIT);
+    }
     if pending & VGA_INTERRUPT_BIT != 0 {
       // VGA interrupts go to one core at a time, round-robin.
       let core = routes.next_vga % self.cores;
       routes.next_vga = (routes.next_vga + 1) % self.cores;
       self.set_pending_bits(core, VGA_INTERRUPT_BIT);
+    }
+  }
+
+  fn broadcast_timer(&self) {
+    for core in 0..self.cores {
+      self.set_pending_bits(core, TIMER_INTERRUPT_BIT);
     }
   }
 
@@ -640,7 +658,6 @@ pub struct Emulator {
   // Distinguish "mode sleep" from a core that starts asleep.
   sleep_armed: bool,
   halted : bool,
-  timer : u32,
   count : u32,
   core_id: u32,
   use_uart_rx: bool,
@@ -916,13 +933,37 @@ fn load_program(path: &str) -> ProgramImage {
 }
 
 impl Emulator {
-  pub fn new(path : String, use_uart_rx: bool) -> Emulator {
+  pub fn new(
+    path : String,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
+  ) -> Emulator {
     let image = load_program(&path);
-    Emulator::from_instructions(image.instructions, use_uart_rx)
+    Emulator::from_instructions(
+      image.instructions,
+      use_uart_rx,
+      sd_dma_ticks_per_word,
+      sd0_image,
+      sd1_image,
+    )
   }
 
-  pub fn from_instructions(instructions: HashMap<u32, u8>, use_uart_rx: bool) -> Emulator {
-    let memory: Arc<Memory> = Arc::new(Memory::new(instructions, use_uart_rx));
+  pub fn from_instructions(
+    instructions: HashMap<u32, u8>,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
+  ) -> Emulator {
+    let memory: Arc<Memory> = Arc::new(Memory::new(instructions, use_uart_rx, sd_dma_ticks_per_word));
+    if let Some(image) = sd0_image {
+      memory.load_sd_image(SdSlot::Sd0, image);
+    }
+    if let Some(image) = sd1_image {
+      memory.load_sd_image(SdSlot::Sd1, image);
+    }
     let interrupts = InterruptController::new(1);
     Emulator::from_shared(memory, interrupts, use_uart_rx, 0)
   }
@@ -955,11 +996,10 @@ impl Emulator {
       memory,
       interrupts,
       tlb: RandomCache::new(32),
-      pc: 0x400,
+      pc: 0,
       asleep: core_id != 0,
       sleep_armed: false,
       halted: false,
-      timer: 0,
       count: 0,
       core_id,
       use_uart_rx,
@@ -980,10 +1020,6 @@ impl Emulator {
     if cleared != 0 {
       self.interrupts.ack_input(self.core_id as usize, cleared);
     }
-  }
-
-  fn set_isr_bits(&mut self, bits: u32) {
-    self.cregfile[2] |= bits;
   }
 
   fn read_mbi(&self) -> u32 {
@@ -1372,10 +1408,19 @@ impl Emulator {
     max_iters: u32,
     with_graphics: bool,
     use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
   ) -> Option<u32> {
     assert!((1..=4).contains(&cores), "cores must be in 1..=4");
     let image = load_program(&path);
-    let memory: Arc<Memory> = Arc::new(Memory::new(image.instructions, use_uart_rx));
+    let memory: Arc<Memory> = Arc::new(Memory::new(image.instructions, use_uart_rx, sd_dma_ticks_per_word));
+    if let Some(image) = sd0_image {
+      memory.load_sd_image(SdSlot::Sd0, image);
+    }
+    if let Some(image) = sd1_image {
+      memory.load_sd_image(SdSlot::Sd1, image);
+    }
     let interrupts = InterruptController::new(cores);
 
     let finished = Arc::new(Mutex::new(false));
@@ -1455,22 +1500,14 @@ impl Emulator {
       self.cregfile[2] |= pending;
     }
 
-    // check for timer interrupt
-    if self.timer == 0 {
-      // check if timer was set
-      let old_kmode = self.kmode;
-      self.kmode = true;
-      let v = self.memory.read_u32(PIT_START);
-      self.kmode = old_kmode;
-      if v != 0 {
-        // reset timer
-        self.timer = v;
+    // Shared PIT countdown is advanced by core 0 only.
+    if self.core_id == 0 && self.memory.tick_pit() {
+      self.interrupts.broadcast_timer();
+    }
 
-        // trigger timer interrupt
-        self.set_isr_bits(TIMER_INTERRUPT_BIT);
-      }
-    } else {
-      self.timer -= 1;
+    // Advance SD DMA after the timer update to share the same tick cadence.
+    if self.core_id == 0 {
+      self.memory.tick_sd_dma();
     }
   }
 
@@ -1597,6 +1634,8 @@ impl Emulator {
 
       15 => self.syscall(instr),
 
+      22 => self.adpc(instr),
+
       // fadd
       16 => self.atomic_absolute(instr, 0),
       17 => self.atomic_relative(instr, 0),
@@ -1620,6 +1659,18 @@ impl Emulator {
       // normal register access
       self.regfile[regnum as usize]
     }
+  }
+
+  fn adpc(&mut self, instr: u32) {
+    // adpc rA, i
+    // rA <- pc + 4 + sign-extended 22-bit immediate (pc-relative to next instruction).
+    let r_a = (instr >> 22) & 0x1F;
+    let imm = (instr & 0x3FFFFF) as i32;
+    let imm = (imm << 10) >> 10; // sign-extend 22 bits
+    let pc = self.pc as i32;
+    let value = pc.wrapping_add(4).wrapping_add(imm) as u32;
+    self.write_reg(r_a, value);
+    self.pc += 4;
   }
 
   fn write_reg(&mut self, regnum : u32, value : u32) {

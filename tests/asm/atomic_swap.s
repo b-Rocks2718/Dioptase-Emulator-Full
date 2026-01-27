@@ -31,10 +31,7 @@ _start:
   add  r14 r14 r10
   add  r14 r14 r13
   mov  r1, r14
-  sys  EXIT     # should return 0x164
+  mode halt     # should return 0x164
 
 SWAP_REL: .fill 0x33
 SWAP_IMM: .fill 0x55
-
-EXIT:
-  mode halt

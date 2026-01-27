@@ -1,5 +1,10 @@
 
   .global _start
+  # Interrupt vector table entry used by this test.
+  .origin 0x200 # IVT EXC_INSTR (0x80 * 4)
+  .fill EXC_INSTR
+
+  .origin 0x400
 EXC_INSTR:
   mov r30, epc
   add r30, r30, 4 # skip the bad instruction and then return

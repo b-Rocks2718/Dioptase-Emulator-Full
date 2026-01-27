@@ -86,7 +86,7 @@ fn run_test(asm_file : &'static str, expected : u32){
   assert!(status.success(), "assembler failed");
 
   // execute hex file
-  let cpu = Emulator::new(hex_file.to_string_lossy().to_string(), false);
+  let cpu = Emulator::new(hex_file.to_string_lossy().to_string(), false, 1, None, None);
   let result = cpu.run(10000, false);
   
   // check result
@@ -117,6 +117,9 @@ fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
     200000,
     false,
     false,
+    1,
+    None,
+    None,
   );
   assert_eq!(result, Some(expected));
 }
@@ -247,6 +250,11 @@ fn lui() {
 #[test]
 fn movi() {
   run_test("tests/asm/movi.s", 0xABABABAB);
+}
+
+#[test]
+fn adpc() {
+  run_test("tests/asm/adpc.s", 0);
 }
 
 #[test]
@@ -398,6 +406,11 @@ fn call() {
 #[test]
 fn sdcard() {
   run_test("tests/asm/sdcard.s", 0);
+}
+
+#[test]
+fn sdcard1() {
+  run_test("tests/asm/sdcard1.s", 0);
 }
 
 #[test]

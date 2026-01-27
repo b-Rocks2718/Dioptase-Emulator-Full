@@ -14,9 +14,6 @@
 
   .define USER_PID 1
 
-EXIT:
-  mode halt
-
 INT_KEYBOARD:
   # return the character causing an interrupt
   movi r4, PS2_ADDR

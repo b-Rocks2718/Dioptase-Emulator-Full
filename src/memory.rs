@@ -16,14 +16,11 @@ pub const SPRITE_WIDTH: u32 = 32;
 // const SPRITES_NUM: u32 = 8;
 const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
 
-// SD card is memory-mapped:
-// - SD_CMD_BUF..+5: command bytes (write-only; mirrored into RAM for visibility)
-// - SD_BUF_START..+512: data buffer for single-block transfers
-// - SD_SEND_BYTE: write to execute current command and copy response/data back into RAM
-// Reads of SD_SEND_BYTE return busy status (1 while executing, else 0).
-const SD_CMD_BUF_LEN: usize = 6;
+// SD card DMA engine (no data buffer). DMA transfers 4 bytes per device tick.
 const SD_BLOCK_SIZE: usize = 512;
+const SD_DMA_BYTES_PER_TICK: u32 = 4;
 pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
+pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
 pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
 
 const FRAME_BUFFER_START : u32 = 0x7FC0000;
@@ -34,9 +31,28 @@ const UART_TX : u32 = 0x7FE5802;
 const UART_RX : u32 = 0x7FE5803;
 pub const PIT_START : u32 = 0x7FE5804;
 
-const SD_SEND_BYTE : u32 = 0x7FE58F9;
-const SD_CMD_BUF : u32  = 0x7FE58FA;
-const SD_BUF_START : u32 = 0x7FE5900;
+const SD_DMA_MEM_ADDR : u32 = 0x7FE58F0;
+const SD2_DMA_MEM_ADDR : u32 = 0x7FE5908;
+
+const SD_DMA_OFFSET_MEM_ADDR: u32 = 0x0;
+const SD_DMA_OFFSET_SD_BLOCK: u32 = 0x4;
+const SD_DMA_OFFSET_LEN: u32 = 0x8;
+const SD_DMA_OFFSET_CTRL: u32 = 0xC;
+const SD_DMA_OFFSET_STATUS: u32 = 0x10;
+const SD_DMA_OFFSET_ERR: u32 = 0x14;
+const SD_DMA_RANGE_SIZE: u32 = 0x18;
+
+const SD_DMA_CTRL_START: u32 = 1 << 0;
+const SD_DMA_CTRL_DIR_RAM_TO_SD: u32 = 1 << 1;
+const SD_DMA_CTRL_IRQ_ENABLE: u32 = 1 << 2;
+
+const SD_DMA_STATUS_BUSY: u32 = 1 << 0;
+const SD_DMA_STATUS_DONE: u32 = 1 << 1;
+const SD_DMA_STATUS_ERR: u32 = 1 << 2;
+
+const SD_DMA_ERR_NONE: u32 = 0;
+const SD_DMA_ERR_BUSY: u32 = 1;
+const SD_DMA_ERR_ZERO_LEN: u32 = 2;
 
 const SPRITE_REGISTERS_START : u32 = 0x7FE5B00;  // every consecutive pair of words correspond to 
 const SPRITE_REGISTERS_SIZE : u32 = 0x40;     // the y and x coordinates, respectively of a sprite
@@ -71,8 +87,10 @@ pub struct Memory {
   vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
   clk_register: Arc<RwLock<(u8, u8, u8, u8)>>,
   pit: Arc<RwLock<(u8, u8, u8, u8)>>,
+  pit_countdown: Arc<Mutex<u32>>,
   sprite_map: Arc<RwLock<SpriteMap>>,
   sd_card: Arc<RwLock<SdCard>>,
+  sd_card2: Arc<RwLock<SdCard>>,
   pending_interrupt: Arc<RwLock<u32>>,
   use_uart_rx: bool
 }
@@ -106,205 +124,181 @@ pub struct Sprite {
     pub pixels: Vec<u8>, // a 32x32 tile of pixels
 }
 
-struct SdCard {
-    // Minimal single-block SD card emulation backing the memory map above.
-    command: [u8; SD_CMD_BUF_LEN],
-    response: [u8; SD_CMD_BUF_LEN],
-    response_len: usize,
-    data_buffer: [u8; SD_BLOCK_SIZE],
-    storage: HashMap<u32, Vec<u8>>,
-    idle: bool,
-    initialized: bool,
-    high_capacity: bool,
-    awaiting_app_cmd: bool,
-    ocr: u32,
-    busy: bool,
+// Purpose: identify which SD card device should receive a host image.
+#[derive(Clone, Copy)]
+pub enum SdSlot {
+    Sd0,
+    Sd1,
 }
 
-struct SdCommandResult {
-    response_len: usize,
-    update_data_buffer: bool,
-    interrupt: bool,
+// Purpose: SD card storage indexed by block address, plus DMA register state.
+// Inputs/outputs: storage is read/written by DMA; registers mirror MMIO state.
+// Invariants: dma_remaining > 0 while dma_active is true; dma_status BUSY implies dma_active.
+struct SdCard {
+    storage: HashMap<u32, Vec<u8>>,
+    dma_mem_addr: u32,
+    dma_sd_block: u32,
+    dma_len: u32,
+    dma_ctrl: u32,
+    dma_status: u32,
+    dma_err: u32,
+    dma_active: bool,
+    dma_mem_cursor: u32,
+    dma_sd_byte_cursor: u64,
+    dma_remaining: u32,
+    dma_ticks_per_word: u32,
+    dma_tick_countdown: u32,
 }
 
 impl SdCard {
-    fn new() -> Self {
+    fn new(dma_ticks_per_word: u32) -> Self {
+        let ticks_per_word = dma_ticks_per_word.max(1);
         SdCard {
-            command: [0; SD_CMD_BUF_LEN],
-            response: [0; SD_CMD_BUF_LEN],
-            response_len: 0,
-            data_buffer: [0; SD_BLOCK_SIZE],
             storage: HashMap::new(),
-            idle: true,
-            initialized: false,
-            high_capacity: false,
-            awaiting_app_cmd: false,
-            ocr: 0x00FF8000,
-            busy: false,
+            dma_mem_addr: 0,
+            dma_sd_block: 0,
+            dma_len: 0,
+            dma_ctrl: 0,
+            dma_status: 0,
+            dma_err: SD_DMA_ERR_NONE,
+            dma_active: false,
+            dma_mem_cursor: 0,
+            dma_sd_byte_cursor: 0,
+            dma_remaining: 0,
+            dma_ticks_per_word: ticks_per_word,
+            dma_tick_countdown: 0,
         }
     }
 
-    fn status(&self) -> u8 {
-        if self.busy { 1 } else { 0 }
+    // Purpose: start a DMA transfer using the current register values.
+    // Inputs: DMA registers already written by MMIO.
+    // Outputs: updates DMA state and returns true if an immediate interrupt is needed.
+    fn start_dma(&mut self) -> bool {
+        let irq_enable = (self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0;
+        let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
+        if is_busy {
+            self.dma_err = SD_DMA_ERR_BUSY;
+            self.dma_status |= SD_DMA_STATUS_ERR;
+            return false;
+        }
+
+        let mem_addr = self.dma_mem_addr & !0x3;
+        let len = self.dma_len & !0x3;
+        if len == 0 {
+            self.dma_err = SD_DMA_ERR_ZERO_LEN;
+            self.dma_status = SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR;
+            self.dma_active = false;
+            return irq_enable;
+        }
+
+        self.dma_mem_cursor = mem_addr;
+        self.dma_sd_byte_cursor = (self.dma_sd_block as u64) * (SD_BLOCK_SIZE as u64);
+        self.dma_remaining = len;
+        self.dma_err = SD_DMA_ERR_NONE;
+        self.dma_status = SD_DMA_STATUS_BUSY;
+        self.dma_active = true;
+        self.dma_tick_countdown = 0;
+        false
     }
 
-    fn write_command_byte(&mut self, offset: usize, value: u8) {
-        if offset < SD_CMD_BUF_LEN {
-            self.command[offset] = value;
-            self.response[offset] = value;
-            if offset + 1 > self.response_len {
-                self.response_len = offset + 1;
-            }
-        }
+    // Purpose: clear DONE/ERR status and reset the error code.
+    // Inputs/outputs: updates status bits and dma_err in-place.
+    fn clear_status(&mut self) {
+        self.dma_status &= !SD_DMA_STATUS_DONE;
+        self.dma_status &= !SD_DMA_STATUS_ERR;
+        self.dma_err = SD_DMA_ERR_NONE;
     }
 
-    fn write_data_byte(&mut self, offset: usize, value: u8) {
-        if offset < SD_BLOCK_SIZE {
-            self.data_buffer[offset] = value;
-        }
+    // Purpose: read a byte from SD storage without allocating missing blocks.
+    // Inputs: byte_offset in SD address space.
+    // Outputs: stored byte value or 0 if unmapped.
+    fn read_storage_byte(&self, byte_offset: u64) -> u8 {
+        let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
+        let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
+        self.storage
+            .get(&block_index)
+            .and_then(|block| block.get(block_offset))
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn execute(&mut self) -> SdCommandResult {
-        self.busy = true;
-        let mut result = SdCommandResult {
-            response_len: 1,
-            update_data_buffer: false,
-            interrupt: true,
-        };
-
-        self.response.fill(0);
-        self.response_len = 0;
-
-        let raw_cmd = self.command[0];
-        let cmd_index = raw_cmd & 0x3F;
-        let arg = ((self.command[1] as u32) << 24)
-            | ((self.command[2] as u32) << 16)
-            | ((self.command[3] as u32) << 8)
-            | (self.command[4] as u32);
-
-        let is_acmd = cmd_index == 41;
-        if cmd_index != 55 && !is_acmd {
-            self.awaiting_app_cmd = false;
-        }
-
-        match cmd_index {
-            0 => {
-                self.idle = true;
-                self.initialized = false;
-                self.high_capacity = false;
-                self.awaiting_app_cmd = false;
-                self.set_response(&[0x01]);
-            }
-            8 => {
-                let status = if self.initialized { 0x00 } else { 0x01 };
-                let resp = [
-                    status,
-                    self.command[1],
-                    self.command[2],
-                    self.command[3],
-                    self.command[4],
-                ];
-                self.set_response(&resp);
-            }
-            55 => {
-                self.awaiting_app_cmd = true;
-                let status = if self.initialized { 0x00 } else { 0x01 };
-                self.set_response(&[status]);
-            }
-            41 => {
-                if !self.awaiting_app_cmd {
-                    self.set_response(&[0x05]);
-                } else {
-                    self.awaiting_app_cmd = false;
-                    self.initialized = true;
-                    self.idle = false;
-                    self.high_capacity = (arg & (1 << 30)) != 0;
-                    self.set_response(&[0x00]);
-                }
-            }
-            58 => {
-                let status = if self.initialized { 0x00 } else { 0x01 };
-                let mut ocr = self.ocr;
-                if self.high_capacity {
-                    ocr |= 1 << 30;
-                } else {
-                    ocr &= !(1 << 30);
-                }
-                let resp = [
-                    status,
-                    ((ocr >> 24) & 0xFF) as u8,
-                    ((ocr >> 16) & 0xFF) as u8,
-                    ((ocr >> 8) & 0xFF) as u8,
-                    (ocr & 0xFF) as u8,
-                ];
-                self.set_response(&resp);
-            }
-            17 => {
-                if !self.initialized {
-                    self.set_response(&[0x05]);
-                } else if !self.high_capacity && (arg % (SD_BLOCK_SIZE as u32) != 0) {
-                    self.set_response(&[0x05]);
-                } else {
-                    let block_index = if self.high_capacity {
-                        arg
-                    } else {
-                        arg / (SD_BLOCK_SIZE as u32)
-                    };
-                    let data = self
-                        .storage
-                        .entry(block_index)
-                        .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
-                    self.data_buffer.copy_from_slice(data.as_slice());
-                    self.set_response(&[0x00]);
-                    result.update_data_buffer = true;
-                }
-            }
-            24 => {
-                if !self.initialized {
-                    self.set_response(&[0x05]);
-                } else if !self.high_capacity && (arg % (SD_BLOCK_SIZE as u32) != 0) {
-                    self.set_response(&[0x05]);
-                } else {
-                    let block_index = if self.high_capacity {
-                        arg
-                    } else {
-                        arg / (SD_BLOCK_SIZE as u32)
-                    };
-                    let data = self
-                        .storage
-                        .entry(block_index)
-                        .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
-                    data.as_mut_slice()
-                        .copy_from_slice(&self.data_buffer);
-                    self.set_response(&[0x00]);
-                }
-            }
-            _ => {
-                self.set_response(&[0x05]);
-            }
-        }
-
-        result.response_len = self.response_len;
-        self.busy = false;
-        result
+    // Purpose: write a byte to SD storage, allocating blocks as needed.
+    // Inputs: byte_offset in SD address space and value to store.
+    // Outputs: updates storage contents.
+    fn write_storage_byte(&mut self, byte_offset: u64, value: u8) {
+        let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
+        let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
+        let block = self
+            .storage
+            .entry(block_index)
+            .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
+        block[block_offset] = value;
     }
 
-    fn set_response(&mut self, bytes: &[u8]) {
-        self.response.fill(0);
-        for (i, value) in bytes.iter().enumerate() {
-            if i < SD_CMD_BUF_LEN {
-                self.response[i] = *value;
-            }
-        }
-        self.response_len = bytes.len().min(SD_CMD_BUF_LEN);
-        if self.response_len == 0 {
-            self.response_len = 1;
+    // Purpose: load a raw SD image into storage starting at block 0.
+    // Inputs: image bytes, where offset 0 corresponds to block 0 byte 0.
+    // Outputs: storage is cleared and replaced with the provided image.
+    fn load_image(&mut self, image: &[u8]) {
+        self.storage.clear();
+        for (index, chunk) in image.chunks(SD_BLOCK_SIZE).enumerate() {
+            let mut block = vec![0u8; SD_BLOCK_SIZE];
+            block[..chunk.len()].copy_from_slice(chunk);
+            self.storage.insert(index as u32, block);
         }
     }
 }
 
+// Purpose: extract a little-endian register byte from a 32-bit value.
+// Inputs: full register value, byte address, base register address.
+// Outputs: the addressed byte.
+fn read_reg_byte(value: u32, addr: u32, base: u32) -> u8 {
+    let shift = ((addr - base) * 8) as u32;
+    ((value >> shift) & 0xFF) as u8
+}
+
+// Purpose: update one byte of a 32-bit MMIO register in little-endian order.
+// Inputs: register, byte address, base register address, and the new byte value.
+// Outputs: updates the register in-place.
+fn write_reg_byte(reg: &mut u32, addr: u32, base: u32, value: u8) {
+    let shift = ((addr - base) * 8) as u32;
+    let mask = 0xFFu32 << shift;
+    *reg = (*reg & !mask) | ((value as u32) << shift);
+}
+
+// Purpose: read a byte from an SD DMA MMIO block.
+// Inputs: address, base address, and SD card state.
+// Outputs: Some(byte) if within the SD block, else None.
+fn read_sd_dma_mmio(addr: u32, base: u32, sd: &SdCard) -> Option<u8> {
+    if addr < base || addr >= base + SD_DMA_RANGE_SIZE {
+        return None;
+    }
+    if addr >= base + SD_DMA_OFFSET_MEM_ADDR && addr < base + SD_DMA_OFFSET_MEM_ADDR + 4 {
+        return Some(read_reg_byte(sd.dma_mem_addr, addr, base + SD_DMA_OFFSET_MEM_ADDR));
+    }
+    if addr >= base + SD_DMA_OFFSET_SD_BLOCK && addr < base + SD_DMA_OFFSET_SD_BLOCK + 4 {
+        return Some(read_reg_byte(sd.dma_sd_block, addr, base + SD_DMA_OFFSET_SD_BLOCK));
+    }
+    if addr >= base + SD_DMA_OFFSET_LEN && addr < base + SD_DMA_OFFSET_LEN + 4 {
+        return Some(read_reg_byte(sd.dma_len, addr, base + SD_DMA_OFFSET_LEN));
+    }
+    if addr >= base + SD_DMA_OFFSET_CTRL && addr < base + SD_DMA_OFFSET_CTRL + 4 {
+        return Some(read_reg_byte(sd.dma_ctrl, addr, base + SD_DMA_OFFSET_CTRL));
+    }
+    if addr >= base + SD_DMA_OFFSET_STATUS && addr < base + SD_DMA_OFFSET_STATUS + 4 {
+        let mut status = sd.dma_status;
+        if sd.dma_err != SD_DMA_ERR_NONE {
+            status |= SD_DMA_STATUS_ERR;
+        } else {
+            status &= !SD_DMA_STATUS_ERR;
+        }
+        return Some(read_reg_byte(status, addr, base + SD_DMA_OFFSET_STATUS));
+    }
+    Some(read_reg_byte(sd.dma_err, addr, base + SD_DMA_OFFSET_ERR))
+}
+
 impl Memory {
-    pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool) -> Memory {
+    pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool, sd_dma_ticks_per_word: u32) -> Memory {
+        let ticks_per_word = sd_dma_ticks_per_word.max(1);
 
         Memory {
             ram: Mutex::new(ram),
@@ -319,8 +313,10 @@ impl Memory {
             vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             clk_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             pit: Arc::new(RwLock::new((0, 0, 0, 0))),
+            pit_countdown: Arc::new(Mutex::new(0)),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
-            sd_card: Arc::new(RwLock::new(SdCard::new())),
+            sd_card: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
+            sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             pending_interrupt: Arc::new(RwLock::new(0)),
             use_uart_rx: use_uart_rx
         }
@@ -383,6 +379,73 @@ impl Memory {
         prev
     }
 
+    // Purpose: load a raw SD image into the selected SD device.
+    // Inputs: slot selector and image bytes.
+    // Outputs: replaces the SD storage contents for the chosen device.
+    pub fn load_sd_image(&self, slot: SdSlot, image: &[u8]) {
+        match slot {
+            SdSlot::Sd0 => {
+                let mut sd = self.sd_card.write().unwrap();
+                sd.load_image(image);
+            }
+            SdSlot::Sd1 => {
+                let mut sd = self.sd_card2.write().unwrap();
+                sd.load_image(image);
+            }
+        }
+    }
+
+    // Purpose: handle SD DMA MMIO writes for a specific SD device.
+    // Inputs: target address/data, base address, device handle, and interrupt bit.
+    // Outputs: true if the address was handled, false otherwise.
+    fn write_sd_dma_mmio(
+        &self,
+        addr: u32,
+        data: u8,
+        base: u32,
+        sd: &Arc<RwLock<SdCard>>,
+        interrupt_bit: u32,
+    ) -> bool {
+        if addr < base || addr >= base + SD_DMA_RANGE_SIZE {
+            return false;
+        }
+        if addr >= base + SD_DMA_OFFSET_MEM_ADDR && addr < base + SD_DMA_OFFSET_MEM_ADDR + 4 {
+            let mut sd = sd.write().unwrap();
+            write_reg_byte(&mut sd.dma_mem_addr, addr, base + SD_DMA_OFFSET_MEM_ADDR, data);
+            return true;
+        }
+        if addr >= base + SD_DMA_OFFSET_SD_BLOCK && addr < base + SD_DMA_OFFSET_SD_BLOCK + 4 {
+            let mut sd = sd.write().unwrap();
+            write_reg_byte(&mut sd.dma_sd_block, addr, base + SD_DMA_OFFSET_SD_BLOCK, data);
+            return true;
+        }
+        if addr >= base + SD_DMA_OFFSET_LEN && addr < base + SD_DMA_OFFSET_LEN + 4 {
+            let mut sd = sd.write().unwrap();
+            write_reg_byte(&mut sd.dma_len, addr, base + SD_DMA_OFFSET_LEN, data);
+            return true;
+        }
+        if addr >= base + SD_DMA_OFFSET_CTRL && addr < base + SD_DMA_OFFSET_CTRL + 4 {
+            let mut sd = sd.write().unwrap();
+            write_reg_byte(&mut sd.dma_ctrl, addr, base + SD_DMA_OFFSET_CTRL, data);
+            sd.dma_ctrl &= SD_DMA_CTRL_START | SD_DMA_CTRL_DIR_RAM_TO_SD | SD_DMA_CTRL_IRQ_ENABLE;
+            let should_start = (sd.dma_ctrl & SD_DMA_CTRL_START) != 0;
+            if should_start {
+                sd.dma_ctrl &= !SD_DMA_CTRL_START;
+                let interrupt = sd.start_dma();
+                if interrupt {
+                    *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+                }
+            }
+            return true;
+        }
+        if addr >= base + SD_DMA_OFFSET_STATUS && addr < base + SD_DMA_OFFSET_STATUS + 4 {
+            let mut sd = sd.write().unwrap();
+            sd.clear_status();
+            return true;
+        }
+        true
+    }
+
     fn read_u32_internal(&self, addr: u32, ram: &mut HashMap<u32, u8>) -> u32 {
         let b0 = self.read_internal(addr, ram) as u32;
         let b1 = self.read_internal(addr + 1, ram) as u32;
@@ -400,8 +463,13 @@ impl Memory {
         else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
         }
-        else if addr == SD_SEND_BYTE {
-            return self.sd_card.read().unwrap().status();
+        else if addr >= SD_DMA_MEM_ADDR && addr < SD_DMA_MEM_ADDR + SD_DMA_RANGE_SIZE {
+            let sd = self.sd_card.read().unwrap();
+            return read_sd_dma_mmio(addr, SD_DMA_MEM_ADDR, &sd).unwrap_or(0);
+        }
+        else if addr >= SD2_DMA_MEM_ADDR && addr < SD2_DMA_MEM_ADDR + SD_DMA_RANGE_SIZE {
+            let sd = self.sd_card2.read().unwrap();
+            return read_sd_dma_mmio(addr, SD2_DMA_MEM_ADDR, &sd).unwrap_or(0);
         }
         else if addr == PS2_STREAM {
             // kind of a hack but this assumed people always read a double from ps2 stream
@@ -541,52 +609,22 @@ impl Memory {
         else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
             self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
         }
-        else if addr == SD_SEND_BYTE {
-            let (response, response_len, updated_buffer, interrupt) = {
-                let mut sd = self.sd_card.write().unwrap();
-                let result = sd.execute();
-                let response = sd.response;
-                let response_len = result.response_len;
-                let buffer = if result.update_data_buffer {
-                    Some(sd.data_buffer.to_vec())
-                } else {
-                    None
-                };
-                (response, response_len, buffer, result.interrupt)
-            };
-
-            for i in 0..SD_CMD_BUF_LEN {
-                let value = if i < response_len { response[i] } else { 0 };
-                ram.insert(SD_CMD_BUF + i as u32, value);
-            }
-
-            if let Some(buffer) = updated_buffer {
-                for (i, value) in buffer.iter().enumerate() {
-                    ram.insert(SD_BUF_START + i as u32, *value);
-                }
-            }
-
-            if interrupt {
-                *self.pending_interrupt.write().unwrap() |= SD_INTERRUPT_BIT;
-            }
+        else if self.write_sd_dma_mmio(
+            addr,
+            data,
+            SD_DMA_MEM_ADDR,
+            &self.sd_card,
+            SD_INTERRUPT_BIT,
+        ) {
             return;
         }
-        else if addr >= SD_CMD_BUF && addr < SD_CMD_BUF + SD_CMD_BUF_LEN as u32 {
-            let offset = (addr - SD_CMD_BUF) as usize;
-            {
-                let mut sd = self.sd_card.write().unwrap();
-                sd.write_command_byte(offset, data);
-            }
-            ram.insert(addr, data);
-            return;
-        }
-        else if addr >= SD_BUF_START && addr < SD_BUF_START + SD_BLOCK_SIZE as u32 {
-            let offset = (addr - SD_BUF_START) as usize;
-            {
-                let mut sd = self.sd_card.write().unwrap();
-                sd.write_data_byte(offset, data);
-            }
-            ram.insert(addr, data);
+        else if self.write_sd_dma_mmio(
+            addr,
+            data,
+            SD2_DMA_MEM_ADDR,
+            &self.sd_card2,
+            SD2_INTERRUPT_BIT,
+        ) {
             return;
         }
         else if addr == PS2_STREAM {
@@ -658,6 +696,104 @@ impl Memory {
         }
 
         ram.insert(addr, data);
+    }
+
+    // Purpose: advance the SD DMA engines by one device tick.
+    // Inputs: none (uses DMA register state and SD storage).
+    // Outputs: updates RAM/storage and may raise SD interrupts.
+    pub fn tick_sd_dma(&self) {
+        self.tick_sd_dma_device(&self.sd_card, SD_INTERRUPT_BIT);
+        self.tick_sd_dma_device(&self.sd_card2, SD2_INTERRUPT_BIT);
+    }
+
+    // Purpose: advance one SD DMA engine by one device tick.
+    // Inputs: SD device handle and interrupt bit.
+    // Outputs: updates RAM/storage and may raise the device interrupt.
+    fn tick_sd_dma_device(&self, sd: &Arc<RwLock<SdCard>>, interrupt_bit: u32) {
+        let (mem_addr, sd_offset, bytes, dir_ram_to_sd, done_after, irq_enable) = {
+            let mut sd = sd.write().unwrap();
+            if !sd.dma_active {
+                return;
+            }
+            if sd.dma_tick_countdown > 0 {
+                sd.dma_tick_countdown -= 1;
+                return;
+            }
+            sd.dma_tick_countdown = sd.dma_ticks_per_word.saturating_sub(1);
+            let bytes = if sd.dma_remaining < SD_DMA_BYTES_PER_TICK {
+                sd.dma_remaining
+            } else {
+                SD_DMA_BYTES_PER_TICK
+            };
+            let mem_addr = sd.dma_mem_cursor;
+            let sd_offset = sd.dma_sd_byte_cursor;
+            let dir_ram_to_sd = (sd.dma_ctrl & SD_DMA_CTRL_DIR_RAM_TO_SD) != 0;
+            sd.dma_mem_cursor = sd.dma_mem_cursor.wrapping_add(bytes);
+            sd.dma_sd_byte_cursor = sd.dma_sd_byte_cursor.wrapping_add(bytes as u64);
+            sd.dma_remaining = sd.dma_remaining.wrapping_sub(bytes);
+            let done_after = sd.dma_remaining == 0;
+            if done_after {
+                sd.dma_active = false;
+                sd.dma_status &= !SD_DMA_STATUS_BUSY;
+                sd.dma_status |= SD_DMA_STATUS_DONE;
+                if sd.dma_err != SD_DMA_ERR_NONE {
+                    sd.dma_status |= SD_DMA_STATUS_ERR;
+                }
+            }
+            let irq_enable = (sd.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0;
+            (mem_addr, sd_offset, bytes, dir_ram_to_sd, done_after, irq_enable)
+        };
+
+        if bytes == 0 {
+            return;
+        }
+
+        if dir_ram_to_sd {
+            let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
+            {
+                let mut ram = self.ram.lock().unwrap();
+                for i in 0..bytes {
+                    buf[i as usize] = self.read_internal(mem_addr + i, &mut ram);
+                }
+            }
+            let mut sd = sd.write().unwrap();
+            for i in 0..bytes {
+                sd.write_storage_byte(sd_offset + i as u64, buf[i as usize]);
+            }
+        } else {
+            let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
+            {
+                let sd = sd.read().unwrap();
+                for i in 0..bytes {
+                    buf[i as usize] = sd.read_storage_byte(sd_offset + i as u64);
+                }
+            }
+            let mut ram = self.ram.lock().unwrap();
+            for i in 0..bytes {
+                self.write_internal(mem_addr + i, buf[i as usize], &mut ram);
+            }
+        }
+
+        if done_after && irq_enable {
+            *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+        }
+    }
+
+    // Purpose: advance the shared PIT countdown by one core-0 tick.
+    // Inputs: none.
+    // Outputs: true if a timer interrupt should be raised this tick.
+    pub fn tick_pit(&self) -> bool {
+        let mut countdown = self.pit_countdown.lock().unwrap();
+        if *countdown == 0 {
+            let reload = self.read_u32(PIT_START);
+            if reload != 0 {
+                *countdown = reload;
+                return true;
+            }
+        } else {
+            *countdown -= 1;
+        }
+        false
     }
 
     pub fn clock() {

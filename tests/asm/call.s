@@ -1,14 +1,11 @@
-EXIT:
-  mode halt
-
   .global _start
 _start:
   call far_label
-  sys  EXIT # should return 42
+  mode halt # should return 42
 
-  sys  EXIT
-  sys  EXIT
-  sys  EXIT
+  mode halt
+  mode halt
+  mode halt
 
 far_label:
   add  r3 r0 21
@@ -16,6 +13,6 @@ far_label:
   mov  r1, r3
   ret  
 
-  sys  EXIT
-  sys  EXIT
-  sys  EXIT
+  mode halt
+  mode halt
+  mode halt

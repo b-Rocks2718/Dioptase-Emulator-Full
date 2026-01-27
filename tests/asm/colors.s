@@ -22,9 +22,6 @@
   .define KEY_Z 122
   .define KEY_Q 113
 
-EXIT:
-  mode halt
-
 INT_KEYBOARD:
 
   # check key
@@ -132,7 +129,7 @@ key_z:
   jmp end
 
 key_q:
-  sys  EXIT
+  mode halt
 
 end:
   # mark interrupt as handled

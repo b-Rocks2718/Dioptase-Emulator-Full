@@ -1,8 +1,10 @@
 
   .global _start
-EXIT:
-  mode halt
+  # Interrupt vector table entry used by this test.
+  .origin 0x3D4 # IVT IPI (0xF5 * 4)
+  .fill INT_IPI
 
+  .origin 0x400
 _start:
   # Split execution by core id.
   mov  r1, cid
@@ -35,7 +37,7 @@ wait_ready1:
   add  r8 r8 1
   swa  r8 [r4, 0]
   mov  r1, r8
-  sys  EXIT
+  mode halt
 
 core1:
   # Load counter, then signal ready1.

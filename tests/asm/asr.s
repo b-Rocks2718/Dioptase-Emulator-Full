@@ -1,6 +1,3 @@
-EXIT:
-  mode halt
-
   .global _start
 _start:
   movi r3 0xAAAAAAAA
@@ -8,4 +5,4 @@ _start:
   asr  r3 r3 r20
   asr  r3 r3 1
   mov  r1, r3
-  sys  EXIT # should return 0xF5555555
+  mode halt # should return 0xF5555555

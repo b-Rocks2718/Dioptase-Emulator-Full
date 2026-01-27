@@ -1,6 +1,3 @@
-EXIT:
-  mode halt
-
   .global _start
 _start:
   add  r1 r0 15
@@ -9,4 +6,4 @@ _start:
   and  r3, r3, 14
   # should return 2
   mov  r1, r3
-  sys  EXIT
+  mode halt

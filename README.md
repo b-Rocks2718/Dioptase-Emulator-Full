@@ -2,19 +2,27 @@
 
 Emulator of both the user mode and kernel mode part of the Dioptase ISA
 
-Emulates all the IO devices other than the SD card.  
+Emulates the IO devices including the SD card DMA engine.  
 I/O emulation was written by [Paul Bailey](https://github.com/PaulBailey-1) and [Jonathan Yang](https://github.com/Jzhyang1)
 for the [JPEB project](https://github.com/PaulBailey-1/JPEB) and re-used here.
 
 ## Usage
 
-Run the emulator with `cargo run -- <file>.hex`
+Run the emulator with `cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>]`
+
+You can also pass positional files in order: `cargo run -- <ram.hex> [sd0.bin] [sd1.bin]`
 
 Use the `--vga` flag to open a window with the VGA output
 
 Use the `--uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
 
 Use the `--debug` flag to start an interactive debugger (label breakpoints require `.debug` files built with assembler `--debug`)
+
+Use the `--sd-dma-ticks <N>` flag to set the number of emulator ticks per 4-byte SD DMA transfer (default 1)
+
+Use the `--sd0 <file>` and `--sd1 <file>` flags to load raw binary SD images into the two SD devices
+
+SD images are raw binary byte streams; byte 0 maps to SD block 0 byte 0
 
 ### Debug Commands
 

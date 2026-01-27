@@ -1,7 +1,5 @@
 
   .global _start
-EXIT:
-  mode halt
 
 _start:
   add  r1 r0 15
@@ -10,4 +8,4 @@ _start:
   xnor r3 r3 16 
   # should return 13
   mov  r1, r3
-  sys  EXIT
+  mode halt

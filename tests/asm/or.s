@@ -1,7 +1,5 @@
 
   .global _start
-EXIT:
-  mode halt
 
 _start:
   add  r4 r0 10
@@ -10,4 +8,4 @@ _start:
   or   r3 r3 1 
   or   r3 r3 0xF0000000 # should be 0xF000000F
   mov  r1, r3
-  sys  EXIT
+  mode halt

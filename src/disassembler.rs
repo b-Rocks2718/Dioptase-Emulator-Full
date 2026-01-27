@@ -271,6 +271,12 @@ fn disassemble_atomic(opcode: u32, instr: u32) -> String {
     )
 }
 
+fn disassemble_adpc(instr: u32) -> String {
+    let r_a = (instr >> 22) & 0x1F;
+    let imm = sign_extend(instr & 0x3FFFFF, 22);
+    format!("adpc {}, {}", reg_name(r_a), fmt_imm_signed(imm))
+}
+
 fn disassemble_kernel(instr: u32) -> String {
     let major = (instr >> 12) & 0x1F;
     match major {
@@ -332,6 +338,7 @@ pub fn disassemble(instr: u32) -> String {
         13 => disassemble_branch_abs(instr),
         14 => disassemble_branch_rel(instr),
         15 => disassemble_sys(instr),
+        22 => disassemble_adpc(instr),
         16..=21 => disassemble_atomic(opcode, instr),
         31 => disassemble_kernel(instr),
         _ => format!("data {}", fmt_imm_hex(instr)),

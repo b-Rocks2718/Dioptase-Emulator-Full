@@ -16,9 +16,6 @@
   .define KEY_D 100
   .define KEY_Q 113
 
-EXIT:
-  mode halt
-
 INT_KEYBOARD:
   push r3
 
@@ -75,7 +72,7 @@ key_d:
   jmp  end
 
 key_q:
-  sys  EXIT
+  mode halt
 
 end:
   # mark interrupt as handled

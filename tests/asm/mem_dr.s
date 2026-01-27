@@ -1,7 +1,5 @@
 
   .global _start
-EXIT:
-  mode halt
 
 DATA_1: .fill 0x22222222
 
@@ -11,7 +9,7 @@ _start:
   lw   r3,  [DATA_2]
   add  r3, r13, r3
   mov  r1, r3
-  sys  EXIT     # should return 0x11114444
+  mode halt     # should return 0x11114444
 
 .space 1108
 DATA_2: .fill 0x11111111

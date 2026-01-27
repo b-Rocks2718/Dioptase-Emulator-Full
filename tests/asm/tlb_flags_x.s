@@ -1,4 +1,11 @@
   .global _start
+  # Interrupt vector table entries used by this test.
+  .origin 0x208 # IVT TLB_UMISS (0x82 * 4)
+  .fill TLB_UMISS
+  .origin 0x20C # IVT TLB_KMISS (0x83 * 4)
+  .fill TLB_KMISS
+
+  .origin 0x400
 _start:
   # set pid to 1
   movi r4, 1
@@ -46,4 +53,4 @@ userland:
   add  r1, r1, 1
   jmp  r2 # should cause a tlb umiss
 
-  sys  EXIT
+  mode halt

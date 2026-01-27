@@ -1,3 +1,5 @@
+  .origin 0x400
+  jmp _start
   # changes the color of the tilemap based on timer interrupts
   # changes the speed of the color change based on keyboard input
   # X to speed up, Z to slow down, Q to quit

@@ -1,6 +1,8 @@
 
   .global _start
 
+  .origin 0x400
+  jmp _start
 DATA_1: .fill 0x22222222
 
 _start:

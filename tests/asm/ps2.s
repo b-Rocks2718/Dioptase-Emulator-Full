@@ -3,6 +3,8 @@
   .define PS2_ADDR 0x7FE5800
   .define UART_TX_ADDR 0x7FE5802
 
+  .origin 0x400
+  jmp _start
 _start:
   movi r4, UART_TX_ADDR
   movi r3, PS2_ADDR

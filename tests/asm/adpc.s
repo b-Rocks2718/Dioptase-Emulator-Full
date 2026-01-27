@@ -1,4 +1,6 @@
   .global _start
+  .origin 0x400
+  jmp _start
 _start:
   # adpc should resolve the absolute address of target.
   adpc r1, target

@@ -7,6 +7,8 @@
   .define KEY_A 97
   .define KEY_Q 113
 
+  .origin 0x400
+  jmp _start
 INT_KEYBOARD:
 
   # save caller registers used below

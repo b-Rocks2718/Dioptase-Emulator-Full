@@ -1,4 +1,6 @@
 
+  .origin 0x400
+  jmp _start
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
   .global _start

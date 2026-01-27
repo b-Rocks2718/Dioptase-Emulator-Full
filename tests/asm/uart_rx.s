@@ -3,6 +3,8 @@
   .define UART_RX_ADDR 0x7FE5803
   .define UART_TX_ADDR 0x7FE5802
 
+  .origin 0x400
+  jmp _start
 _start:
   movi r4, UART_TX_ADDR
   movi r3, UART_RX_ADDR

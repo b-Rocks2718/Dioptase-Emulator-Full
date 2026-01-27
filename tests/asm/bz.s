@@ -1,4 +1,6 @@
   .global _start
+  .origin 0x400
+  jmp _start
 _start:
   add  r1 r0 10
   add  r2 r0 11

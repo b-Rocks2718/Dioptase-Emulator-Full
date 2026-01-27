@@ -12,6 +12,7 @@
   .fill TLB_KMISS
 
   .origin 0x400
+  jmp _start
 _start:
   # set pid to 1
   movi r1, 1

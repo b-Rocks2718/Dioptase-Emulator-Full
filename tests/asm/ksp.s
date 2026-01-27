@@ -4,6 +4,7 @@
   .fill EXIT
 
   .origin 0x400
+  jmp _start
 _start:
   # set pid to 1
   movi r4, 1

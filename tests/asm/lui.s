@@ -1,6 +1,8 @@
 
   .global _start
 
+  .origin 0x400
+  jmp _start
 _start:
   lui  r6 0xAA000000
   mov  r6 r6

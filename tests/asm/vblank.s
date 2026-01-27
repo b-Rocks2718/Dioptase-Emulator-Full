@@ -11,6 +11,8 @@
 .define VGA_STATUS_ADDR 0x7FE5B46
 .define VGA_FRAME_ADDR 0x7FE5B48
 
+  .origin 0x400
+  jmp _start
 hello:
   push r3
   push r4

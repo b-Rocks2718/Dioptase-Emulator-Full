@@ -6,6 +6,7 @@
   .fill TLB_KMISS
 
   .origin 0x400
+  jmp _start
 TLB_KMISS:
   mov  r1, tlb
   mode halt

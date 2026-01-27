@@ -1,4 +1,6 @@
   .global _start
+  .origin 0x400
+  jmp _start
 _start:
   # Setup: store 5 at absolute addr 0x7F0 using base r4 + 0x7E0.
   add  r4 r0 0x10

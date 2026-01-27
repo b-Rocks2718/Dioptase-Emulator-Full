@@ -1,6 +1,8 @@
 
   .global _start
 
+  .origin 0x400
+  jmp _start
 .fill 0x44444444
 .fill 0x55555555
 .fill 0x66666666

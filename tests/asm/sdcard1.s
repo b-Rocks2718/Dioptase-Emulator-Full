@@ -9,6 +9,8 @@
 
 .define SD_DMA_STATUS_BUSY 0x1
 
+  .origin 0x400
+  jmp _start
 _start:
   movi r11 0
   movi r4 0x2000

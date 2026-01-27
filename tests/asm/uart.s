@@ -8,6 +8,8 @@
 
 .define UART_ADDR 0x7FE5802
 
+  .origin 0x400
+  jmp _start
 _start:
   movi r4, UART_ADDR
 

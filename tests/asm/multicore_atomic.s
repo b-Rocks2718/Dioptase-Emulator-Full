@@ -5,6 +5,7 @@
   .fill INT_IPI
 
   .origin 0x400
+  jmp _start
 _start:
   # Split execution by core id.
   mov  r1, cid

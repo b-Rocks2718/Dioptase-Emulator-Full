@@ -2,6 +2,7 @@
 
   .global _start
   .origin 0x400
+  jmp _start
 _start:
   # Point the EXIT syscall vector at the test handler.
   lw   r22, [EXIT_PTR]

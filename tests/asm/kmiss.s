@@ -4,6 +4,7 @@
   .fill TLB_KMISS
 
   .origin 0x400
+  jmp _start
 _start:
 
   movi r7, 0xFFFFFFF0

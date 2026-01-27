@@ -5,6 +5,7 @@
   .fill EXC_INSTR
 
   .origin 0x400
+  jmp _start
 EXC_INSTR:
   mov r30, epc
   add r30, r30, 4 # skip the bad instruction and then return

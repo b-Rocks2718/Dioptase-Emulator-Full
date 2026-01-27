@@ -1,6 +1,8 @@
 
   .global _start
 
+  .origin 0x400
+  jmp _start
 _start:
   movi r4 0x5557
   movi r3 0x00A0

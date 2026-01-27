@@ -21,6 +21,9 @@ use crate::graphics::Graphics;
 
 mod debugger;
 
+// Reset vector for kernel entry (see docs/mem_map.md).
+const RESET_PC: u32 = 0x0000_0400;
+
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
@@ -996,7 +999,7 @@ impl Emulator {
       memory,
       interrupts,
       tlb: RandomCache::new(32),
-      pc: 0,
+      pc: RESET_PC,
       asleep: core_id != 0,
       sleep_armed: false,
       halted: false,

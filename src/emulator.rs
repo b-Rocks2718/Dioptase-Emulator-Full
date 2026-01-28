@@ -1132,6 +1132,11 @@ impl Emulator {
 
   // memory operations must be aligned
   fn mem_write8(&mut self, addr : u32, data : u8) -> bool {
+    if addr == 0 {
+      println!("Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
+    }
+
     let vaddr = addr;
     let addr = self.convert_mem_address(addr, 1);
 
@@ -1147,7 +1152,11 @@ impl Emulator {
   fn mem_write16(&mut self, addr : u32, data : u16) -> bool {
     if (addr & 1) != 0 {
       // unaligned access
-      println!("Warning: unaligned memory access at {:08x}", addr);
+      println!("Warning: unaligned memory access at 0x{:08x}", addr);
+    }
+    if addr == 0 {
+      println!("Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
     }
     let addr = addr & 0xFFFFFFFE;
     let bytes = data.to_le_bytes();
@@ -1170,7 +1179,10 @@ impl Emulator {
       // unaligned access
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
-
+    if addr == 0 {
+      println!("Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
+    }
     let addr = addr & 0xFFFFFFFC;
     let bytes = data.to_le_bytes();
     let mut addrs = [0u32; 4];
@@ -1190,7 +1202,8 @@ impl Emulator {
 
   fn mem_read8(&mut self, addr : u32) -> Option<u8> {
     if addr == 0 {
-      println!("Warning: reading from virtual address 0x00000000");
+      println!("Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
     }
 
     let vaddr = addr;
@@ -1211,7 +1224,8 @@ impl Emulator {
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
     if addr == 0 {
-      println!("Warning: reading from virtual address 0x00000000");
+      println!("Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
     }
     let mut addrs = [0u32; 2];
     for (i, slot) in addrs.iter_mut().enumerate() {
@@ -1234,7 +1248,8 @@ impl Emulator {
       println!("Warning: unaligned memory access at {:08x}", addr);
     }
     if addr == 0 {
-      println!("Warning: reading from virtual address 0x00000000");
+      println!("Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
+        self.cregfile[9], self.pc);
     }
     let mut addrs = [0u32; 4];
     for (i, slot) in addrs.iter_mut().enumerate() {

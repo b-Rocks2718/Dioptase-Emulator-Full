@@ -512,3 +512,10 @@ fn atomic_fadd() {
 fn atomic_swap() {
   run_test("tests/asm/atomic_swap.s", 0x164);
 }
+
+
+#[test]
+fn carry() {
+  run_test("tests/asm/carry.s", 42);
+}
+

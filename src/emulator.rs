@@ -1841,10 +1841,10 @@ impl Emulator {
         // two's complement
         // sub with immediate does imm - reg
         let result = if imm {
-          let r_b = (1 + u64::from(!r_b)) as u32;
+          let r_b = 1 + u64::from(!r_b);
           u64::from(r_c) + u64::from(r_b)
         } else {
-          let r_c = (1 + u64::from(!r_c)) as u32;
+          let r_c = 1 + u64::from(!r_c);
           u64::from(r_c) + u64::from(r_b)
         };
 

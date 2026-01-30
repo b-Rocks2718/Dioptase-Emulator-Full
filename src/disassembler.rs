@@ -323,6 +323,7 @@ fn disassemble_kernel(instr: u32) -> String {
                 format!("ipi {}, {}", reg_name(r_a), instr & 0x3)
             }
         }
+        5 => "rft".to_string(),
         _ => format!("kernel {}", fmt_imm_hex(instr)),
     }
 }

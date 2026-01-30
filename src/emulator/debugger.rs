@@ -662,6 +662,10 @@ impl Emulator {
       "FLG: {:08X} CDV: {:08X} TLB: {:08X} KSP: {:08X}",
       self.read_creg(5), self.read_creg(6), self.read_creg(7), self.read_creg(8)
     );
+    println!(
+      "ISP: {:08X} CID: {:08X} MBI: {:08X} MBO: {:08X}",
+      self.read_creg(12), self.read_creg(9), self.read_creg(10), self.read_creg(11)
+    );
   }
 
   fn print_cregs(&self) {
@@ -678,6 +682,7 @@ impl Emulator {
     println!("cr9 (cid): {:08X}", self.read_creg(9));
     println!("cr10 (mbi): {:08X}", self.read_creg(10));
     println!("cr11 (mbo): {:08X}", self.read_creg(11));
+    println!("cr12 (isp): {:08X}", self.read_creg(12));
   }
 
   fn print_single_reg(&self, token: &str) -> bool {
@@ -701,6 +706,10 @@ impl Emulator {
       }
       "ksp" => {
         println!("ksp (cr8) = {:08X}", self.read_creg(8));
+        return true;
+      }
+      "isp" => {
+        println!("isp (cr12) = {:08X}", self.read_creg(12));
         return true;
       }
       "psr" => {
@@ -824,6 +833,10 @@ impl Emulator {
       }
       "ksp" => {
         self.write_creg(8, value);
+        return true;
+      }
+      "isp" => {
+        self.write_creg(12, value);
         return true;
       }
       "cid" => {

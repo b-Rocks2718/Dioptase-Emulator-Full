@@ -650,8 +650,10 @@ impl RunShared {
 
 pub struct Emulator {
   kmode : bool,
+  // Number of active ISP frames (interrupts + kernel TLB misses).
+  isp_depth: u32,
   regfile : [u32; 32], // r0 - r31
-  cregfile : [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, unused, TLB, KSP, CID, MBI, MBO
+  cregfile : [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, unused, TLB, KSP, CID, MBI, MBO, ISP
   // in FLG, flags are: carry | zero | sign | overflow
   memory : Arc<Memory>,
   interrupts: Arc<InterruptController>,
@@ -977,11 +979,7 @@ impl Emulator {
     use_uart_rx: bool,
     core_id: u32,
   ) -> Emulator {
-    let mut cregfile = if core_id == 0 {
-      [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] // start core 0 in kernel mode
-    } else {
-      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] // ipi to wake up remaining cores will put them in kmode
-    };
+    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
     // CID is a read-only core identifier.
     cregfile[9] = core_id;
     if core_id != 0 {
@@ -991,6 +989,7 @@ impl Emulator {
 
     Emulator {
       kmode: true,
+      isp_depth: 0,
       regfile: [0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1102,6 +1101,9 @@ impl Emulator {
     // save pc
     self.cregfile[4] = self.pc;
 
+    // save flags
+    self.cregfile[6] = self.cregfile[5];
+
     // disable interrupts
     self.cregfile[3] &= 0x7FFFFFFF;
   }
@@ -1120,6 +1122,10 @@ impl Emulator {
     }
 
     if self.kmode {
+      if self.isp_depth == u32::MAX {
+        panic!("ISP depth overflow");
+      }
+      self.isp_depth += 1;
       self.kmode = true;
       self.cregfile[0] += 1;
       self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
@@ -1567,6 +1573,10 @@ impl Emulator {
       // enter kernel mode
       self.cregfile[0] += 1;
       self.kmode = true;
+      if self.isp_depth == u32::MAX {
+        panic!("ISP depth overflow");
+      }
+      self.isp_depth += 1;
 
       // disable interrupts
       self.cregfile[3] &= 0x7FFFFFFF;
@@ -1671,8 +1681,12 @@ impl Emulator {
 
   fn get_reg(&self, regnum : u32) -> u32 {
     if self.kmode && regnum == 31 {
-      // use kernel stack pointer
-      self.cregfile[8]
+      // use ISP while handling interrupts or kernel TLB misses
+      if self.isp_depth > 0 {
+        self.cregfile[12]
+      } else {
+        self.cregfile[8]
+      }
     } else {
       // normal register access
       self.regfile[regnum as usize]
@@ -1693,8 +1707,12 @@ impl Emulator {
 
   fn write_reg(&mut self, regnum : u32, value : u32) {
     if self.kmode && regnum == 31 {
-      // use kernel stack pointer
-      self.cregfile[8] = value;
+      // use ISP while handling interrupts or kernel TLB misses
+      if self.isp_depth > 0 {
+        self.cregfile[12] = value;
+      } else {
+        self.cregfile[8] = value;
+      }
     } else {
       // normal register access
       if regnum != 0 {
@@ -2449,6 +2467,7 @@ impl Emulator {
       2 => self.mode_op(instr),
       3 => self.rfe(instr),
       4 => self.ipi_op(instr),
+      5 => self.rft(instr),
       _ => {
         self.raise_exc_instr();
         return;
@@ -2568,10 +2587,35 @@ impl Emulator {
       // was rfi
       // re-enable interrupts
       self.cregfile[3] |= 0x80000000;
+      if self.isp_depth > 0 {
+        self.isp_depth -= 1;
+      }
     }
 
     // restore pc
     self.pc = self.cregfile[4];
+
+    // restore flags
+    self.cregfile[5] = self.cregfile[6];
+  }
+
+  fn rft(&mut self, _instr : u32) {
+    // Return from kernel TLB miss.
+    if self.isp_depth > 0 {
+      self.isp_depth -= 1;
+    }
+
+    // update kernel mode (same semantics as rfe)
+    self.cregfile[0] -= 1;
+    if self.cregfile[0] == 0 {
+      self.kmode = false;
+    }
+
+    // restore pc
+    self.pc = self.cregfile[4];
+
+    // restore flags
+    self.cregfile[5] = self.cregfile[6];
   }
 }
 

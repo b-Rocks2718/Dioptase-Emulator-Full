@@ -18,6 +18,8 @@ Use the `--uart` flag to route keyboard input to the `UART_RX` address instead o
 
 Use the `--debug` flag to start an interactive debugger (label breakpoints require `.debug` files built with assembler `--debug`)
 
+Use `--sched` to change the scheduling of when cores run. Options are `free`, `rr` (round robin), and `random`.
+
 Use the `--sd-dma-ticks <N>` flag to set the number of emulator ticks per 4-byte SD DMA transfer (default 1)
 
 Use the `--sd0 <file>` and `--sd1 <file>` flags to load raw binary SD images into the two SD devices

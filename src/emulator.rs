@@ -24,6 +24,25 @@ mod debugger;
 // Reset vector for kernel entry (see docs/mem_map.md).
 const RESET_PC: u32 = 0x0000_0400;
 
+// Memory map ranges from Dioptase-OS/docs/kernel_mem_map.md.
+const IVT_START: u32 = 0x0000_0000;
+const IVT_END: u32 = 0x0000_0400;
+const BIOS_START: u32 = 0x0000_0400;
+const BIOS_SIZE: u32 = 0x0001_0000; // 64KB reserved; kernel can overwrite after entry.
+const BIOS_END: u32 = BIOS_START + BIOS_SIZE;
+const KERNEL_TEXT_START: u32 = 0x0001_0000;
+const KERNEL_TEXT_END: u32 = 0x0009_0000;
+const KERNEL_DATA_START: u32 = 0x0009_0000;
+const KERNEL_DATA_END: u32 = 0x000A_0000;
+const KERNEL_RODATA_START: u32 = 0x000A_0000;
+const KERNEL_RODATA_END: u32 = 0x000B_0000;
+const KERNEL_BSS_START: u32 = 0x000B_0000;
+const KERNEL_BSS_END: u32 = 0x000E_0000;
+const KERNEL_INT_STACK_START: u32 = 0x000E_0000;
+const KERNEL_INT_STACK_END: u32 = 0x000F_0000;
+const KERNEL_STACK_START: u32 = 0x000F_0000;
+const KERNEL_STACK_END: u32 = 0x0010_0000;
+
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
@@ -649,7 +668,6 @@ impl RunShared {
 }
 
 pub struct Emulator {
-  kmode : bool,
   // Number of active ISP frames (interrupts + kernel TLB misses).
   isp_depth: u32,
   regfile : [u32; 32], // r0 - r31
@@ -988,7 +1006,6 @@ impl Emulator {
     }
 
     Emulator {
-      kmode: true,
       isp_depth: 0,
       regfile: [0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1050,7 +1067,101 @@ impl Emulator {
         println!("Warning: attempt to write read-only CID register");
       }
       10 => self.write_mbi(value),
-      _ => self.cregfile[idx] = value,
+      _ => {
+        if idx == 0 && TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+          println!(
+            "[core {}] psr write {:08X} -> {:08X} (crmv pc=0x{:08X})",
+            self.core_id,
+            self.cregfile[0],
+            value,
+            self.pc
+          );
+        }
+        self.cregfile[idx] = value;
+      }
+    }
+  }
+
+  // Kernel mode is derived from the PSR (cr0) depth, not a cached flag.
+  fn get_kmode(&self) -> bool {
+    self.cregfile[0] != 0
+  }
+
+  fn psr_inc_checked(&mut self, reason: &str) {
+    if self.cregfile[0] == u32::MAX {
+      panic!("too many nested exceptions!");
+    }
+    let old = self.cregfile[0];
+    self.cregfile[0] = self.cregfile[0].wrapping_add(1);
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      println!(
+        "[core {}] psr inc {:08X} -> {:08X} ({} pc=0x{:08X})",
+        self.core_id,
+        old,
+        self.cregfile[0],
+        reason,
+        self.pc
+      );
+    }
+  }
+
+  fn psr_dec(&mut self, reason: &str) {
+    let old = self.cregfile[0];
+    self.cregfile[0] = self.cregfile[0].wrapping_sub(1);
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      println!(
+        "[core {}] psr dec {:08X} -> {:08X} ({} pc=0x{:08X})",
+        self.core_id,
+        old,
+        self.cregfile[0],
+        reason,
+        self.pc
+      );
+    }
+  }
+
+  fn memmap_region(paddr: u32) -> Option<&'static str> {
+    if paddr >= KERNEL_TEXT_START && paddr < KERNEL_TEXT_END {
+      Some("kernel_text")
+    } else if paddr >= KERNEL_RODATA_START && paddr < KERNEL_RODATA_END {
+      Some("kernel_rodata")
+    } else if paddr >= KERNEL_DATA_START && paddr < KERNEL_DATA_END {
+      Some("kernel_data")
+    } else if paddr >= KERNEL_BSS_START && paddr < KERNEL_BSS_END {
+      Some("kernel_bss")
+    } else if paddr >= KERNEL_INT_STACK_START && paddr < KERNEL_INT_STACK_END {
+      Some("kernel_int_stack")
+    } else if paddr >= KERNEL_STACK_START && paddr < KERNEL_STACK_END {
+      Some("kernel_stack")
+    } else if paddr >= BIOS_START && paddr < BIOS_END {
+      Some("bios")
+    } else if paddr >= IVT_START && paddr < IVT_END {
+      Some("ivt")
+    } else {
+      None
+    }
+  }
+
+  fn warn_on_write(region: &str) -> bool {
+    matches!(region, "kernel_text" | "kernel_rodata" | "bios" | "ivt")
+  }
+
+  fn maybe_log_memmap_write(&self, vaddr: u32, paddr: u32, size: u8) {
+    if !TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      return;
+    }
+    if let Some(region) = Self::memmap_region(paddr) {
+      if Self::warn_on_write(region) {
+        println!(
+          "[core {}] Warning: write to {} vaddr=0x{:08X} paddr=0x{:08X} size={} pc=0x{:08X}",
+          self.core_id,
+          region,
+          vaddr,
+          paddr,
+          size,
+          self.pc
+        );
+      }
     }
   }
 
@@ -1076,17 +1187,18 @@ impl Emulator {
   }
 
   fn convert_mem_address(&self, addr : u32, operation : u32) -> Option<u32> {
-    if self.kmode {
+    let kmode = self.get_kmode();
+    if kmode {
       if addr <= PHYSMEM_MAX {
         Some(addr)
-      } else if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, self.kmode) {
+      } else if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, kmode) {
         Some(result | (addr & 0xFFF))
       } else {
         // TLB_KMISS
         None
       }
     } else {
-      if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, self.kmode) {
+      if let Some(result) = self.tlb.access(self.cregfile[1], addr >> 12, operation, kmode) {
         Some(result | (addr & 0xFFF))
       } else {
         // TLB_UMISS
@@ -1112,26 +1224,32 @@ impl Emulator {
     // TLB_UMISS = 0x82
     // TLB_KMISS = 0x83
 
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      let kmode = self.get_kmode();
+      println!(
+        "[core {}] exception tlb_{}miss addr=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
+        self.core_id,
+        if kmode { "k" } else { "u" },
+        addr,
+        self.pc,
+        self.cregfile[0]
+      );
+    }
+
     // save address and pid that caused exception
     self.cregfile[7] = (addr >> 12) | (self.cregfile[1] << 20);
 
     self.save_state();
 
-    if self.cregfile[0] == u32::MAX {
-      panic!("too many nested exceptions!");
-    }
-
-    if self.kmode {
+    if self.get_kmode() {
       if self.isp_depth == u32::MAX {
         panic!("ISP depth overflow");
       }
       self.isp_depth += 1;
-      self.kmode = true;
-      self.cregfile[0] += 1;
+      self.psr_inc_checked("tlb_kmiss");
       self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
     } else {
-      self.kmode = true;
-      self.cregfile[0] += 1;
+      self.psr_inc_checked("tlb_umiss");
       self.pc = self.mem_read32(0x82 * 4).expect("shouldnt fail");
     }
   }
@@ -1147,6 +1265,7 @@ impl Emulator {
     let addr = self.convert_mem_address(addr, 1);
 
     if let Some(addr) = addr {
+      self.maybe_log_memmap_write(vaddr, addr, 1);
       self.maybe_watch(vaddr, WatchAccess::Write, data);
       self.memory.write(addr, data);
       true
@@ -1174,6 +1293,14 @@ impl Emulator {
         return false;
       }
     }
+    for (i, paddr) in addrs.iter().enumerate() {
+      if let Some(region) = Self::memmap_region(*paddr) {
+        if Self::warn_on_write(region) {
+          self.maybe_log_memmap_write(addr + i as u32, *paddr, 2);
+          break;
+        }
+      }
+    }
     self.maybe_watch(addr, WatchAccess::Write, bytes[0]);
     self.maybe_watch(addr + 1, WatchAccess::Write, bytes[1]);
     self.memory.write_phys_bytes(&addrs, &bytes);
@@ -1197,6 +1324,14 @@ impl Emulator {
         *slot = paddr;
       } else {
         return false;
+      }
+    }
+    for (i, paddr) in addrs.iter().enumerate() {
+      if let Some(region) = Self::memmap_region(*paddr) {
+        if Self::warn_on_write(region) {
+          self.maybe_log_memmap_write(addr + i as u32, *paddr, 4);
+          break;
+        }
       }
     }
     for (i, byte) in bytes.iter().enumerate() {
@@ -1283,6 +1418,7 @@ impl Emulator {
     if read_addr != write_addr {
       return None;
     }
+    self.maybe_log_memmap_write(addr, write_addr, 4);
     let prev = self.memory.atomic_swap_u32(read_addr, value);
     let prev_bytes = prev.to_le_bytes();
     let new_bytes = value.to_le_bytes();
@@ -1304,6 +1440,7 @@ impl Emulator {
     if read_addr != write_addr {
       return None;
     }
+    self.maybe_log_memmap_write(addr, write_addr, 4);
     let prev = self.memory.atomic_add_u32(read_addr, value);
     let next = u32::wrapping_add(prev, value);
     let prev_bytes = prev.to_le_bytes();
@@ -1566,13 +1703,8 @@ impl Emulator {
 
       self.save_state();
 
-      if self.cregfile[0] == u32::MAX {
-        panic!("too many nested exceptions!");
-      }
-
       // enter kernel mode
-      self.cregfile[0] += 1;
-      self.kmode = true;
+      self.psr_inc_checked("interrupt");
       if self.isp_depth == u32::MAX {
         panic!("ISP depth overflow");
       }
@@ -1620,14 +1752,18 @@ impl Emulator {
   fn raise_exc_instr(&mut self){
     // exec_instr
 
-    self.save_state();
-
-    if self.cregfile[0] == u32::MAX {
-      panic!("too many nested exceptions!");
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      println!(
+        "[core {}] exception invalid_instr pc=0x{:08X} psr=0x{:08X}",
+        self.core_id,
+        self.pc,
+        self.cregfile[0]
+      );
     }
 
-    self.kmode = true;
-    self.cregfile[0] += 1;
+    self.save_state();
+
+    self.psr_inc_checked("invalid_instr");
 
     self.pc = self.mem_read32(0x80 * 4).expect("shouldn't fail");
     return;
@@ -1680,7 +1816,7 @@ impl Emulator {
   }
 
   fn get_reg(&self, regnum : u32) -> u32 {
-    if self.kmode && regnum == 31 {
+    if self.get_kmode() && regnum == 31 {
       // use ISP while handling interrupts or kernel TLB misses
       if self.isp_depth > 0 {
         self.cregfile[12]
@@ -1706,7 +1842,7 @@ impl Emulator {
   }
 
   fn write_reg(&mut self, regnum : u32, value : u32) {
-    if self.kmode && regnum == 31 {
+    if self.get_kmode() && regnum == 31 {
       // use ISP while handling interrupts or kernel TLB misses
       if self.isp_depth > 0 {
         self.cregfile[12] = value;
@@ -2397,11 +2533,7 @@ impl Emulator {
   fn syscall(&mut self, instr : u32){
     let imm = instr & 0xFF;
 
-    self.kmode = true;
-    if self.cregfile[0] == u32::MAX {
-      panic!("too many nested exceptions!");
-    }
-    self.cregfile[0] += 1;
+    self.psr_inc_checked("syscall");
 
     match imm {
       1 => {
@@ -2441,17 +2573,22 @@ impl Emulator {
 
 
   fn kernel_instr(&mut self, instr : u32){
-    if !self.kmode {
+    if !self.get_kmode() {
       // exec_priv
       assert!(self.cregfile[0] == 0);
 
+      if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+        println!(
+          "[core {}] exception priv pc=0x{:08X} psr=0x{:08X}",
+          self.core_id,
+          self.pc,
+          self.cregfile[0]
+        );
+      }
+
       self.save_state();
 
-      self.kmode = true;
-      if self.cregfile[0] == u32::MAX {
-        panic!("too many nested exceptions!");
-      }
-      self.cregfile[0] += 1;
+      self.psr_inc_checked("priv");
 
       self.pc = self.mem_read32(0x81 * 4).expect("shouldn't fail");
       return;
@@ -2577,11 +2714,16 @@ impl Emulator {
   }
 
   fn rfe(&mut self, instr : u32) {
-    // update kernel mode
-    self.cregfile[0] -= 1;
-    if self.cregfile[0] == 0 {
-      self.kmode = false;
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      println!(
+        "[core {}] rfe/rfi instr=0x{:08X} pc=0x{:08X}",
+        self.core_id,
+        instr,
+        self.pc
+      );
     }
+    // update kernel mode
+    self.psr_dec("rfe/rfi");
 
     if ((instr >> 11) & 1) == 1 {
       // was rfi
@@ -2600,16 +2742,20 @@ impl Emulator {
   }
 
   fn rft(&mut self, _instr : u32) {
+    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+      println!(
+        "[core {}] rft pc=0x{:08X}",
+        self.core_id,
+        self.pc
+      );
+    }
     // Return from kernel TLB miss.
     if self.isp_depth > 0 {
       self.isp_depth -= 1;
     }
 
     // update kernel mode (same semantics as rfe)
-    self.cregfile[0] -= 1;
-    if self.cregfile[0] == 0 {
-      self.kmode = false;
-    }
+    self.psr_dec("rft");
 
     // restore pc
     self.pc = self.cregfile[4];

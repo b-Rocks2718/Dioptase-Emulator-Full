@@ -644,7 +644,7 @@ impl Emulator {
   }
 
   fn print_regs(&self) {
-    println!("pc: {:08X} kmode: {}", self.pc, self.kmode);
+    println!("pc: {:08X} kmode: {}", self.pc, self.get_kmode());
     for row in 0..8 {
       let base = row * 4;
       let r0 = self.get_reg(base as u32);
@@ -669,7 +669,7 @@ impl Emulator {
   }
 
   fn print_cregs(&self) {
-    println!("kmode: {}", self.kmode);
+    println!("kmode: {}", self.get_kmode());
     println!("cr0 (psr): {:08X}", self.read_creg(0));
     println!("cr1 (pid): {:08X}", self.read_creg(1));
     println!("cr2 (isr): {:08X}", self.read_creg(2));

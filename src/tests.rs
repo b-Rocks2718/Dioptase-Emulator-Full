@@ -479,16 +479,6 @@ fn ksp() {
 }
 
 #[test]
-fn isp() {
-  run_test("tests/asm/isp.s", 0x8100);
-}
-
-#[test]
-fn rft() {
-  run_test("tests/asm/rft.s", 0x8100);
-}
-
-#[test]
 fn tlb_flags_r() {
   run_test("tests/asm/tlb_flags_r.s", 67);
 }
@@ -527,4 +517,9 @@ fn atomic_swap() {
 #[test]
 fn carry() {
   run_test("tests/asm/carry.s", 42);
+}
+
+#[test]
+fn isa(){
+  run_test("tests/asm/isa.s", 126);
 }

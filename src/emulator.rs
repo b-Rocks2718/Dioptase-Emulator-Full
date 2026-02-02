@@ -669,7 +669,7 @@ impl RunShared {
 
 pub struct Emulator {
   regfile : [u32; 32], // r0 - r31
-  cregfile : [u32; 14], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, ISP, ISP_DEPTH
+  cregfile : [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, ISA
   // in FLG, flags are: carry | zero | sign | overflow
   memory : Arc<Memory>,
   interrupts: Arc<InterruptController>,
@@ -995,7 +995,7 @@ impl Emulator {
     use_uart_rx: bool,
     core_id: u32,
   ) -> Emulator {
-    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
+    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
     // CID is a read-only core identifier.
     cregfile[9] = core_id;
     if core_id != 0 {
@@ -1051,17 +1051,8 @@ impl Emulator {
       // ISR and MBI are core-local control registers.
       2 => self.read_isr(),
       10 => self.read_mbi(),
-      13 => self.cregfile[13],
       _ => self.cregfile[idx],
     }
-  }
-
-  fn isp_depth(&self) -> u32 {
-    self.cregfile[13]
-  }
-
-  fn set_isp_depth(&mut self, value: u32) {
-    self.cregfile[13] = value;
   }
 
   fn write_creg(&mut self, idx: usize, value: u32) {
@@ -1073,10 +1064,7 @@ impl Emulator {
         println!("Warning: attempt to write read-only CID register");
       }
       10 => self.write_mbi(value),
-      13 => {
-        // ISP depth is architecturally visible and writable.
-        self.set_isp_depth(value);
-      }
+
       _ => {
         if idx == 0 && TRACE_INTERRUPTS.load(Ordering::Relaxed) {
           println!(
@@ -1252,10 +1240,6 @@ impl Emulator {
     self.save_state();
 
     if self.get_kmode() {
-      if self.isp_depth() == u32::MAX {
-        panic!("ISP depth overflow");
-      }
-      self.set_isp_depth(self.isp_depth().wrapping_add(1));
       self.psr_inc_checked("tlb_kmiss");
       self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
     } else {
@@ -1715,10 +1699,6 @@ impl Emulator {
 
       // enter kernel mode
       self.psr_inc_checked("interrupt");
-      if self.isp_depth() == u32::MAX {
-        panic!("ISP depth overflow");
-      }
-      self.set_isp_depth(self.isp_depth().wrapping_add(1));
 
       // disable interrupts
       self.cregfile[3] &= 0x7FFFFFFF;
@@ -1828,11 +1808,7 @@ impl Emulator {
   fn get_reg(&self, regnum : u32) -> u32 {
     if self.get_kmode() && regnum == 31 {
       // use ISP while handling interrupts or kernel TLB misses
-      if self.isp_depth() > 0 {
-        self.cregfile[12]
-      } else {
-        self.cregfile[8]
-      }
+      self.cregfile[8]
     } else {
       // normal register access
       self.regfile[regnum as usize]
@@ -1854,11 +1830,7 @@ impl Emulator {
   fn write_reg(&mut self, regnum : u32, value : u32) {
     if self.get_kmode() && regnum == 31 {
       // use ISP while handling interrupts or kernel TLB misses
-      if self.isp_depth() > 0 {
-        self.cregfile[12] = value;
-      } else {
-        self.cregfile[8] = value;
-      }
+      self.cregfile[8] = value;
     } else {
       // normal register access
       if regnum != 0 {
@@ -2614,7 +2586,7 @@ impl Emulator {
       2 => self.mode_op(instr),
       3 => self.rfe(instr),
       4 => self.ipi_op(instr),
-      5 => self.rft(instr),
+      5 => self.isa_op(instr),
       _ => {
         self.raise_exc_instr();
         return;
@@ -2739,9 +2711,6 @@ impl Emulator {
       // was rfi
       // re-enable interrupts
       self.cregfile[3] |= 0x80000000;
-      if self.isp_depth() > 0 {
-        self.set_isp_depth(self.isp_depth().wrapping_sub(1));
-      }
     }
 
     // restore pc
@@ -2751,27 +2720,21 @@ impl Emulator {
     self.cregfile[5] = self.cregfile[6];
   }
 
-  fn rft(&mut self, _instr : u32) {
-    if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-      println!(
-        "[core {}] rft pc=0x{:08X}",
-        self.core_id,
-        self.pc
-      );
+  fn isa_op(&mut self, instr : u32) {
+    let op = (instr >> 11) & 1;
+    let ra = (instr >> 22) & 0x1F;
+    let imm = instr & 0x7FF;
+
+    if op == 0 {
+      // store
+      self.mem_write32(self.cregfile[12] + imm, self.get_reg(ra));
+    } else {
+      // load
+      let load = self.mem_read32(self.cregfile[12] + imm).expect("isa reg translation failed");
+      self.write_reg(ra, load);
     }
-    // Return from kernel TLB miss.
-    if self.isp_depth() > 0 {
-      self.set_isp_depth(self.isp_depth().wrapping_sub(1));
-    }
 
-    // update kernel mode (same semantics as rfe)
-    self.psr_dec("rft");
-
-    // restore pc
-    self.pc = self.cregfile[4];
-
-    // restore flags
-    self.cregfile[5] = self.cregfile[6];
+    self.pc += 4;
   }
 }
 

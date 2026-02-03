@@ -669,7 +669,7 @@ impl RunShared {
 
 pub struct Emulator {
   regfile : [u32; 32], // r0 - r31
-  cregfile : [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, ISA
+  cregfile : [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO
   // in FLG, flags are: carry | zero | sign | overflow
   memory : Arc<Memory>,
   interrupts: Arc<InterruptController>,
@@ -995,7 +995,7 @@ impl Emulator {
     use_uart_rx: bool,
     core_id: u32,
   ) -> Emulator {
-    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
+    let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
     // CID is a read-only core identifier.
     cregfile[9] = core_id;
     if core_id != 0 {
@@ -2586,7 +2586,6 @@ impl Emulator {
       2 => self.mode_op(instr),
       3 => self.rfe(instr),
       4 => self.ipi_op(instr),
-      5 => self.isa_op(instr),
       _ => {
         self.raise_exc_instr();
         return;
@@ -2720,22 +2719,6 @@ impl Emulator {
     self.cregfile[5] = self.cregfile[6];
   }
 
-  fn isa_op(&mut self, instr : u32) {
-    let op = (instr >> 11) & 1;
-    let ra = (instr >> 22) & 0x1F;
-    let imm = instr & 0x7FF;
-
-    if op == 0 {
-      // store
-      self.mem_write32(self.cregfile[12] + imm, self.get_reg(ra));
-    } else {
-      // load
-      let load = self.mem_read32(self.cregfile[12] + imm).expect("isa reg translation failed");
-      self.write_reg(ra, load);
-    }
-
-    self.pc += 4;
-  }
 }
 
 fn run_core_loop(

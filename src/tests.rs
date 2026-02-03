@@ -518,8 +518,3 @@ fn atomic_swap() {
 fn carry() {
   run_test("tests/asm/carry.s", 42);
 }
-
-#[test]
-fn isa(){
-  run_test("tests/asm/isa.s", 126);
-}

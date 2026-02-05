@@ -1507,14 +1507,18 @@ impl Emulator {
     let mut graphics: Option<Graphics> = None;
     if with_graphics {
       graphics = Some(Graphics::new(
-        self.memory.get_frame_buffer(), 
+        self.memory.get_pixel_frame_buffer(), 
+        self.memory.get_tile_frame_buffer(),
         self.memory.get_tile_map(), 
         self.memory.get_io_buffer(),
-        self.memory.get_vscroll_register(),
-        self.memory.get_hscroll_register(),
+        self.memory.get_tile_vscroll_register(),
+        self.memory.get_tile_hscroll_register(),
+        self.memory.get_pixel_vscroll_register(),
+        self.memory.get_pixel_hscroll_register(),
         self.memory.get_sprite_map(),
-        self.memory.get_scale_register(),
-        self.memory.get_vga_mode_register(),
+        self.memory.get_tile_scale_register(),
+        self.memory.get_pixel_scale_register(),
+        self.memory.get_sprite_scale_registers(),
         self.memory.get_vga_status_register(),
         self.memory.get_vga_frame_register(),
         self.memory.get_pending_interrupt()
@@ -1589,14 +1593,18 @@ impl Emulator {
     let mut graphics = None;
     if with_graphics {
       graphics = Some(Graphics::new(
-        memory.get_frame_buffer(),
+        memory.get_pixel_frame_buffer(),
+        memory.get_tile_frame_buffer(),
         memory.get_tile_map(),
         memory.get_io_buffer(),
-        memory.get_vscroll_register(),
-        memory.get_hscroll_register(),
+        memory.get_tile_vscroll_register(),
+        memory.get_tile_hscroll_register(),
+        memory.get_pixel_vscroll_register(),
+        memory.get_pixel_hscroll_register(),
         memory.get_sprite_map(),
-        memory.get_scale_register(),
-        memory.get_vga_mode_register(),
+        memory.get_tile_scale_register(),
+        memory.get_pixel_scale_register(),
+        memory.get_sprite_scale_registers(),
         memory.get_vga_status_register(),
         memory.get_vga_frame_register(),
         memory.get_pending_interrupt(),

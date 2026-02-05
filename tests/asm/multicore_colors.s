@@ -6,7 +6,7 @@
 
   .global _start
   .define TILEMAP_ADDR 0x7FE8000
-  .define FRAMEBUFFER_ADDR 0x7FC0000
+  .define TILE_FRAMEBUFFER_ADDR 0x7FBD000
   .define SCALE_REG_ADDR 0x7FE5B44
   .define HSCROLL_ADDR 0x7FE5B40
   .define VSCROLL_ADDR 0x7FE5B42
@@ -25,6 +25,10 @@
   .define KEY_X 120
   .define KEY_Z 122
   .define KEY_Q 113
+
+  .define PS2_INT 0x3C4
+  .define PIT_INT 0x3C0
+  .define IPI_INT 0x3D4
 
 INT_KEYBOARD:
   # check key
@@ -163,9 +167,24 @@ SQUARE_INDEX:
   .fill 0
 
 COLOR: 
-  .fill 0xFF00FF00
+  .fill 0xFD04FD04
 
 _start:
+  # register the keyboard interrupt handler
+  movi r1, PS2_INT
+  adpc r2, INT_KEYBOARD
+  swa  r2, [r1]
+
+  # register the timer interrupt handler
+  movi r1, PIT_INT
+  adpc r2, INT_TIMER
+  swa  r2, [r1]
+
+  # register the IPI handler
+  movi r1, IPI_INT
+  adpc r2, INT_IPI
+  swa  r2, [r1]
+
   # initialize stack
   movi r1, 0x10000
   movi r2, 0x10000
@@ -197,6 +216,8 @@ set_color:
   movi r8, TILEMAP_ADDR
   add  r8, r8, 128 
   lw   r6,  [COLOR]
+  movi r7, 0x0FFF
+  and  r6, r6, r7
 
   movi r10, 64
 draw_tile_loop:
@@ -205,11 +226,12 @@ draw_tile_loop:
   bnz  draw_tile_loop
 
 draw_square:
-  movi r8, FRAMEBUFFER_ADDR
+  movi r8, TILE_FRAMEBUFFER_ADDR
   lw   r9, [SQUARE_INDEX]
+  add  r9, r9, r9
   add  r8, r8, r9
   movi r5, 1
-  sba  r5, [r8]
+  sda  r5, [r8]
 
   # enable interrupts
   mov  r3, imr

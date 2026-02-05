@@ -4,13 +4,16 @@
   # uses interrupts to accomplish this
 
   .define TILEMAP_ADDR 0x7FE8000
-  .define FRAMEBUFFER_ADDR 0x7FC0000
+  .define TILE_FRAMEBUFFER_ADDR 0x7FBD000
   .define SCALE_REG_ADDR 0x7FE5B44
   .define HSCROLL_ADDR 0x7FE5B40
   .define VSCROLL_ADDR 0x7FE5B42
   .define PIT_ADDR 0x7FE5804
 
   .define PS2_ADDR 0x7FE5800
+
+  .define PS2_INT 0x3C4
+  .define PIT_INT 0x3C0
 
   .define KEY_W 119
   .define KEY_A 97
@@ -23,6 +26,74 @@
   .define KEY_X 120
   .define KEY_Z 122
   .define KEY_Q 113
+
+SQUARE_INDEX:
+  .fill 0
+
+COLOR: 
+  .fill 0xFF00FF00
+
+  .global _start
+_start:
+  # register the keyboard interrupt handler
+  movi r1, PS2_INT
+  adpc r2, INT_KEYBOARD
+  swa  r2, [r1]
+
+  # register the timer interrupt handler
+  movi r1, PIT_INT
+  adpc r2, INT_TIMER
+  swa  r2, [r1]
+
+  # initialize stack
+  movi r1, 0x1000
+  movi r2, 0x1000
+
+  # set timer
+  movi r4, PIT_ADDR
+  movi r3, 50000
+  swa  r3, [r4]
+
+  # set imr
+  movi r3, 0x0000000F
+  mov  imr, r3
+
+  # set square reg
+  movi r3, SCALE_REG_ADDR
+  movi r4, 1
+  sba  r4, [r3]
+
+set_color:
+  movi r8, TILEMAP_ADDR
+  add  r8, r8, 128 
+  lw   r6,  [COLOR]
+  movi r7, 0x0FFF # mask to 12 bits so we don't accidentally make it transparent
+  and  r6, r6, r7
+
+  movi r10, 64
+draw_tile_loop:
+  sda  r6, [r8], 2
+  add  r10, r10, -1
+  bnz  draw_tile_loop
+
+draw_square:
+  movi r8, TILE_FRAMEBUFFER_ADDR
+  lw   r9, [SQUARE_INDEX]
+  add  r9, r9, r9
+  add  r8, r8, r9
+  movi r5, 1
+  sda  r5, [r8]
+
+  # enable interrupts
+  mov  r3, imr
+  movi r4, 0x80000000
+  or   r3, r4, r3
+  mov  imr, r3
+
+  # wait for keypress
+  mode sleep
+  mode halt # should never run
+
 
 INT_KEYBOARD:
 
@@ -157,57 +228,3 @@ INT_TIMER:
 
   # return from the interrupt
   jmp  set_color
-
-SQUARE_INDEX:
-  .fill 0
-
-COLOR: 
-  .fill 0xFF00FF00
-
-  .global _start
-_start:
-  # initialize stack
-  movi r1, 0x1000
-  movi r2, 0x1000
-
-  # set timer
-  movi r4, PIT_ADDR
-  movi r3, 50000
-  swa  r3, [r4]
-
-  # set imr
-  movi r3, 0x0000000F
-  mov  imr, r3
-
-  # set square reg
-  movi r3, SCALE_REG_ADDR
-  movi r4, 1
-  sba  r4, [r3]
-
-set_color:
-  movi r8, TILEMAP_ADDR
-  add  r8, r8, 128 
-  lw   r6,  [COLOR]
-
-  movi r10, 64
-draw_tile_loop:
-  sda  r6, [r8], 2
-  add  r10, r10, -1
-  bnz  draw_tile_loop
-
-draw_square:
-  movi r8, FRAMEBUFFER_ADDR
-  lw   r9, [SQUARE_INDEX]
-  add  r8, r8, r9
-  movi r5, 1
-  sba  r5, [r8]
-
-  # enable interrupts
-  mov  r3, imr
-  movi r4, 0x80000000
-  or   r3, r4, r3
-  mov  imr, r3
-
-  # wait for keypress
-  mode sleep
-  mode halt # should never run

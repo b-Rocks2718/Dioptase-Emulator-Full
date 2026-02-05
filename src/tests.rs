@@ -124,7 +124,7 @@ fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
   assert_eq!(result, Some(expected));
 }
 
-// I/O tests that must be run manually (10):
+// I/O tests that must be run manually (12):
 // cdiv.s (run with --vga)
 // colors.s (--vga)
 // multicore_colors.s (--vga --cores 4)
@@ -132,10 +132,12 @@ fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
 // ps2.s (--vga)
 // sleep.s (--vga)
 // sprite.s (--vga)
+// tile_colors.s (--vga)
 // uart.s
 // uart_rx.s (--vga --uart)
 // pixels.s (--vga)
 // vblank.s (--vga)
+// tile_colors.s (--vga)
 
 #[test]
 fn and() {

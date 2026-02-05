@@ -10,10 +10,12 @@ pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
 pub const FRAME_WIDTH: u32 = 640;
 pub const FRAME_HEIGHT: u32 = 480;
 pub const TILE_WIDTH: u32 = 8;
-// const TILES_NUM: u32 = 128;
+pub const PIXEL_FRAME_WIDTH: u32 = FRAME_WIDTH / 2;
+pub const PIXEL_FRAME_HEIGHT: u32 = FRAME_HEIGHT / 2;
+// const TILES_NUM: u32 = 256;
 const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH * 2;
 pub const SPRITE_WIDTH: u32 = 32;
-// const SPRITES_NUM: u32 = 8;
+// const SPRITES_NUM: u32 = 16;
 const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
 
 // SD card DMA engine (no data buffer). DMA transfers 4 bytes per device tick.
@@ -23,16 +25,25 @@ pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
 pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
 pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
 
-const FRAME_BUFFER_START : u32 = 0x7FC0000;
-const FRAME_BUFFER_SIZE : u32 = 0x25800; // 320 * 240 * 2 bytes
+const PIXEL_FRAME_BUFFER_START: u32 = 0x7FC0000;
+const PIXEL_FRAME_BUFFER_SIZE: u32 = PIXEL_FRAME_WIDTH * PIXEL_FRAME_HEIGHT * 2;
+const TILE_FRAME_BUFFER_WIDTH_TILES: u32 = FRAME_WIDTH / TILE_WIDTH;
+const TILE_FRAME_BUFFER_HEIGHT_TILES: u32 = FRAME_HEIGHT / TILE_WIDTH;
+// Two bytes per tile entry (index + color) in an 80x60 grid.
+const TILE_FRAME_BUFFER_SIZE: u32 =
+    TILE_FRAME_BUFFER_WIDTH_TILES * TILE_FRAME_BUFFER_HEIGHT_TILES * 2;
+// Align the tile framebuffer to the 4KB page size for TLB mappings.
+const TILE_FRAME_BUFFER_START: u32 =
+    (PIXEL_FRAME_BUFFER_START - TILE_FRAME_BUFFER_SIZE) & !0xFFF;
+const IO_START: u32 = TILE_FRAME_BUFFER_START;
 
 const PS2_STREAM : u32 = 0x7FE5800;
 const UART_TX : u32 = 0x7FE5802;
 const UART_RX : u32 = 0x7FE5803;
 pub const PIT_START : u32 = 0x7FE5804;
 
-const SD_DMA_MEM_ADDR : u32 = 0x7FE58F0;
-const SD2_DMA_MEM_ADDR : u32 = 0x7FE5908;
+const SD_DMA_MEM_ADDR: u32 = 0x7FE5810;
+const SD2_DMA_MEM_ADDR: u32 = 0x7FE5828;
 
 const SD_DMA_OFFSET_MEM_ADDR: u32 = 0x0;
 const SD_DMA_OFFSET_SD_BLOCK: u32 = 0x4;
@@ -54,15 +65,20 @@ const SD_DMA_ERR_NONE: u32 = 0;
 const SD_DMA_ERR_BUSY: u32 = 1;
 const SD_DMA_ERR_ZERO_LEN: u32 = 2;
 
-const SPRITE_REGISTERS_START : u32 = 0x7FE5B00;  // every consecutive pair of words correspond to 
+const SPRITE_COUNT: u32 = 16;
+const SPRITE_REGISTERS_START : u32 = 0x7FE5B00;  // every consecutive pair of words correspond to
 const SPRITE_REGISTERS_SIZE : u32 = 0x40;     // the y and x coordinates, respectively of a sprite
 
-const H_SCROLL_START : u32 = 0x7FE5B40;
-const V_SCROLL_START : u32 = 0x7FE5B42;
+const TILE_H_SCROLL_START: u32 = 0x7FE5B40;
+const TILE_V_SCROLL_START: u32 = 0x7FE5B42;
+const TILE_SCALE_REGISTER_START: u32 = 0x7FE5B44; // each tile pixel is repeated 2^n times
 
-const SCALE_REGISTER_START : u32 = 0x7FE5B44; // each pixel is repeated 2^n times
+const PIXEL_H_SCROLL_START: u32 = 0x7FE5B50;
+const PIXEL_V_SCROLL_START: u32 = 0x7FE5B52;
+const PIXEL_SCALE_REGISTER_START: u32 = 0x7FE5B54; // each pixel is repeated 2^n times
 
-const VGA_MODE_REGISTER_START : u32 = 0x7FE5B45;
+const SPRITE_SCALE_START: u32 = 0x7FE5B60;
+const SPRITE_SCALE_SIZE: u32 = SPRITE_COUNT;
 const VGA_STATUS_REGISTER_START : u32 = 0x7FE5B46;
 const VGA_FRAME_REGISTER_START : u32 = 0x7FE5B48;
 
@@ -76,13 +92,17 @@ const SPRITE_MAP_SIZE : u32 = 0x8000;
 
 pub struct Memory {
   ram: Mutex<HashMap<u32, u8>>,
-  frame_buffer: Arc<RwLock<FrameBuffer>>,
+  pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
+  tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
   tile_map: Arc<RwLock<TileMap>>, 
   io_buffer: Arc<RwLock<VecDeque<u16>>>,
-  vscroll_register: Arc<RwLock<(u8, u8)>>,
-  hscroll_register: Arc<RwLock<(u8, u8)>>,
-  scale_register: Arc<RwLock<u8>>,
-  vga_mode_register: Arc<RwLock<u8>>,
+  tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
+  tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
+  pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
+  pixel_hscroll_register: Arc<RwLock<(u8, u8)>>,
+  tile_scale_register: Arc<RwLock<u8>>,
+  pixel_scale_register: Arc<RwLock<u8>>,
+  sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
   vga_status_register: Arc<RwLock<u8>>,
   vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
   clk_register: Arc<RwLock<(u8, u8, u8, u8)>>,
@@ -95,13 +115,22 @@ pub struct Memory {
   use_uart_rx: bool
 }
 
-// an 80x60 framebuffer of 8-bit tile values
-pub struct FrameBuffer {
-    pub width_pixels: u32,
-    pub height_pixels: u32,
+// Purpose: tile layer for the VGA output (two bytes per tile entry).
+// Inputs/outputs: MMIO reads/writes map to raw bytes; rendering uses tile index + color.
+// Invariants: entries length matches the MMIO-mapped byte size; width/height in tiles.
+pub struct TileFrameBuffer {
     pub width_tiles: u32, // number of tiles in the x direction
     pub height_tiles: u32, // number of tiles in the y direction
-    tile_ptrs: Vec<u8>,
+    entries: Vec<u8>,
+}
+
+// Purpose: pixel layer for the VGA output (16-bit little-endian pixels).
+// Inputs/outputs: MMIO reads/writes map to raw bytes; rendering reads u16 pixels.
+// Invariants: byte length == width_pixels * height_pixels * 2.
+pub struct PixelFrameBuffer {
+    pub width_pixels: u32,
+    pub height_pixels: u32,
+    bytes: Vec<u8>,
 }
 
 pub struct TileMap {
@@ -302,13 +331,25 @@ impl Memory {
 
         Memory {
             ram: Mutex::new(ram),
-            frame_buffer: Arc::new(RwLock::new(FrameBuffer::new(FRAME_WIDTH, FRAME_HEIGHT))),
+            pixel_frame_buffer: Arc::new(RwLock::new(PixelFrameBuffer::new(
+                PIXEL_FRAME_WIDTH,
+                PIXEL_FRAME_HEIGHT,
+                PIXEL_FRAME_BUFFER_SIZE,
+            ))),
+            tile_frame_buffer: Arc::new(RwLock::new(TileFrameBuffer::new(
+                FRAME_WIDTH,
+                FRAME_HEIGHT,
+                TILE_FRAME_BUFFER_SIZE,
+            ))),
             tile_map: Arc::new(RwLock::new(TileMap::new(TILE_MAP_SIZE))),
             io_buffer: Arc::new(RwLock::new(VecDeque::new())),
-            vscroll_register: Arc::new(RwLock::new((0, 0))),
-            hscroll_register: Arc::new(RwLock::new((0, 0))),
-            scale_register: Arc::new(RwLock::new(0)),
-            vga_mode_register: Arc::new(RwLock::new(0)),
+            tile_vscroll_register: Arc::new(RwLock::new((0, 0))),
+            tile_hscroll_register: Arc::new(RwLock::new((0, 0))),
+            pixel_vscroll_register: Arc::new(RwLock::new((0, 0))),
+            pixel_hscroll_register: Arc::new(RwLock::new((0, 0))),
+            tile_scale_register: Arc::new(RwLock::new(0)),
+            pixel_scale_register: Arc::new(RwLock::new(0)),
+            sprite_scale_registers: Arc::new(RwLock::new(vec![0; SPRITE_COUNT as usize])),
             vga_status_register: Arc::new(RwLock::new(0)),
             vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             clk_register: Arc::new(RwLock::new((0, 0, 0, 0))),
@@ -322,14 +363,36 @@ impl Memory {
         }
     }
 
-    pub fn get_frame_buffer(&self) -> Arc<RwLock<FrameBuffer>> { return Arc::clone(&self.frame_buffer)}
+    pub fn get_pixel_frame_buffer(&self) -> Arc<RwLock<PixelFrameBuffer>> {
+        Arc::clone(&self.pixel_frame_buffer)
+    }
+    pub fn get_tile_frame_buffer(&self) -> Arc<RwLock<TileFrameBuffer>> {
+        Arc::clone(&self.tile_frame_buffer)
+    }
     pub fn get_tile_map(&self) -> Arc<RwLock<TileMap>> { return Arc::clone(&self.tile_map)}
     pub fn get_io_buffer(&self) -> Arc<RwLock<VecDeque<u16>>> { return Arc::clone(&self.io_buffer) }
-    pub fn get_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> { return Arc::clone(&self.vscroll_register) }
-    pub fn get_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> { return Arc::clone(&self.hscroll_register) }
-    pub fn get_scale_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.scale_register) }
+    pub fn get_tile_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
+        Arc::clone(&self.tile_vscroll_register)
+    }
+    pub fn get_tile_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
+        Arc::clone(&self.tile_hscroll_register)
+    }
+    pub fn get_pixel_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
+        Arc::clone(&self.pixel_vscroll_register)
+    }
+    pub fn get_pixel_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
+        Arc::clone(&self.pixel_hscroll_register)
+    }
+    pub fn get_tile_scale_register(&self) -> Arc<RwLock<u8>> {
+        Arc::clone(&self.tile_scale_register)
+    }
+    pub fn get_pixel_scale_register(&self) -> Arc<RwLock<u8>> {
+        Arc::clone(&self.pixel_scale_register)
+    }
+    pub fn get_sprite_scale_registers(&self) -> Arc<RwLock<Vec<u8>>> {
+        Arc::clone(&self.sprite_scale_registers)
+    }
     pub fn get_sprite_map(&self) -> Arc<RwLock<SpriteMap>> { return Arc::clone(&self.sprite_map) }
-    pub fn get_vga_mode_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.vga_mode_register) }
     pub fn get_vga_status_register(&self) -> Arc<RwLock<u8>> { return Arc::clone(&self.vga_status_register) }
     pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> { return Arc::clone(&self.vga_frame_register) }
     pub fn get_pending_interrupt(&self) -> Arc<RwLock<u32>> { return Arc::clone(&self.pending_interrupt) }
@@ -460,8 +523,11 @@ impl Memory {
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             return self.tile_map.read().unwrap().get_tile_byte(addr - TILE_MAP_START);
         }
-        else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
-            return self.frame_buffer.read().unwrap().get_tile_pair(addr - FRAME_BUFFER_START);
+        else if addr >= TILE_FRAME_BUFFER_START && addr < TILE_FRAME_BUFFER_START + TILE_FRAME_BUFFER_SIZE {
+            return self.tile_frame_buffer.read().unwrap().get_byte(addr - TILE_FRAME_BUFFER_START);
+        }
+        else if addr >= PIXEL_FRAME_BUFFER_START && addr < PIXEL_FRAME_BUFFER_START + PIXEL_FRAME_BUFFER_SIZE {
+            return self.pixel_frame_buffer.read().unwrap().get_byte(addr - PIXEL_FRAME_BUFFER_START);
         }
         else if addr >= SD_DMA_MEM_ADDR && addr < SD_DMA_MEM_ADDR + SD_DMA_RANGE_SIZE {
             let sd = self.sd_card.read().unwrap();
@@ -487,23 +553,39 @@ impl Memory {
         else if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
             return self.sprite_map.read().unwrap().get_sprite_reg((addr - SPRITE_REGISTERS_START) as u32);
         }
-        else if addr == V_SCROLL_START {
-            return self.vscroll_register.read().unwrap().0;
+        else if addr == TILE_V_SCROLL_START {
+            return self.tile_vscroll_register.read().unwrap().0;
         }
-        else if addr == V_SCROLL_START + 1 {
-            return self.vscroll_register.read().unwrap().1;
+        else if addr == TILE_V_SCROLL_START + 1 {
+            return self.tile_vscroll_register.read().unwrap().1;
         }
-        else if addr == H_SCROLL_START {
-            return self.hscroll_register.read().unwrap().0;
+        else if addr == TILE_H_SCROLL_START {
+            return self.tile_hscroll_register.read().unwrap().0;
         }
-        else if addr == H_SCROLL_START + 1 {
-            return self.hscroll_register.read().unwrap().1;
+        else if addr == TILE_H_SCROLL_START + 1 {
+            return self.tile_hscroll_register.read().unwrap().1;
         }
-        else if addr == SCALE_REGISTER_START {
-            return *self.scale_register.read().unwrap();
+        else if addr == TILE_SCALE_REGISTER_START {
+            return *self.tile_scale_register.read().unwrap();
         }
-        else if addr == VGA_MODE_REGISTER_START {
-            return *self.vga_mode_register.read().unwrap();
+        else if addr == PIXEL_V_SCROLL_START {
+            return self.pixel_vscroll_register.read().unwrap().0;
+        }
+        else if addr == PIXEL_V_SCROLL_START + 1 {
+            return self.pixel_vscroll_register.read().unwrap().1;
+        }
+        else if addr == PIXEL_H_SCROLL_START {
+            return self.pixel_hscroll_register.read().unwrap().0;
+        }
+        else if addr == PIXEL_H_SCROLL_START + 1 {
+            return self.pixel_hscroll_register.read().unwrap().1;
+        }
+        else if addr == PIXEL_SCALE_REGISTER_START {
+            return *self.pixel_scale_register.read().unwrap();
+        }
+        else if addr >= SPRITE_SCALE_START && addr < SPRITE_SCALE_START + SPRITE_SCALE_SIZE {
+            let idx = (addr - SPRITE_SCALE_START) as usize;
+            return self.sprite_scale_registers.read().unwrap()[idx];
         }
         else if addr == VGA_STATUS_REGISTER_START {
             return *self.vga_status_register.read().unwrap();
@@ -563,6 +645,10 @@ impl Memory {
             println!("Warning: reading from physical address 0x00000000");
         }
 
+        if addr >= IO_START {
+            panic!("read from unmapped IO address 0x{:08X}", addr);
+        }
+
         ram.get(&addr).copied().unwrap_or(0)
     }
 
@@ -602,12 +688,29 @@ impl Memory {
 
     fn write_internal(&self, addr: u32, data: u8, ram: &mut HashMap<u32, u8>) {
         assert!(addr <= PHYSMEM_MAX, "Physical memory address out of bounds: 0x{:08X}", addr);
-        
+
+        let mut handled = false;
+
         if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
-            self.tile_map.write().unwrap().set_tile_byte((addr - TILE_MAP_START) as u32, data);
+            self.tile_map
+                .write()
+                .unwrap()
+                .set_tile_byte((addr - TILE_MAP_START) as u32, data);
+            handled = true;
         }
-        else if addr >= FRAME_BUFFER_START && addr < FRAME_BUFFER_START + FRAME_BUFFER_SIZE {
-            self.frame_buffer.write().unwrap().set_tile_pair((addr - FRAME_BUFFER_START) as u32, data);
+        else if addr >= TILE_FRAME_BUFFER_START && addr < TILE_FRAME_BUFFER_START + TILE_FRAME_BUFFER_SIZE {
+            self.tile_frame_buffer
+                .write()
+                .unwrap()
+                .set_byte((addr - TILE_FRAME_BUFFER_START) as u32, data);
+            handled = true;
+        }
+        else if addr >= PIXEL_FRAME_BUFFER_START && addr < PIXEL_FRAME_BUFFER_START + PIXEL_FRAME_BUFFER_SIZE {
+            self.pixel_frame_buffer
+                .write()
+                .unwrap()
+                .set_byte((addr - PIXEL_FRAME_BUFFER_START) as u32, data);
+            handled = true;
         }
         else if self.write_sd_dma_mmio(
             addr,
@@ -633,57 +736,95 @@ impl Memory {
         else if addr == UART_TX {
             print!("{}", data as char);
             io::stdout().flush().unwrap();
+            handled = true;
         }
         else if addr == UART_RX {
             panic!("attempting to write input port (address {:X})", UART_RX);
         }
-        else if addr == V_SCROLL_START {
-            self.vscroll_register.write().unwrap().0 = data;
+        else if addr == TILE_V_SCROLL_START {
+            self.tile_vscroll_register.write().unwrap().0 = data;
+            handled = true;
         }
-        else if addr == V_SCROLL_START + 1 {
-            self.vscroll_register.write().unwrap().1 = data;
+        else if addr == TILE_V_SCROLL_START + 1 {
+            self.tile_vscroll_register.write().unwrap().1 = data;
+            handled = true;
         }
-        else if addr == H_SCROLL_START {
-            self.hscroll_register.write().unwrap().0 = data;
+        else if addr == TILE_H_SCROLL_START {
+            self.tile_hscroll_register.write().unwrap().0 = data;
+            handled = true;
         }
-        else if addr == H_SCROLL_START + 1 {
-            self.hscroll_register.write().unwrap().1 = data;
+        else if addr == TILE_H_SCROLL_START + 1 {
+            self.tile_hscroll_register.write().unwrap().1 = data;
+            handled = true;
         }
-        else if addr == SCALE_REGISTER_START {
-            *self.scale_register.write().unwrap() = data;
+        else if addr == TILE_SCALE_REGISTER_START {
+            *self.tile_scale_register.write().unwrap() = data;
+            handled = true;
+        }
+        else if addr == PIXEL_V_SCROLL_START {
+            self.pixel_vscroll_register.write().unwrap().0 = data;
+            handled = true;
+        }
+        else if addr == PIXEL_V_SCROLL_START + 1 {
+            self.pixel_vscroll_register.write().unwrap().1 = data;
+            handled = true;
+        }
+        else if addr == PIXEL_H_SCROLL_START {
+            self.pixel_hscroll_register.write().unwrap().0 = data;
+            handled = true;
+        }
+        else if addr == PIXEL_H_SCROLL_START + 1 {
+            self.pixel_hscroll_register.write().unwrap().1 = data;
+            handled = true;
+        }
+        else if addr == PIXEL_SCALE_REGISTER_START {
+            *self.pixel_scale_register.write().unwrap() = data;
+            handled = true;
+        }
+        else if addr >= SPRITE_SCALE_START && addr < SPRITE_SCALE_START + SPRITE_SCALE_SIZE {
+            let idx = (addr - SPRITE_SCALE_START) as usize;
+            self.sprite_scale_registers.write().unwrap()[idx] = data;
+            handled = true;
         }
         else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
             self.sprite_map.write().unwrap().set_sprite_byte((addr - SPRITE_MAP_START) as u32, data);
+            handled = true;
         }
         else if addr >= SPRITE_REGISTERS_START && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE {
             self.sprite_map.write().unwrap().set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
+            handled = true;
         }
         else if addr == PIT_START {
             self.pit.write().unwrap().0 = data;
+            handled = true;
         }
         else if addr == PIT_START + 1 {
             self.pit.write().unwrap().1 = data;
+            handled = true;
         }
         else if addr == PIT_START + 2 {
             self.pit.write().unwrap().2 = data;
+            handled = true;
         }
         else if addr == PIT_START + 3 {
             self.pit.write().unwrap().3 = data;
+            handled = true;
         }
         else if addr == CLK_REG_START {
             self.clk_register.write().unwrap().0 = data;
+            handled = true;
         }
         else if addr == CLK_REG_START + 1 {
             self.clk_register.write().unwrap().1 = data;
+            handled = true;
         }
         else if addr == CLK_REG_START + 2 {
             self.clk_register.write().unwrap().2 = data;
+            handled = true;
         }
         else if addr == CLK_REG_START + 3 {
             self.clk_register.write().unwrap().3 = data;
-        }
-        else if addr == VGA_MODE_REGISTER_START {
-            *self.vga_mode_register.write().unwrap() = data;
+            handled = true;
         }
         else if addr == VGA_STATUS_REGISTER_START {
             panic!("attempting to write read-only VGA status register (0x{:08X})", VGA_STATUS_REGISTER_START);
@@ -693,6 +834,10 @@ impl Memory {
         }
         else if addr == 0 {
             println!("Warning: writing to physical address 0x00000000: 0x{:08X}", data);
+        }
+
+        if addr >= IO_START && !handled {
+            panic!("write to unmapped IO address 0x{:08X}", addr);
         }
 
         ram.insert(addr, data);
@@ -810,52 +955,119 @@ impl Memory {
     }
 }
 
-impl FrameBuffer {
-    pub fn new(width_pixels: u32, height_pixels: u32) -> Self {
+impl TileFrameBuffer {
+    // Purpose: initialize the tile framebuffer with a fixed MMIO byte size.
+    // Inputs: screen dimensions in pixels and the total MMIO byte size.
+    // Outputs: a zeroed tile buffer; panics if the buffer is too small.
+    pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
         let width_tiles = width_pixels / TILE_WIDTH;
         let height_tiles = height_pixels / TILE_WIDTH;
-        FrameBuffer {
-            width_pixels,
-            height_pixels,
+        let tiles_needed = width_tiles * height_tiles;
+        let bytes_needed = tiles_needed * 2;
+        assert!(
+            size_bytes == bytes_needed,
+            "Tile framebuffer size mismatch: expected {} bytes, got {}",
+            bytes_needed,
+            size_bytes
+        );
+        TileFrameBuffer {
             width_tiles,
             height_tiles,
-            tile_ptrs: vec![0; (width_pixels * height_pixels) as usize],
+            entries: vec![0; size_bytes as usize],
         }
     }
 
-    pub fn set_tile_pair(&mut self, i: u32, tile_pair_value: u8) {
-        // we're packing 2 tile_ptrs into 1 word
-        if i < self.tile_ptrs.len() as u32 {
-            self.tile_ptrs[i as usize] = tile_pair_value;
+    // Purpose: store one MMIO byte into the tile framebuffer backing store.
+    // Inputs: byte offset and value.
+    // Outputs: updates tile_indices at the given offset.
+    pub fn set_byte(&mut self, offset: u32, value: u8) {
+        if offset < self.entries.len() as u32 {
+            self.entries[offset as usize] = value;
         } else {
-            panic!("Tile coordinates out of bounds: {}", i);
+            panic!("Tile framebuffer offset out of bounds: {}", offset);
         }
     }
 
-    pub fn get_tile_pair(&self, i: u32) -> u8 {
-        // we're packing 2 tile_ptrs into 1 word
-        if i < self.tile_ptrs.len() as u32 {
-            return self.tile_ptrs[i as usize];
+    // Purpose: read one MMIO byte from the tile framebuffer backing store.
+    // Inputs: byte offset.
+    // Outputs: stored byte value at the given offset.
+    pub fn get_byte(&self, offset: u32) -> u8 {
+        if offset < self.entries.len() as u32 {
+            self.entries[offset as usize]
         } else {
-            panic!("Tile coordinates out of bounds");
+            panic!("Tile framebuffer offset out of bounds: {}", offset);
         }
     }
 
-    pub fn get_pixel(&self, x: u32, y: u32) -> u16 {
-        if x < self.width_pixels && y < self.height_pixels {
-            let idx: usize = (x + y * (self.width_pixels/ 2)) as usize;
-            return ((u16::from(self.tile_ptrs[2 * idx + 1])) << 8) | u16::from(self.tile_ptrs[2 * idx]);
-        } else {
-            panic!("Tile coordinates out of bounds");
-        }
-    }
-
-    pub fn get_tile(&self, x: u32, y: u32) -> u8 {
+    // Purpose: fetch the tile index at a tile coordinate.
+    // Inputs: tile-space coordinates.
+    // Outputs: 8-bit tile index for the tilemap lookup.
+    // Purpose: fetch the tile entry (index + color) at a tile coordinate.
+    // Inputs: tile-space coordinates.
+    // Outputs: (tile index, color byte).
+    pub fn get_tile_entry(&self, x: u32, y: u32) -> (u8, u8) {
         if x < self.width_tiles && y < self.height_tiles {
             let idx: usize = (x + y * self.width_tiles) as usize;
-            return self.tile_ptrs[idx];
+            let entry_offset = idx * 2;
+            let tile_index = self.entries[entry_offset];
+            let tile_color = self.entries[entry_offset + 1];
+            (tile_index, tile_color)
         } else {
-            panic!("Tile coordinates out of bounds");
+            panic!("Tile coordinates out of bounds: ({}, {})", x, y);
+        }
+    }
+}
+
+impl PixelFrameBuffer {
+    // Purpose: initialize the pixel framebuffer with a fixed MMIO byte size.
+    // Inputs: logical pixel dimensions and the total MMIO byte size.
+    // Outputs: a zeroed pixel buffer; panics if the size doesn't match.
+    pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
+        let expected = width_pixels * height_pixels * 2;
+        assert!(
+            size_bytes == expected,
+            "Pixel framebuffer size mismatch: expected {} bytes, got {}",
+            expected,
+            size_bytes
+        );
+        PixelFrameBuffer {
+            width_pixels,
+            height_pixels,
+            bytes: vec![0; size_bytes as usize],
+        }
+    }
+
+    // Purpose: store one MMIO byte into the pixel framebuffer backing store.
+    // Inputs: byte offset and value.
+    // Outputs: updates bytes at the given offset.
+    pub fn set_byte(&mut self, offset: u32, value: u8) {
+        if offset < self.bytes.len() as u32 {
+            self.bytes[offset as usize] = value;
+        } else {
+            panic!("Pixel framebuffer offset out of bounds: {}", offset);
+        }
+    }
+
+    // Purpose: read one MMIO byte from the pixel framebuffer backing store.
+    // Inputs: byte offset.
+    // Outputs: stored byte value at the given offset.
+    pub fn get_byte(&self, offset: u32) -> u8 {
+        if offset < self.bytes.len() as u32 {
+            self.bytes[offset as usize]
+        } else {
+            panic!("Pixel framebuffer offset out of bounds: {}", offset);
+        }
+    }
+
+    // Purpose: fetch the 16-bit pixel at a logical pixel coordinate.
+    // Inputs: pixel-space coordinates.
+    // Outputs: packed 12-bit RGB value stored in 16 bits (little-endian).
+    pub fn get_pixel(&self, x: u32, y: u32) -> u16 {
+        if x < self.width_pixels && y < self.height_pixels {
+            let idx: usize = (x + y * self.width_pixels) as usize;
+            ((u16::from(self.bytes[2 * idx + 1])) << 8) | u16::from(self.bytes[2 * idx])
+        } else {
+            panic!("Pixel coordinates out of bounds: ({}, {})", x, y);
         }
     }
 }

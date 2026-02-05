@@ -1,35 +1,29 @@
   .origin 0x400
-  jmp _start
   # have the kernel initialize the tlb
   # then enter user mode and draw a green square
 
   .define PHY_TILEMAP_ADDR 0x7FE8000
-  .define PHY_FRAMEBUFFER_ADDR 0x7FC0000
+  .define PHY_TILE_FRAMEBUFFER_ADDR 0x7FBD000
+
+  .define PS2_INT 0x3C4
 
   .define VMEM_FLAGS 0x00F
 
   .define VRT_TILEMAP_ADDR 0x10000000
-  .define VRT_FRAMEBUFFER_ADDR 0x20000000
+  .define VRT_TILE_FRAMEBUFFER_ADDR 0x20000000
   .define USER_PC_START 0x80000000
 
   .define PS2_ADDR 0x7FE5800
 
   .define USER_PID 1
 
-EXIT:
-  mode halt
-
-INT_KEYBOARD:
-  # return the character causing an interrupt
-  movi r4, PS2_ADDR
-  lda  r1, [r4]
-  mode halt
-
-INT_TIMER:
-  mode halt
-
   .global _start
 _start:
+  # register the keyboard interrupt handler
+  movi r1, PS2_INT
+  adpc r2, INT_KEYBOARD
+  swa  r2, [r1]
+
   movi r4, USER_PID
   mov  pid, r4 # set pid to 1
 
@@ -53,9 +47,9 @@ init_tlb:
 
   tlbw r2, r3
 
-  # map VRT_FRAMEBUFFER_ADDR => PHY_FRAMEBUFFER_ADDR
-  movi r2, PHY_FRAMEBUFFER_ADDR
-  movi r3, VRT_FRAMEBUFFER_ADDR
+  # map VRT_TILE_FRAMEBUFFER_ADDR => PHY_TILE_FRAMEBUFFER_ADDR
+  movi r2, PHY_TILE_FRAMEBUFFER_ADDR
+  movi r3, VRT_TILE_FRAMEBUFFER_ADDR
   or   r2, r2, r4
 
   tlbw r2, r3
@@ -82,9 +76,16 @@ draw_square_loop:
   add  r10, r10, -1
   bnz  draw_square_loop
 
-  movi r8, VRT_FRAMEBUFFER_ADDR
+  movi r8, VRT_TILE_FRAMEBUFFER_ADDR
   movi r5, 1
-  swa  r5, [r8]
+  sda  r5, [r8]
 
 inf_loop:
   jmp  inf_loop
+
+
+INT_KEYBOARD:
+  # return the character causing an interrupt
+  movi r4, PS2_ADDR
+  lda  r1, [r4]
+  mode halt

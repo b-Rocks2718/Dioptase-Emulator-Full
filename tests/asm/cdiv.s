@@ -5,7 +5,7 @@
   # X to speed up, Z to slow down, Q to quit
 
   .define TILEMAP_ADDR 0x7FE8000
-  .define FRAMEBUFFER_ADDR 0x7FC0000
+  .define FRAMEBUFFER_ADDR 0x7FBD000
   .define SCALE_REG_ADDR 0x7FE5B44
   .define HSCROLL_ADDR 0x7FE5B40
   .define VSCROLL_ADDR 0x7FE5B42
@@ -16,6 +16,9 @@
   .define KEY_X 120
   .define KEY_Z 122
   .define KEY_Q 113
+
+  .define PIT_IVT 0x3C0
+  .define PS2_IVT 0x3C4
 
 INT_KEYBOARD:
 
@@ -80,6 +83,15 @@ COLOR:
 
   .global _start
 _start:
+  # register the timer interrupt handler
+  movi r4, PIT_IVT
+  adpc r5, INT_TIMER
+  swa  r5, [r4]
+
+  movi r4, PS2_IVT
+  adpc r5, INT_KEYBOARD
+  swa  r5, [r4]
+
   # initialize stack
   movi r1, 0x1000
   movi r2, 0x1000
@@ -106,6 +118,8 @@ _start:
 set_color:
   movi r8, TILEMAP_ADDR
   lw   r6,  [COLOR]
+  movi r7, 0x0FFF
+  and  r6, r6, r7
 
   movi r10, 64
 draw_tile_loop:

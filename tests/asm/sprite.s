@@ -12,6 +12,8 @@
   
   .define PS2_ADDR 0x7FE5800
 
+  .define PS2_IVT 0x3C4
+
   .define KEY_W 119
   .define KEY_A 97
   .define KEY_S 115
@@ -93,6 +95,11 @@ end:
   rfi
 
 _start:
+  # register the keyboard interrupt handler
+  movi r4, PS2_IVT
+  adpc r5, INT_KEYBOARD
+  swa  r5, [r4]
+
   # initialize stack
   movi r31, 0x1000
 

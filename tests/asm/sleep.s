@@ -7,6 +7,8 @@
   .define KEY_A 97
   .define KEY_Q 113
 
+  .define PS2_IVT 0x3C4
+
   .origin 0x400
   jmp _start
 INT_KEYBOARD:
@@ -70,6 +72,11 @@ COUNTER:
   .fill 0
 
 _start:
+  # register the keyboard interrupt handler
+  movi r4, PS2_IVT
+  adpc r5, INT_KEYBOARD
+  swa  r5, [r4]
+
   # initialize stack
   movi r31, 0x1000
 

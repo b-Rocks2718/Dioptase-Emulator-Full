@@ -11,6 +11,8 @@
 .define VGA_STATUS_ADDR 0x7FE5B46
 .define VGA_FRAME_ADDR 0x7FE5B48
 
+.define VGA_IVT 0x3D0
+
   .origin 0x400
   jmp _start
 hello:
@@ -63,6 +65,11 @@ INT_VGA:
   rfi
 
 _start:
+  # register the VGA interrupt handler
+  movi r4, VGA_IVT
+  adpc r5, INT_VGA
+  swa  r5, [r4]
+
   # set up stack pointer
   movi r31, 0x10000
 

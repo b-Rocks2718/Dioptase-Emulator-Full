@@ -25,6 +25,13 @@ fn expand_rgb332(color: u8) -> (u8, u8, u8) {
     (r4, g4, b4)
 }
 
+// Purpose: decode a signed 16-bit scroll offset from two MMIO bytes.
+// Inputs: (low, high) bytes in little-endian order.
+// Outputs: signed pixel offset.
+fn decode_scroll_offset(pair: (u8, u8)) -> i32 {
+    i32::from(i16::from_le_bytes([pair.0, pair.1]))
+}
+
 pub struct Graphics {
     window: PistonWindow,
     buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
@@ -175,8 +182,8 @@ impl Graphics {
                         // positions in the logical screen
                         let scroll_x_pair = *self.tile_hscroll_register.read().unwrap();
                         let scroll_y_pair = *self.tile_vscroll_register.read().unwrap();
-                        let scroll_x = (i32::from(scroll_x_pair.1) << 8) | i32::from(scroll_x_pair.0);
-                        let scroll_y = (i32::from(scroll_y_pair.1) << 8) | i32::from(scroll_y_pair.0);
+                        let scroll_x = decode_scroll_offset(scroll_x_pair);
+                        let scroll_y = decode_scroll_offset(scroll_y_pair);
                         let raw_x: i32 = (x * TILE_WIDTH) as i32 + px as i32 + scroll_x;
                         let raw_y: i32 = (y * TILE_WIDTH) as i32 + py as i32 + scroll_y;
                         let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;
@@ -214,8 +221,8 @@ impl Graphics {
                 // positions in the logical screen
                 let scroll_x_pair = *self.pixel_hscroll_register.read().unwrap();
                 let scroll_y_pair = *self.pixel_vscroll_register.read().unwrap();
-                let scroll_x = (i32::from(scroll_x_pair.1) << 8) | i32::from(scroll_x_pair.0);
-                let scroll_y = (i32::from(scroll_y_pair.1) << 8) | i32::from(scroll_y_pair.0);
+                let scroll_x = decode_scroll_offset(scroll_x_pair);
+                let scroll_y = decode_scroll_offset(scroll_y_pair);
                 let raw_x: i32 = x as i32 + scroll_x;
                 let raw_y: i32 = y as i32 + scroll_y;
                 let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;

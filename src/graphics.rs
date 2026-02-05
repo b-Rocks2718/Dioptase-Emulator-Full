@@ -6,6 +6,11 @@ use crate::memory::*;
 
 const SCREEN_WIDTH: u32 = 640;
 const SCREEN_HEIGHT: u32 = 480;
+// Purpose: scale the host window without changing logical resolution.
+// Invariants: buffer remains FRAME_WIDTH x FRAME_HEIGHT.
+const DISPLAY_SCALE: u32 = 2;
+const WINDOW_WIDTH: u32 = SCREEN_WIDTH * DISPLAY_SCALE;
+const WINDOW_HEIGHT: u32 = SCREEN_HEIGHT * DISPLAY_SCALE;
 
 // Purpose: expand an 8-bit sprite/tile color into 4-bit RGB channels.
 // Inputs: 8-bit color in RGB332 format.
@@ -60,7 +65,7 @@ impl Graphics {
         vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
         pending_interrupt: Arc<RwLock<u32>>,
     ) -> Graphics {
-        let mut window: PistonWindow = WindowSettings::new("Dioptase", [SCREEN_WIDTH, SCREEN_HEIGHT])
+        let mut window: PistonWindow = WindowSettings::new("Dioptase", [WINDOW_WIDTH, WINDOW_HEIGHT])
             .exit_on_esc(true)
             .build()
             .unwrap();
@@ -71,7 +76,7 @@ impl Graphics {
         let texture = Texture::from_image(
             &mut window.create_texture_context(),
             &buffer,
-            &TextureSettings::new(),
+            &TextureSettings::new().filter(Filter::Nearest),
         ).unwrap();
 
         Graphics { 
@@ -110,7 +115,8 @@ impl Graphics {
                 Event::Loop(Loop::Render(_args)) => {
                     self.window.draw_2d(&event, |context, graphics, _| {
                         clear([0.0; 4], graphics); // black background
-                        image(&self.texture, context.transform, graphics);
+                        let scale = DISPLAY_SCALE as f64;
+                        image(&self.texture, context.transform.scale(scale, scale), graphics);
                     });
                 }
                 Event::Input(Input::Button(ButtonArgs { 
@@ -293,7 +299,7 @@ impl Graphics {
         self.texture = Texture::from_image(
             &mut self.window.create_texture_context(),
             &self.buffer,
-            &TextureSettings::new(),
+            &TextureSettings::new().filter(Filter::Nearest),
         ).unwrap();
 
         // set status to idle

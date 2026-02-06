@@ -75,7 +75,7 @@ const TILE_SCALE_REGISTER_START: u32 = 0x7FE5B44; // each tile pixel is repeated
 
 const PIXEL_H_SCROLL_START: u32 = 0x7FE5B50;
 const PIXEL_V_SCROLL_START: u32 = 0x7FE5B52;
-const PIXEL_SCALE_REGISTER_START: u32 = 0x7FE5B54; // each pixel is repeated 2^n times
+const PIXEL_SCALE_REGISTER_START: u32 = 0x7FE5B54; // each pixel is repeated 2^(n+1) times
 
 const SPRITE_SCALE_START: u32 = 0x7FE5B60;
 const SPRITE_SCALE_SIZE: u32 = SPRITE_COUNT;

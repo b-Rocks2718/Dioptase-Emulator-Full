@@ -209,7 +209,9 @@ impl Graphics {
     fn pixel_layer_update(&mut self) {
         // draw the pixel layer as the background
         let fb = self.pixel_frame_buffer.read().unwrap();
-        let scale = 1 << (*self.pixel_scale_register.read().unwrap() as u32);
+        // Pixel layer uses an exponent with an implicit +1 so that:
+        // n=0 -> 2x, n=1 -> 4x, matching 320x240 -> 640x480 at n=0.
+        let scale = 1 << ((*self.pixel_scale_register.read().unwrap() as u32) + 1);
         for x in 0..fb.width_pixels {
             for y in 0..fb.height_pixels {
                 let pixel = fb.get_pixel(x, y);
@@ -229,10 +231,10 @@ impl Graphics {
                 let final_y: u32 = (raw_y + FRAME_HEIGHT as i32) as u32 % FRAME_HEIGHT;
 
                 // print the pixel rgba in the physical screen
-                for i in 0..(scale + 1) {
-                    for j in 0..(scale + 1) {
-                        let screen_x: u32 = final_x * (scale + 1) + i;
-                        let screen_y: u32 = final_y * (scale + 1) + j;
+                for i in 0..scale {
+                    for j in 0..scale {
+                        let screen_x: u32 = final_x * scale + i;
+                        let screen_y: u32 = final_y * scale + j;
 
                         if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
                             self.buffer.put_pixel(screen_x, screen_y, pixel);

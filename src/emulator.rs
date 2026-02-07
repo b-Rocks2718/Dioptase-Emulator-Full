@@ -1986,10 +1986,10 @@ impl Emulator {
         // sub with immediate does imm - reg
         let result = if imm {
           let r_b = 1 + u64::from(!r_b);
-          u64::from(r_c) + u64::from(r_b)
+          u64::from(r_c) + r_b
         } else {
           let r_c = 1 + u64::from(!r_c);
-          u64::from(r_c) + u64::from(r_b)
+          r_c + u64::from(r_b)
         };
 
         // set the carry flag
@@ -2002,15 +2002,14 @@ impl Emulator {
 
         // two's complement
         let result = if imm {
-          let r_b = (1 + u64::from(
+          let r_b = 1 + u64::from(
           !(u32::wrapping_add(
-          u32::from(prev_carry == 0), r_b)))) as u32;
-          u64::from(imm) + u64::from(r_b)
+          u32::from(prev_carry == 0), r_b)));
+          u64::from(imm) + r_b
         } else {
-          let r_c = (1 + u64::from(
-          !(u32::wrapping_add(u32::from(prev_carry == 0), r_c)))
-          ) as u32;
-          u64::from(r_c) + u64::from(r_b)
+          let r_c = 1 + u64::from(
+          !(u32::wrapping_add(u32::from(prev_carry == 0), r_c)));
+          r_c + u64::from(r_b)
         };
 
         // set the carry flag

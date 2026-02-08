@@ -42,6 +42,7 @@ const KERNEL_INT_STACK_START: u32 = 0x000E_0000;
 const KERNEL_INT_STACK_END: u32 = 0x000F_0000;
 const KERNEL_STACK_START: u32 = 0x000F_0000;
 const KERNEL_STACK_END: u32 = 0x0010_0000;
+const TLB_ENTRIES: usize = 16;
 
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
@@ -53,30 +54,50 @@ pub fn set_trace_interrupts(enabled: bool) {
 #[derive(Debug)]
 pub struct RandomCache {
     private_table : HashMap<(u32, u32), u32>,
-    private_size : usize,
-    private_capacity : usize,
     global_table : HashMap<u32, u32>,
-    global_size : usize,
-    global_capacity : usize,
+    total_capacity : usize,
 }
 
 impl RandomCache {
+  fn total_size(&self) -> usize {
+    self.private_table.len() + self.global_table.len()
+  }
+
+  fn evict_one(&mut self, prefer_global: bool) {
+    // Replacement policy is implementation-defined; this emulator uses a
+    // deterministic first-key eviction and prefers evicting from the same
+    // class (global/private) as the incoming entry when possible.
+    if prefer_global {
+      if let Some(evict) = self.global_table.keys().next().cloned() {
+        self.global_table.remove(&evict);
+        return;
+      }
+      if let Some(evict) = self.private_table.keys().next().cloned() {
+        self.private_table.remove(&evict);
+      }
+    } else {
+      if let Some(evict) = self.private_table.keys().next().cloned() {
+        self.private_table.remove(&evict);
+        return;
+      }
+      if let Some(evict) = self.global_table.keys().next().cloned() {
+        self.global_table.remove(&evict);
+      }
+    }
+  }
+
   pub fn new(capacity : usize) -> RandomCache  {
     RandomCache {
       private_table : HashMap::new(),
-      private_size : 0,
-      private_capacity : capacity,
       global_table : HashMap::new(),
-      global_size : 0,
-      global_capacity : capacity,
+      total_capacity : capacity,
     }
   }
 
   pub fn access(&self, pid : u32, vpn : u32, operation : u32, kmode : bool) -> Option<u32> {
     // used whenever a memory access is made
 
-    assert!(self.private_size <= self.private_capacity);
-    assert!(self.global_size <= self.global_capacity);
+    assert!(self.total_size() <= self.total_capacity);
 
     // operations: 0 => read, 1 => write, 2 => fetch
 
@@ -172,8 +193,7 @@ impl RandomCache {
   pub fn read(&self, pid : u32, vpn : u32) -> Option<u32> {
     // used by tlbr instruction
 
-    assert!(self.private_size <= self.private_capacity);
-    assert!(self.global_size <= self.global_capacity);
+    assert!(self.total_size() <= self.total_capacity);
     let result = self.private_table.get(&(pid, vpn)).copied();
 
     if result.is_some() {
@@ -187,68 +207,41 @@ impl RandomCache {
   pub fn write(&mut self, pid : u32, vpn: u32, ppn : u32){
     if ppn & 0x00000010 != 0 {
       // global entry
-      if !self.global_table.contains_key(&vpn) {
-        if self.global_size < self.global_capacity {
-          self.global_size += 1;
-        } else {
-          // remove an entry
-          let evict = {
-            let mut keys = self.global_table.keys();
-            keys.next().cloned().expect("size was nonzero, this should work")
-          };
-          self.global_table.remove(&evict);
-        }
+      if !self.global_table.contains_key(&vpn) && self.total_size() >= self.total_capacity {
+        self.evict_one(true);
       }
 
       // will replace old mapping if one existed
       self.global_table.insert(vpn, ppn);
-      assert!(self.global_size <= self.global_capacity);
+      assert!(self.total_size() <= self.total_capacity);
 
     } else {
       // private entry
-      if !self.private_table.contains_key(&(pid, vpn)) {
-        if self.private_size < self.private_capacity {
-          self.private_size += 1;
-        } else {
-          // remove an entry
-          let evict = {
-            let mut keys = self.private_table.keys();
-            keys.next().cloned().expect("size was nonzero, this should work")
-          };
-          self.private_table.remove(&evict);
-        }
+      if !self.private_table.contains_key(&(pid, vpn)) && self.total_size() >= self.total_capacity {
+        self.evict_one(false);
       }
 
       // will replace old mapping if one existed
       self.private_table.insert((pid, vpn), ppn);
 
-      assert!(self.private_size <= self.private_capacity);
+      assert!(self.total_size() <= self.total_capacity);
     }
   }
 
   pub fn invalidate(&mut self, pid : u32, vpn : u32){
-    if self.private_table.contains_key(&(pid, vpn)) {
-      self.private_size -= 1;
-    }
-    if self.global_table.contains_key(&vpn) {
-      self.global_size -= 1;
-    }
-
     self.private_table.remove(&(pid, vpn));
     self.global_table.remove(&vpn);
   }
 
   pub fn clear(&mut self){
-    self.private_size = 0;
-    self.global_size = 0;
     self.private_table.drain();
     self.global_table.drain();
   }
 
   fn debug_dump(&self) {
     println!(
-      "TLB private: {}/{} entries",
-      self.private_size, self.private_capacity
+      "TLB private: {} entries",
+      self.private_table.len()
     );
     if self.private_table.is_empty() {
       println!("  (empty)");
@@ -258,8 +251,8 @@ impl RandomCache {
       }
     }
     println!(
-      "TLB global: {}/{} entries",
-      self.global_size, self.global_capacity
+      "TLB global: {} entries",
+      self.global_table.len()
     );
     if self.global_table.is_empty() {
       println!("  (empty)");
@@ -268,6 +261,10 @@ impl RandomCache {
         println!("  vpn {:08X} -> {:08X}", vpn, entry);
       }
     }
+    println!(
+      "TLB total: {}/{} entries",
+      self.total_size(), self.total_capacity
+    );
   }
 }
 
@@ -1011,7 +1008,7 @@ impl Emulator {
       cregfile,
       memory,
       interrupts,
-      tlb: RandomCache::new(32),
+      tlb: RandomCache::new(TLB_ENTRIES),
       pc: RESET_PC,
       asleep: core_id != 0,
       sleep_armed: false,

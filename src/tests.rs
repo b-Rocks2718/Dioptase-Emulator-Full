@@ -441,6 +441,11 @@ fn tlbw() {
 }
 
 #[test]
+fn tlb_evict() {
+  run_test("tests/asm/tlb_evict.s", 1);
+}
+
+#[test]
 fn kmiss() {
   run_test("tests/asm/kmiss.s", 2);
 }

@@ -9,7 +9,7 @@ _start:
 
   # Insert 17 distinct entries (TLB has size 16)
   movi r10, 0
-  movi r11, 65
+  movi r11, 17
 fill_tlb:
   # value = ((index + 1) << 12) | 0x17
   add  r2, r10, 1
@@ -24,13 +24,13 @@ fill_tlb:
   bnz  fill_tlb
 
   # Sanity check: most recent insert must be readable.
-  movi r10, 64
+  movi r10, 16
   lsl  r3, r10, 12
   tlbr r7, r3
   add  r13, r7, 0
   bz   FAIL
 
-  # Count misses across the 17 inserted keys.
+  # Count misses across the 65 inserted keys.
   # At least one miss is required to prove an eviction happened.
   movi r10, 0
   movi r11, 17

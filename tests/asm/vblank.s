@@ -50,6 +50,11 @@ INT_VGA:
   # mark interrupt as handled
   mov  isr, r0
 
+  # Read live frame counter in-handler so output does not depend on
+  # foreground loop register timing.
+  movi r3, VGA_FRAME_ADDR
+  lwa  r2, [r3]
+
   movi r4, UART_ADDR
   add  r3, r2, 48
   sba  r3, [r4]
@@ -87,11 +92,13 @@ loop:
 
   movi r4, UART_ADDR
   movi r3, VGA_STATUS_ADDR
-  lba  r2, [r3]
-  add  r2, r2, 48
-  #sba  r2, [r4] # print VGA status
-  movi r2, 10
-  #sba  r2, [r4]
+  # Keep r2 as the latest frame count so the interrupt handler can print it.
+  # Status debug uses r5 instead.
+  lba  r5, [r3]
+  add  r5, r5, 48
+  #sba  r5, [r4] # print VGA status
+  movi r5, 10
+  #sba  r5, [r4]
 
   jmp  loop
 

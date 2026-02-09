@@ -20,6 +20,7 @@ const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
 
 // SD card DMA engine (no data buffer). DMA transfers 4 bytes per device tick.
 const SD_BLOCK_SIZE: usize = 512;
+const SD_BLOCK_SIZE_U32: u32 = SD_BLOCK_SIZE as u32;
 const SD_DMA_BYTES_PER_TICK: u32 = 4;
 pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
 pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
@@ -212,8 +213,10 @@ impl SdCard {
         }
 
         let mem_addr = self.dma_mem_addr & !0x3;
-        let len = self.dma_len & !0x3;
-        if len == 0 {
+        // SD_DMA_LEN is architecturally defined in blocks. Internally the DMA engine
+        // tracks a byte countdown, so convert blocks->bytes with 32-bit truncation.
+        let len_bytes = self.dma_len.wrapping_mul(SD_BLOCK_SIZE_U32);
+        if len_bytes == 0 {
             self.dma_err = SD_DMA_ERR_ZERO_LEN;
             self.dma_status = SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR;
             self.dma_active = false;
@@ -222,7 +225,7 @@ impl SdCard {
 
         self.dma_mem_cursor = mem_addr;
         self.dma_sd_byte_cursor = (self.dma_sd_block as u64) * (SD_BLOCK_SIZE as u64);
-        self.dma_remaining = len;
+        self.dma_remaining = len_bytes;
         self.dma_err = SD_DMA_ERR_NONE;
         self.dma_status = SD_DMA_STATUS_BUSY;
         self.dma_active = true;

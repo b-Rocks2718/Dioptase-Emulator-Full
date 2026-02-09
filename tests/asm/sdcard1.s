@@ -27,10 +27,10 @@ _start:
   movi r1 0x55667788
   swa  r1, [r4, 4]
 
-  # DMA RAM -> SD1 (block 3, length 8)
+  # DMA RAM -> SD1 (block 3, length 1 block)
   movi r1 3
   swa  r1, [r7]
-  movi r1 8
+  movi r1 1
   swa  r1, [r8]
   movi r1 0x2000
   swa  r1, [r6]
@@ -46,10 +46,10 @@ wait_write:
   swa  r0, [r5]
   swa  r0, [r5, 4]
 
-  # DMA SD1 -> RAM (block 3, length 8)
+  # DMA SD1 -> RAM (block 3, length 1 block)
   movi r1 3
   swa  r1, [r7]
-  movi r1 8
+  movi r1 1
   swa  r1, [r8]
   movi r1 0x3000
   swa  r1, [r6]

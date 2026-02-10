@@ -8,6 +8,7 @@
 .define SD_DMA_STATUS 0x7FE5838
 
 .define SD_DMA_STATUS_BUSY 0x1
+.define SD_DMA_CTRL_SD_INIT 0x8
 
   .origin 0x400
   jmp _start
@@ -20,6 +21,15 @@ _start:
   movi r8 SD_DMA_LEN
   movi r9 SD_DMA_CTRL
   movi r10 SD_DMA_STATUS
+
+  # Initialize SD card 1 before issuing DMA commands.
+  movi r1 SD_DMA_CTRL_SD_INIT
+  swa  r1, [r9]
+
+wait_init:
+  lwa  r1 [r10]
+  and  r1 r1 SD_DMA_STATUS_BUSY
+  bnz  wait_init
 
   # write pattern to source
   movi r1 0xA1B2C3D4

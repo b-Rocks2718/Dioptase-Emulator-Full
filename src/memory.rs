@@ -57,6 +57,7 @@ const SD_DMA_RANGE_SIZE: u32 = 0x18;
 const SD_DMA_CTRL_START: u32 = 1 << 0;
 const SD_DMA_CTRL_DIR_RAM_TO_SD: u32 = 1 << 1;
 const SD_DMA_CTRL_IRQ_ENABLE: u32 = 1 << 2;
+const SD_DMA_CTRL_INIT: u32 = 1 << 3;
 
 const SD_DMA_STATUS_BUSY: u32 = 1 << 0;
 const SD_DMA_STATUS_DONE: u32 = 1 << 1;
@@ -65,6 +66,8 @@ const SD_DMA_STATUS_ERR: u32 = 1 << 2;
 const SD_DMA_ERR_NONE: u32 = 0;
 const SD_DMA_ERR_BUSY: u32 = 1;
 const SD_DMA_ERR_ZERO_LEN: u32 = 2;
+const SD_DMA_ERR_NOT_INITIALIZED: u32 = 3;
+const SD_INIT_TICKS: u32 = 32;
 
 const SPRITE_COUNT: u32 = 16;
 const SPRITE_REGISTERS_START : u32 = 0x7FE5B00;  // every consecutive pair of words correspond to
@@ -178,6 +181,9 @@ struct SdCard {
     dma_remaining: u32,
     dma_ticks_per_word: u32,
     dma_tick_countdown: u32,
+    init_active: bool,
+    init_ticks_remaining: u32,
+    initialized: bool,
 }
 
 impl SdCard {
@@ -197,7 +203,32 @@ impl SdCard {
             dma_remaining: 0,
             dma_ticks_per_word: ticks_per_word,
             dma_tick_countdown: 0,
+            init_active: false,
+            init_ticks_remaining: 0,
+            initialized: false,
         }
+    }
+
+    // Purpose: start an SD initialization sequence using DMA status/error registers.
+    // Inputs: SD_DMA_CTRL already written by MMIO.
+    // Outputs: updates BUSY/DONE/ERR state and returns true for immediate IRQ.
+    fn start_init(&mut self) -> bool {
+        let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
+        if is_busy {
+            self.dma_err = SD_DMA_ERR_BUSY;
+            self.dma_status |= SD_DMA_STATUS_ERR;
+            return false;
+        }
+
+        self.dma_active = false;
+        self.dma_remaining = 0;
+        self.dma_tick_countdown = 0;
+        self.dma_err = SD_DMA_ERR_NONE;
+        self.dma_status = SD_DMA_STATUS_BUSY;
+        self.init_active = true;
+        self.init_ticks_remaining = SD_INIT_TICKS;
+        self.initialized = false;
+        false
     }
 
     // Purpose: start a DMA transfer using the current register values.
@@ -213,6 +244,13 @@ impl SdCard {
         }
 
         let mem_addr = self.dma_mem_addr & !0x3;
+        if !self.initialized {
+            self.dma_err = SD_DMA_ERR_NOT_INITIALIZED;
+            self.dma_status = SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR;
+            self.dma_active = false;
+            return irq_enable;
+        }
+
         // SD_DMA_LEN is architecturally defined in blocks. Internally the DMA engine
         // tracks a byte countdown, so convert blocks->bytes with 32-bit truncation.
         let len_bytes = self.dma_len.wrapping_mul(SD_BLOCK_SIZE_U32);
@@ -493,11 +531,18 @@ impl Memory {
         if addr >= base + SD_DMA_OFFSET_CTRL && addr < base + SD_DMA_OFFSET_CTRL + 4 {
             let mut sd = sd.write().unwrap();
             write_reg_byte(&mut sd.dma_ctrl, addr, base + SD_DMA_OFFSET_CTRL, data);
-            sd.dma_ctrl &= SD_DMA_CTRL_START | SD_DMA_CTRL_DIR_RAM_TO_SD | SD_DMA_CTRL_IRQ_ENABLE;
+            sd.dma_ctrl &=
+                SD_DMA_CTRL_START | SD_DMA_CTRL_DIR_RAM_TO_SD | SD_DMA_CTRL_IRQ_ENABLE | SD_DMA_CTRL_INIT;
             let should_start = (sd.dma_ctrl & SD_DMA_CTRL_START) != 0;
-            if should_start {
-                sd.dma_ctrl &= !SD_DMA_CTRL_START;
-                let interrupt = sd.start_dma();
+            let should_init = (sd.dma_ctrl & SD_DMA_CTRL_INIT) != 0;
+            if should_start || should_init {
+                // START/SD_INIT are command strobes and clear after write observation.
+                sd.dma_ctrl &= !(SD_DMA_CTRL_START | SD_DMA_CTRL_INIT);
+                let interrupt = if should_init {
+                    sd.start_init()
+                } else {
+                    sd.start_dma()
+                };
                 if interrupt {
                     *self.pending_interrupt.write().unwrap() |= interrupt_bit;
                 }
@@ -858,6 +903,36 @@ impl Memory {
     // Inputs: SD device handle and interrupt bit.
     // Outputs: updates RAM/storage and may raise the device interrupt.
     fn tick_sd_dma_device(&self, sd: &Arc<RwLock<SdCard>>, interrupt_bit: u32) {
+        let init_irq = {
+            let mut sd = sd.write().unwrap();
+            if !sd.init_active {
+                false
+            } else {
+                if sd.init_ticks_remaining > 0 {
+                    sd.init_ticks_remaining -= 1;
+                }
+                if sd.init_ticks_remaining == 0 {
+                    sd.init_active = false;
+                    sd.initialized = true;
+                    sd.dma_status &= !SD_DMA_STATUS_BUSY;
+                    sd.dma_status |= SD_DMA_STATUS_DONE;
+                    (sd.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0
+                } else {
+                    false
+                }
+            }
+        };
+        if init_irq {
+            *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+            return;
+        }
+        {
+            let sd = sd.read().unwrap();
+            if sd.init_active {
+                return;
+            }
+        }
+
         let (mem_addr, sd_offset, bytes, dir_ram_to_sd, done_after, irq_enable) = {
             let mut sd = sd.write().unwrap();
             if !sd.dma_active {

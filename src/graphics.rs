@@ -186,8 +186,10 @@ impl Graphics {
                         let scroll_y = decode_scroll_offset(scroll_y_pair);
                         let raw_x: i32 = (x * TILE_WIDTH) as i32 + px as i32 + scroll_x;
                         let raw_y: i32 = (y * TILE_WIDTH) as i32 + py as i32 + scroll_y;
-                        let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;
-                        let final_y: u32 = (raw_y + FRAME_HEIGHT as i32) as u32 % FRAME_HEIGHT;
+                        // Scroll registers are signed; use Euclidean modulo so large negative
+                        // offsets continue wrapping correctly after many screens of scroll.
+                        let final_x: u32 = raw_x.rem_euclid(FRAME_WIDTH as i32) as u32;
+                        let final_y: u32 = raw_y.rem_euclid(FRAME_HEIGHT as i32) as u32;
 
                         // print the pixel rgba in the physical screen
                         for i in 0..scale {
@@ -227,8 +229,10 @@ impl Graphics {
                 let scroll_y = decode_scroll_offset(scroll_y_pair);
                 let raw_x: i32 = x as i32 + scroll_x;
                 let raw_y: i32 = y as i32 + scroll_y;
-                let final_x: u32 = (raw_x + FRAME_WIDTH as i32) as u32 % FRAME_WIDTH;
-                let final_y: u32 = (raw_y + FRAME_HEIGHT as i32) as u32 % FRAME_HEIGHT;
+                // Scroll registers are signed; use Euclidean modulo so large negative
+                // offsets continue wrapping correctly after many screens of scroll.
+                let final_x: u32 = raw_x.rem_euclid(FRAME_WIDTH as i32) as u32;
+                let final_y: u32 = raw_y.rem_euclid(FRAME_HEIGHT as i32) as u32;
 
                 // print the pixel rgba in the physical screen
                 for i in 0..scale {
@@ -259,6 +263,9 @@ impl Graphics {
         let sprite_scales = self.sprite_scale_registers.read().unwrap();
         for (sprite_index, sprite) in sprite_map.sprites.iter().enumerate() {
             let scale = 1 << (sprite_scales.get(sprite_index).copied().unwrap_or(0) as u32);
+            // Sprite coordinates are signed 16-bit little-endian MMIO values.
+            let sprite_x = i32::from(i16::from_le_bytes([sprite.x.0, sprite.x.1]));
+            let sprite_y = i32::from(i16::from_le_bytes([sprite.y.0, sprite.y.1]));
             for px in 0..SPRITE_WIDTH {
                 for py in 0..SPRITE_WIDTH {
                     let addr = (2 * (px + py * SPRITE_WIDTH)) as usize;
@@ -273,8 +280,15 @@ impl Graphics {
                     }
 
                     let pixel = Rgba([red, green, blue, 255]);
-                    let final_x: u32 = (u32::from(sprite.x.1) << 8) | (u32::from(sprite.x.0) + px);
-                    let final_y: u32 = (u32::from(sprite.y.1) << 8) | (u32::from(sprite.y.0) + py);
+                    // Reconstruct the full coordinate before adding the per-pixel offset so carry
+                    // from the low byte is preserved (the previous bytewise OR math dropped carry).
+                    let final_x = sprite_x + px as i32;
+                    let final_y = sprite_y + py as i32;
+                    if final_x < 0 || final_y < 0 {
+                        continue;
+                    }
+                    let final_x = final_x as u32;
+                    let final_y = final_y as u32;
 
                     // print the pixel rgba in the physical screen
                     for i in 0..scale {

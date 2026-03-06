@@ -8,7 +8,7 @@ for the [JPEB project](https://github.com/PaulBailey-1/JPEB) and re-used here.
 
 ## Usage
 
-Run the emulator with `cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>]`
+Run the emulator with `cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>]`
 
 You can also pass positional files in order: `cargo run -- <ram.hex> [sd0.bin] [sd1.bin]`
 
@@ -23,6 +23,8 @@ Use `--sched` to change the scheduling of when cores run. Options are `free`, `r
 Use the `--sd-dma-ticks <N>` flag to set the number of emulator ticks per 4-byte SD DMA transfer (default 1)
 
 Use the `--sd0 <file>` and `--sd1 <file>` flags to load raw binary SD images into the two SD devices
+
+Use the `--sd0-out <file>` and `--sd1-out <file>` flags to write the final raw SD images back to disk when the emulator exits
 
 SD images are raw binary byte streams; byte 0 maps to SD block 0 byte 0
 

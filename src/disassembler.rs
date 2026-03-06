@@ -23,24 +23,24 @@ fn fmt_imm_signed(value: i32) -> String {
 
 fn alu_op_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
-        "and", "nand", "or", "nor", "xor", "xnor", "not", "lsl", "lsr", "asr",
-        "rotl", "rotr", "lslc", "lsrc", "add", "addc", "sub", "subb", "mul",
+        "and", "nand", "or", "nor", "xor", "xnor", "not", "lsl", "lsr", "asr", "rotl", "rotr",
+        "lslc", "lsrc", "add", "addc", "sub", "subb", "mul",
     ];
     OPS.get(op as usize).copied()
 }
 
 fn branch_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
-        "br", "bz", "bnz", "bs", "bns", "bc", "bnc", "bo", "bno",
-        "bps", "bnps", "bg", "bge", "bl", "ble", "ba", "bae", "bb", "bbe",
+        "br", "bz", "bnz", "bs", "bns", "bc", "bnc", "bo", "bno", "bps", "bnps", "bg", "bge", "bl",
+        "ble", "ba", "bae", "bb", "bbe",
     ];
     OPS.get(op as usize).copied()
 }
 
 fn branch_abs_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
-        "bra", "bza", "bnza", "bsa", "bnsa", "bca", "bnca", "boa", "bnoa",
-        "bpa", "bnpa", "bga", "bgea", "bla", "blea", "baa", "baea", "bba", "bbea",
+        "bra", "bza", "bnza", "bsa", "bnsa", "bca", "bnca", "boa", "bnoa", "bpa", "bnpa", "bga",
+        "bgea", "bla", "blea", "baa", "baea", "bba", "bbea",
     ];
     OPS.get(op as usize).copied()
 }
@@ -184,12 +184,7 @@ fn disassemble_mem(opcode: u32, instr: u32) -> String {
         }
         _ => {
             let imm = sign_extend(instr & 0x1FFFFF, 21);
-            format!(
-                "{} {}, [{}]",
-                mnemonic,
-                reg_name(r_a),
-                fmt_imm_signed(imm)
-            )
+            format!("{} {}, [{}]", mnemonic, reg_name(r_a), fmt_imm_signed(imm))
         }
     }
 }
@@ -312,7 +307,11 @@ fn disassemble_kernel(instr: u32) -> String {
         }
         3 => {
             let is_rfi = ((instr >> 11) & 1) != 0;
-            if is_rfi { "rfi".to_string() } else { "rfe".to_string() }
+            if is_rfi {
+                "rfi".to_string()
+            } else {
+                "rfe".to_string()
+            }
         }
         4 => {
             let r_a = (instr >> 22) & 0x1F;

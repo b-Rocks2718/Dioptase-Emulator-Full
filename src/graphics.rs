@@ -1,6 +1,9 @@
-use piston_window::*;
 use ::image::{ImageBuffer, Rgba};
-use std::{collections::VecDeque, sync::{Arc, Mutex, RwLock}};
+use piston_window::*;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use crate::memory::*;
 
@@ -54,12 +57,11 @@ pub struct Graphics {
 }
 
 impl Graphics {
-
     pub fn new(
-        pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>, 
-        tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>, 
-        tile_map: Arc<RwLock<TileMap>>, 
-        io_buffer: Arc<RwLock<VecDeque<u16>>>, 
+        pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
+        tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
+        tile_map: Arc<RwLock<TileMap>>,
+        io_buffer: Arc<RwLock<VecDeque<u16>>>,
         tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
         tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
         pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
@@ -72,10 +74,11 @@ impl Graphics {
         vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
         pending_interrupt: Arc<RwLock<u32>>,
     ) -> Graphics {
-        let mut window: PistonWindow = WindowSettings::new("Dioptase", [WINDOW_WIDTH, WINDOW_HEIGHT])
-            .exit_on_esc(true)
-            .build()
-            .unwrap();
+        let mut window: PistonWindow =
+            WindowSettings::new("Dioptase", [WINDOW_WIDTH, WINDOW_HEIGHT])
+                .exit_on_esc(true)
+                .build()
+                .unwrap();
         window.set_max_fps(60);
         window.set_ups(60);
 
@@ -84,9 +87,10 @@ impl Graphics {
             &mut window.create_texture_context(),
             &buffer,
             &TextureSettings::new().filter(Filter::Nearest),
-        ).unwrap();
+        )
+        .unwrap();
 
-        Graphics { 
+        Graphics {
             window,
             buffer,
             texture,
@@ -104,10 +108,9 @@ impl Graphics {
             sprite_scale_registers,
             vga_status_register,
             vga_frame_register,
-            pending_interrupt
+            pending_interrupt,
         }
     }
-    
 
     pub fn start(&mut self, finished: Arc<Mutex<bool>>, stay_open: bool) {
         while let Some(event) = self.window.next() {
@@ -123,12 +126,21 @@ impl Graphics {
                     self.window.draw_2d(&event, |context, graphics, _| {
                         clear([0.0; 4], graphics); // black background
                         let scale = DISPLAY_SCALE as f64;
-                        image(&self.texture, context.transform.scale(scale, scale), graphics);
+                        image(
+                            &self.texture,
+                            context.transform.scale(scale, scale),
+                            graphics,
+                        );
                     });
                 }
-                Event::Input(Input::Button(ButtonArgs { 
-                    button: Button::Keyboard(key), 
-                    state, .. }), _) => {
+                Event::Input(
+                    Input::Button(ButtonArgs {
+                        button: Button::Keyboard(key),
+                        state,
+                        ..
+                    }),
+                    _,
+                ) => {
                     match state {
                         ButtonState::Press => {
                             // Handle key press here
@@ -137,7 +149,10 @@ impl Graphics {
                         }
                         ButtonState::Release => {
                             // Handle key release here
-                            self.io_buffer.write().unwrap().push_back(key as u16 & 0xFF | 0x100);
+                            self.io_buffer
+                                .write()
+                                .unwrap()
+                                .push_back(key as u16 & 0xFF | 0x100);
                             //println!("Key released: {:?}", key);
                         }
                     }
@@ -178,7 +193,7 @@ impl Graphics {
                             )
                         };
                         let pixel = Rgba([red, green, blue, 255]);
-                        
+
                         // positions in the logical screen
                         let scroll_x_pair = *self.tile_hscroll_register.read().unwrap();
                         let scroll_y_pair = *self.tile_vscroll_register.read().unwrap();
@@ -248,7 +263,6 @@ impl Graphics {
             }
         }
     }
-
 
     fn update(&mut self) {
         // set status to busy
@@ -323,7 +337,8 @@ impl Graphics {
             &mut self.window.create_texture_context(),
             &self.buffer,
             &TextureSettings::new().filter(Filter::Nearest),
-        ).unwrap();
+        )
+        .unwrap();
 
         // set status to idle
         *self.vga_status_register.write().unwrap() = 3;

@@ -2,7 +2,10 @@ use ::image::{ImageBuffer, Rgba};
 use piston_window::*;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
 };
 
 use crate::memory::*;
@@ -43,6 +46,7 @@ pub struct Graphics {
     tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
     tile_map: Arc<RwLock<TileMap>>,
     io_buffer: Arc<RwLock<VecDeque<u16>>>,
+    input_pending: Arc<AtomicBool>,
     tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
     tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
     pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
@@ -52,7 +56,7 @@ pub struct Graphics {
     sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
     vga_status_register: Arc<RwLock<u8>>,
     vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-    pending_interrupt: Arc<RwLock<u32>>,
+    pending_interrupt: Arc<AtomicU32>,
     sprite_map: Arc<RwLock<SpriteMap>>,
 }
 
@@ -62,6 +66,7 @@ impl Graphics {
         tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
         tile_map: Arc<RwLock<TileMap>>,
         io_buffer: Arc<RwLock<VecDeque<u16>>>,
+        input_pending: Arc<AtomicBool>,
         tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
         tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
         pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
@@ -72,7 +77,7 @@ impl Graphics {
         sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
         vga_status_register: Arc<RwLock<u8>>,
         vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-        pending_interrupt: Arc<RwLock<u32>>,
+        pending_interrupt: Arc<AtomicU32>,
     ) -> Graphics {
         let mut window: PistonWindow =
             WindowSettings::new("Dioptase", [WINDOW_WIDTH, WINDOW_HEIGHT])
@@ -98,6 +103,7 @@ impl Graphics {
             tile_frame_buffer,
             tile_map,
             io_buffer,
+            input_pending,
             tile_vscroll_register,
             tile_hscroll_register,
             pixel_vscroll_register,
@@ -145,6 +151,7 @@ impl Graphics {
                         ButtonState::Press => {
                             // Handle key press here
                             self.io_buffer.write().unwrap().push_back(key as u16 & 0xFF);
+                            self.input_pending.store(true, Ordering::SeqCst);
                             //println!("Key pressed: {:?}", key);
                         }
                         ButtonState::Release => {
@@ -153,6 +160,7 @@ impl Graphics {
                                 .write()
                                 .unwrap()
                                 .push_back(key as u16 & 0xFF | 0x100);
+                            self.input_pending.store(true, Ordering::SeqCst);
                             //println!("Key released: {:?}", key);
                         }
                     }
@@ -344,6 +352,7 @@ impl Graphics {
         *self.vga_status_register.write().unwrap() = 3;
 
         // send vblank interrupt
-        *self.pending_interrupt.write().unwrap() |= VGA_INTERRUPT_BIT;
+        self.pending_interrupt
+            .fetch_or(VGA_INTERRUPT_BIT, Ordering::SeqCst);
     }
 }

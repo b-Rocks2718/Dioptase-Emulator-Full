@@ -1309,14 +1309,13 @@ impl Emulator {
         }
         let addr = addr & 0xFFFFFFFE;
         let bytes = data.to_le_bytes();
-        let mut addrs = [0u32; 2];
-        for (i, slot) in addrs.iter_mut().enumerate() {
-            if let Some(paddr) = self.convert_mem_address(addr + i as u32, 1) {
-                *slot = paddr;
-            } else {
-                return false;
-            }
+        let Some(paddr) = self.convert_mem_address(addr, 1) else {
+            return false;
+        };
+        if paddr > PHYSMEM_MAX - 1 {
+            return false;
         }
+        let addrs = [paddr, paddr + 1];
         for (i, paddr) in addrs.iter().enumerate() {
             if let Some(region) = Self::memmap_region(*paddr) {
                 if Self::warn_on_write(region) {
@@ -1327,7 +1326,7 @@ impl Emulator {
         }
         self.maybe_watch(addr, WatchAccess::Write, bytes[0]);
         self.maybe_watch(addr + 1, WatchAccess::Write, bytes[1]);
-        self.memory.write_phys_bytes(&addrs, &bytes);
+        self.memory.write_u16(paddr, data);
         true
     }
 
@@ -1344,14 +1343,13 @@ impl Emulator {
         }
         let addr = addr & 0xFFFFFFFC;
         let bytes = data.to_le_bytes();
-        let mut addrs = [0u32; 4];
-        for (i, slot) in addrs.iter_mut().enumerate() {
-            if let Some(paddr) = self.convert_mem_address(addr + i as u32, 1) {
-                *slot = paddr;
-            } else {
-                return false;
-            }
+        let Some(paddr) = self.convert_mem_address(addr, 1) else {
+            return false;
+        };
+        if paddr > PHYSMEM_MAX - 3 {
+            return false;
         }
+        let addrs = [paddr, paddr + 1, paddr + 2, paddr + 3];
         for (i, paddr) in addrs.iter().enumerate() {
             if let Some(region) = Self::memmap_region(*paddr) {
                 if Self::warn_on_write(region) {
@@ -1363,7 +1361,7 @@ impl Emulator {
         for (i, byte) in bytes.iter().enumerate() {
             self.maybe_watch(addr + i as u32, WatchAccess::Write, *byte);
         }
-        self.memory.write_phys_bytes(&addrs, &bytes);
+        self.memory.write_u32(paddr, data);
         true
     }
 
@@ -1398,16 +1396,12 @@ impl Emulator {
                 self.cregfile[9], self.pc
             );
         }
-        let mut addrs = [0u32; 2];
-        for (i, slot) in addrs.iter_mut().enumerate() {
-            if let Some(paddr) = self.convert_mem_address(addr + i as u32, 0) {
-                *slot = paddr;
-            } else {
-                return None;
-            }
+        let addr = addr & 0xFFFFFFFE;
+        let paddr = self.convert_mem_address(addr, 0)?;
+        if paddr > PHYSMEM_MAX - 1 {
+            return None;
         }
-        let mut bytes = [0u8; 2];
-        self.memory.read_phys_bytes(&addrs, &mut bytes);
+        let bytes = self.memory.read_u16(paddr).to_le_bytes();
         self.maybe_watch(addr, WatchAccess::Read, bytes[0]);
         self.maybe_watch(addr + 1, WatchAccess::Read, bytes[1]);
         Some(u16::from_le_bytes(bytes))
@@ -1424,16 +1418,12 @@ impl Emulator {
                 self.cregfile[9], self.pc
             );
         }
-        let mut addrs = [0u32; 4];
-        for (i, slot) in addrs.iter_mut().enumerate() {
-            if let Some(paddr) = self.convert_mem_address(addr + i as u32, 0) {
-                *slot = paddr;
-            } else {
-                return None;
-            }
+        let addr = addr & 0xFFFFFFFC;
+        let paddr = self.convert_mem_address(addr, 0)?;
+        if paddr > PHYSMEM_MAX - 3 {
+            return None;
         }
-        let mut bytes = [0u8; 4];
-        self.memory.read_phys_bytes(&addrs, &mut bytes);
+        let bytes = self.memory.read_u32(paddr).to_le_bytes();
         for (i, byte) in bytes.iter().enumerate() {
             self.maybe_watch(addr + i as u32, WatchAccess::Read, *byte);
         }
@@ -1550,6 +1540,7 @@ impl Emulator {
                 self.memory.get_tile_frame_buffer(),
                 self.memory.get_tile_map(),
                 self.memory.get_io_buffer(),
+                self.memory.get_input_pending(),
                 self.memory.get_tile_vscroll_register(),
                 self.memory.get_tile_hscroll_register(),
                 self.memory.get_pixel_vscroll_register(),
@@ -1643,6 +1634,7 @@ impl Emulator {
                 memory.get_tile_frame_buffer(),
                 memory.get_tile_map(),
                 memory.get_io_buffer(),
+                memory.get_input_pending(),
                 memory.get_tile_vscroll_register(),
                 memory.get_tile_hscroll_register(),
                 memory.get_pixel_vscroll_register(),
@@ -1716,12 +1708,8 @@ impl Emulator {
     }
 
     fn check_for_interrupts(&mut self) {
-        // check if io buf is nonempty
-        let io_nonempty = {
-            let binding = self.memory.get_io_buffer();
-            let io_buf = binding.read().unwrap();
-            !io_buf.is_empty()
-        };
+        // Input routing only needs a queue-empty check, not the full queue lock.
+        let io_nonempty = self.memory.has_pending_input();
         self.interrupts
             .dispatch_input(self.use_uart_rx, io_nonempty);
 

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::convert::TryFrom;
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::u16;
 
@@ -109,6 +110,7 @@ pub struct Memory {
     tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
     tile_map: Arc<RwLock<TileMap>>,
     io_buffer: Arc<RwLock<VecDeque<u16>>>,
+    input_pending: Arc<AtomicBool>,
     tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
     tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
     pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
@@ -119,12 +121,12 @@ pub struct Memory {
     vga_status_register: Arc<RwLock<u8>>,
     vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
     clk_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-    pit: Arc<RwLock<(u8, u8, u8, u8)>>,
+    pit_reload: Arc<AtomicU32>,
     pit_countdown: Arc<Mutex<u32>>,
     sprite_map: Arc<RwLock<SpriteMap>>,
     sd_card: Arc<RwLock<SdCard>>,
     sd_card2: Arc<RwLock<SdCard>>,
-    pending_interrupt: Arc<RwLock<u32>>,
+    pending_interrupt: Arc<AtomicU32>,
     use_uart_rx: bool,
 }
 
@@ -446,6 +448,7 @@ impl Memory {
             ))),
             tile_map: Arc::new(RwLock::new(TileMap::new(TILE_MAP_SIZE))),
             io_buffer: Arc::new(RwLock::new(VecDeque::new())),
+            input_pending: Arc::new(AtomicBool::new(false)),
             tile_vscroll_register: Arc::new(RwLock::new((0, 0))),
             tile_hscroll_register: Arc::new(RwLock::new((0, 0))),
             pixel_vscroll_register: Arc::new(RwLock::new((0, 0))),
@@ -456,12 +459,12 @@ impl Memory {
             vga_status_register: Arc::new(RwLock::new(0)),
             vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
             clk_register: Arc::new(RwLock::new((0, 0, 0, 0))),
-            pit: Arc::new(RwLock::new((0, 0, 0, 0))),
+            pit_reload: Arc::new(AtomicU32::new(0)),
             pit_countdown: Arc::new(Mutex::new(0)),
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
             sd_card: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
-            pending_interrupt: Arc::new(RwLock::new(0)),
+            pending_interrupt: Arc::new(AtomicU32::new(0)),
             use_uart_rx: use_uart_rx,
         }
     }
@@ -514,6 +517,35 @@ impl Memory {
         addrs.iter().any(|addr| Self::addr_touches_mmio(*addr))
     }
 
+    fn single_ram_page(addrs: &[u32]) -> Option<usize> {
+        let first = *addrs.first()?;
+        if first >= IO_START {
+            return None;
+        }
+        let page = Self::ram_page_index(first);
+        if addrs
+            .iter()
+            .all(|addr| *addr < IO_START && Self::ram_page_index(*addr) == page)
+        {
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    fn addrs_are_contiguous_pit_bytes(addrs: &[u32]) -> bool {
+        let Some(&first) = addrs.first() else {
+            return false;
+        };
+        if !(PIT_START..PIT_START + 4).contains(&first) {
+            return false;
+        }
+        addrs
+            .iter()
+            .enumerate()
+            .all(|(index, addr)| *addr == first + index as u32 && *addr < PIT_START + 4)
+    }
+
     fn maybe_warn_null_read(addr: u32) {
         if addr == 0 {
             println!("Warning: reading from physical address 0x00000000");
@@ -543,7 +575,39 @@ impl Memory {
         page.write_byte(Self::ram_page_offset(addr), data);
     }
 
+    fn read_pit_reload(&self) -> u32 {
+        self.pit_reload.load(Ordering::SeqCst)
+    }
+
+    fn write_pit_reload_byte(&self, addr: u32, data: u8) {
+        let mut reload = self.read_pit_reload();
+        write_reg_byte(&mut reload, addr, PIT_START, data);
+        self.pit_reload.store(reload, Ordering::SeqCst);
+    }
+
+    fn write_pit_reload_bytes(&self, addrs: &[u32], data: &[u8]) {
+        let mut reload = self.read_pit_reload();
+        for (addr, byte) in addrs.iter().zip(data.iter()) {
+            write_reg_byte(&mut reload, *addr, PIT_START, *byte);
+        }
+        self.pit_reload.store(reload, Ordering::SeqCst);
+    }
+
+    fn raise_pending_interrupt(&self, interrupt_bit: u32) {
+        self.pending_interrupt
+            .fetch_or(interrupt_bit, Ordering::SeqCst);
+    }
+
     fn read_phys_bytes_inner(&self, addrs: &[u32], out: &mut [u8]) {
+        if let Some(page_index) = Self::single_ram_page(addrs) {
+            let page = self.ram_pages[page_index].read().unwrap();
+            for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
+                Self::maybe_warn_null_read(*addr);
+                *slot = page.read_byte(Self::ram_page_offset(*addr));
+            }
+            return;
+        }
+
         let pages = Self::collect_ram_page_indices(addrs);
         let page_guards: Vec<_> = pages
             .iter()
@@ -562,6 +626,20 @@ impl Memory {
     }
 
     fn write_phys_bytes_inner(&self, addrs: &[u32], data: &[u8]) {
+        if Self::addrs_are_contiguous_pit_bytes(addrs) {
+            self.write_pit_reload_bytes(addrs, data);
+            return;
+        }
+
+        if let Some(page_index) = Self::single_ram_page(addrs) {
+            let mut page = self.ram_pages[page_index].write().unwrap();
+            for (addr, byte) in addrs.iter().zip(data.iter()) {
+                Self::maybe_warn_null_write(*addr, *byte);
+                page.write_byte(Self::ram_page_offset(*addr), *byte);
+            }
+            return;
+        }
+
         let pages = Self::collect_ram_page_indices(addrs);
         let mut page_guards: Vec<_> = pages
             .iter()
@@ -590,6 +668,9 @@ impl Memory {
     }
     pub fn get_io_buffer(&self) -> Arc<RwLock<VecDeque<u16>>> {
         return Arc::clone(&self.io_buffer);
+    }
+    pub fn get_input_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.input_pending)
     }
     pub fn get_tile_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
         Arc::clone(&self.tile_vscroll_register)
@@ -621,8 +702,12 @@ impl Memory {
     pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> {
         return Arc::clone(&self.vga_frame_register);
     }
-    pub fn get_pending_interrupt(&self) -> Arc<RwLock<u32>> {
+    pub fn get_pending_interrupt(&self) -> Arc<AtomicU32> {
         return Arc::clone(&self.pending_interrupt);
+    }
+
+    pub fn has_pending_input(&self) -> bool {
+        self.input_pending.load(Ordering::SeqCst)
     }
 
     pub fn read(&self, addr: u32) -> u8 {
@@ -799,7 +884,7 @@ impl Memory {
                     sd.start_dma()
                 };
                 if interrupt {
-                    *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+                    self.raise_pending_interrupt(interrupt_bit);
                 }
             }
             return true;
@@ -852,26 +937,17 @@ impl Memory {
             if self.use_uart_rx {
                 return 0;
             }
-            return self
-                .io_buffer
-                .write()
-                .unwrap()
-                .front()
-                .unwrap_or(&0)
-                .clone() as u8;
+            return self.io_buffer.read().unwrap().front().unwrap_or(&0).clone() as u8;
         } else if addr == PS2_STREAM + 1 {
             // read of upper byte will cause a pop
             if self.use_uart_rx {
                 return 0;
             }
-            return (self
-                .io_buffer
-                .write()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(0)
-                .clone()
-                >> 8) as u8;
+            let mut io_buffer = self.io_buffer.write().unwrap();
+            let value = io_buffer.pop_front().unwrap_or(0);
+            self.input_pending
+                .store(!io_buffer.is_empty(), Ordering::SeqCst);
+            return (value >> 8) as u8;
         } else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
             return self
                 .sprite_map
@@ -924,13 +1000,10 @@ impl Memory {
         } else if addr == UART_RX {
             // get value
             if self.use_uart_rx {
-                let value = self
-                    .io_buffer
-                    .write()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(0)
-                    .clone();
+                let mut io_buffer = self.io_buffer.write().unwrap();
+                let value = io_buffer.pop_front().unwrap_or(0);
+                self.input_pending
+                    .store(!io_buffer.is_empty(), Ordering::SeqCst);
                 if value & 0xFF00 != 0 {
                     return 0; // ignore keyup
                 }
@@ -939,13 +1012,13 @@ impl Memory {
                 return 0;
             }
         } else if addr == PIT_START {
-            return self.pit.read().unwrap().0;
+            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
         } else if addr == PIT_START + 1 {
-            return self.pit.read().unwrap().1;
+            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
         } else if addr == PIT_START + 2 {
-            return self.pit.read().unwrap().2;
+            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
         } else if addr == PIT_START + 3 {
-            return self.pit.read().unwrap().3;
+            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
         } else if addr == CLK_REG_START {
             return self.clk_register.read().unwrap().0;
         } else if addr == CLK_REG_START + 1 {
@@ -1103,16 +1176,16 @@ impl Memory {
                 .set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
             handled = true;
         } else if addr == PIT_START {
-            self.pit.write().unwrap().0 = data;
+            self.write_pit_reload_byte(addr, data);
             handled = true;
         } else if addr == PIT_START + 1 {
-            self.pit.write().unwrap().1 = data;
+            self.write_pit_reload_byte(addr, data);
             handled = true;
         } else if addr == PIT_START + 2 {
-            self.pit.write().unwrap().2 = data;
+            self.write_pit_reload_byte(addr, data);
             handled = true;
         } else if addr == PIT_START + 3 {
-            self.pit.write().unwrap().3 = data;
+            self.write_pit_reload_byte(addr, data);
             handled = true;
         } else if addr == CLK_REG_START {
             self.clk_register.write().unwrap().0 = data;
@@ -1183,7 +1256,7 @@ impl Memory {
             }
         };
         if init_irq {
-            *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+            self.raise_pending_interrupt(interrupt_bit);
             return;
         }
         {
@@ -1265,7 +1338,7 @@ impl Memory {
         }
 
         if done_after && irq_enable {
-            *self.pending_interrupt.write().unwrap() |= interrupt_bit;
+            self.raise_pending_interrupt(interrupt_bit);
         }
     }
 
@@ -1275,7 +1348,7 @@ impl Memory {
     pub fn tick_pit(&self) -> bool {
         let mut countdown = self.pit_countdown.lock().unwrap();
         if *countdown == 0 {
-            let reload = self.read_u32(PIT_START);
+            let reload = self.read_pit_reload();
             if reload != 0 {
                 *countdown = reload;
                 return true;
@@ -1291,11 +1364,7 @@ impl Memory {
     }
 
     pub fn check_interrupts(&self) -> u32 {
-        let pending = { *self.pending_interrupt.read().unwrap() };
-        if pending != 0 {
-            *self.pending_interrupt.write().unwrap() = 0;
-        }
-        pending
+        self.pending_interrupt.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -1304,6 +1373,7 @@ impl Memory {
 Summary:
 - Verifies SD image serialization preserves sparse/block-backed state.
 - Verifies RAM pages stay zero-filled until first write and support cross-page access.
+- Verifies PIT reload caching and pending interrupt atomics preserve MMIO behavior.
 */
 mod tests {
     use super::*;
@@ -1372,6 +1442,30 @@ mod tests {
         let mut actual = [0u8; 4];
         memory.read_phys_bytes(&addrs, &mut actual);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn pit_tick_uses_latest_written_reload() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.write_u32(PIT_START, 3);
+
+        assert!(memory.tick_pit());
+        assert_eq!(*memory.pit_countdown.lock().unwrap(), 3);
+        assert_eq!(memory.read_u32(PIT_START), 3);
+    }
+
+    #[test]
+    fn pending_interrupts_swap_and_clear() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.raise_pending_interrupt(SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT);
+
+        assert_eq!(
+            memory.check_interrupts(),
+            SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT
+        );
+        assert_eq!(memory.check_interrupts(), 0);
     }
 }
 

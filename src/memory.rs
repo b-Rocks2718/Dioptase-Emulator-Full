@@ -37,6 +37,10 @@ const TILE_FRAME_BUFFER_SIZE: u32 =
 // Align the tile framebuffer to the 4KB page size for TLB mappings.
 const TILE_FRAME_BUFFER_START: u32 = (PIXEL_FRAME_BUFFER_START - TILE_FRAME_BUFFER_SIZE) & !0xFFF;
 const IO_START: u32 = TILE_FRAME_BUFFER_START;
+const RAM_PAGE_SIZE: usize = 4096;
+const RAM_PAGE_SHIFT: u32 = 12;
+const RAM_PAGE_MASK: usize = RAM_PAGE_SIZE - 1;
+const RAM_PAGE_COUNT: usize = (IO_START as usize) / RAM_PAGE_SIZE;
 
 const PS2_STREAM: u32 = 0x7FE5800;
 const UART_TX: u32 = 0x7FE5802;
@@ -95,7 +99,12 @@ const SPRITE_MAP_START: u32 = 0x7FF0000;
 const SPRITE_MAP_SIZE: u32 = 0x8000;
 
 pub struct Memory {
-    ram: Mutex<HashMap<u32, u8>>,
+    // Ordinary RAM is sharded by 4KB page so unrelated cores can access
+    // different pages concurrently. Each page lock also guards lazy allocation.
+    ram_pages: Box<[RwLock<RamPage>]>,
+    // Multi-byte MMIO operations must stay tear-free even though device state is
+    // stored behind separate locks, so MMIO accesses share one sequencing lock.
+    mmio_lock: Mutex<()>,
     pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
     tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
     tile_map: Arc<RwLock<TileMap>>,
@@ -117,6 +126,10 @@ pub struct Memory {
     sd_card2: Arc<RwLock<SdCard>>,
     pending_interrupt: Arc<RwLock<u32>>,
     use_uart_rx: bool,
+}
+
+struct RamPage {
+    bytes: Option<Box<[u8; RAM_PAGE_SIZE]>>,
 }
 
 // Purpose: tile layer for the VGA output (two bytes per tile entry).
@@ -155,6 +168,23 @@ pub struct Sprite {
     pub x: (u8, u8),
     pub y: (u8, u8),
     pub pixels: Vec<u8>, // a 32x32 tile of pixels
+}
+
+impl RamPage {
+    fn new(bytes: Option<Box<[u8; RAM_PAGE_SIZE]>>) -> Self {
+        RamPage { bytes }
+    }
+
+    fn read_byte(&self, offset: usize) -> u8 {
+        self.bytes.as_ref().map_or(0, |bytes| bytes[offset])
+    }
+
+    fn write_byte(&mut self, offset: usize, value: u8) {
+        let bytes = self
+            .bytes
+            .get_or_insert_with(|| Box::new([0; RAM_PAGE_SIZE]));
+        bytes[offset] = value;
+    }
 }
 
 // Purpose: identify which SD card device should receive a host image.
@@ -402,7 +432,8 @@ impl Memory {
         let ticks_per_word = sd_dma_ticks_per_word.max(1);
 
         Memory {
-            ram: Mutex::new(ram),
+            ram_pages: Self::build_ram_pages(ram),
+            mmio_lock: Mutex::new(()),
             pixel_frame_buffer: Arc::new(RwLock::new(PixelFrameBuffer::new(
                 PIXEL_FRAME_WIDTH,
                 PIXEL_FRAME_HEIGHT,
@@ -432,6 +463,119 @@ impl Memory {
             sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             pending_interrupt: Arc::new(RwLock::new(0)),
             use_uart_rx: use_uart_rx,
+        }
+    }
+
+    fn build_ram_pages(image: HashMap<u32, u8>) -> Box<[RwLock<RamPage>]> {
+        let mut pages: Vec<Option<Box<[u8; RAM_PAGE_SIZE]>>> = Vec::with_capacity(RAM_PAGE_COUNT);
+        pages.resize_with(RAM_PAGE_COUNT, || None);
+        for (addr, value) in image {
+            if addr >= IO_START {
+                continue;
+            }
+            let page = Self::ram_page_index(addr);
+            let offset = Self::ram_page_offset(addr);
+            let bytes = pages[page].get_or_insert_with(|| Box::new([0; RAM_PAGE_SIZE]));
+            bytes[offset] = value;
+        }
+        pages
+            .into_iter()
+            .map(|bytes| RwLock::new(RamPage::new(bytes)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn ram_page_index(addr: u32) -> usize {
+        (addr >> RAM_PAGE_SHIFT) as usize
+    }
+
+    fn ram_page_offset(addr: u32) -> usize {
+        (addr as usize) & RAM_PAGE_MASK
+    }
+
+    fn collect_ram_page_indices(addrs: &[u32]) -> Vec<usize> {
+        let mut pages = Vec::new();
+        for addr in addrs {
+            if *addr < IO_START {
+                pages.push(Self::ram_page_index(*addr));
+            }
+        }
+        // Sort lock acquisition so multi-page accesses cannot deadlock.
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
+    fn addr_touches_mmio(addr: u32) -> bool {
+        addr >= IO_START
+    }
+
+    fn addrs_touch_mmio(addrs: &[u32]) -> bool {
+        addrs.iter().any(|addr| Self::addr_touches_mmio(*addr))
+    }
+
+    fn maybe_warn_null_read(addr: u32) {
+        if addr == 0 {
+            println!("Warning: reading from physical address 0x00000000");
+        }
+    }
+
+    fn maybe_warn_null_write(addr: u32, data: u8) {
+        if addr == 0 {
+            println!(
+                "Warning: writing to physical address 0x00000000: 0x{:08X}",
+                data
+            );
+        }
+    }
+
+    fn read_ram_byte(&self, addr: u32) -> u8 {
+        debug_assert!(addr < IO_START);
+        Self::maybe_warn_null_read(addr);
+        let page = self.ram_pages[Self::ram_page_index(addr)].read().unwrap();
+        page.read_byte(Self::ram_page_offset(addr))
+    }
+
+    fn write_ram_byte(&self, addr: u32, data: u8) {
+        debug_assert!(addr < IO_START);
+        Self::maybe_warn_null_write(addr, data);
+        let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
+        page.write_byte(Self::ram_page_offset(addr), data);
+    }
+
+    fn read_phys_bytes_inner(&self, addrs: &[u32], out: &mut [u8]) {
+        let pages = Self::collect_ram_page_indices(addrs);
+        let page_guards: Vec<_> = pages
+            .iter()
+            .map(|page| self.ram_pages[*page].read().unwrap())
+            .collect();
+        for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
+            if Self::addr_touches_mmio(*addr) {
+                *slot = self.read_mmio_byte(*addr);
+            } else {
+                Self::maybe_warn_null_read(*addr);
+                let page = Self::ram_page_index(*addr);
+                let guard_index = pages.binary_search(&page).unwrap();
+                *slot = page_guards[guard_index].read_byte(Self::ram_page_offset(*addr));
+            }
+        }
+    }
+
+    fn write_phys_bytes_inner(&self, addrs: &[u32], data: &[u8]) {
+        let pages = Self::collect_ram_page_indices(addrs);
+        let mut page_guards: Vec<_> = pages
+            .iter()
+            .map(|page| self.ram_pages[*page].write().unwrap())
+            .collect();
+        for (addr, byte) in addrs.iter().zip(data.iter()) {
+            if Self::addr_touches_mmio(*addr) {
+                self.write_mmio_byte(*addr, *byte);
+            } else {
+                Self::maybe_warn_null_write(*addr, *byte);
+                let page = Self::ram_page_index(*addr);
+                let guard_index = pages.binary_search(&page).unwrap();
+                page_guards[guard_index].write_byte(Self::ram_page_offset(*addr), *byte);
+            }
         }
     }
 
@@ -482,48 +626,94 @@ impl Memory {
     }
 
     pub fn read(&self, addr: u32) -> u8 {
-        let mut ram = self.ram.lock().unwrap();
-        self.read_internal(addr, &mut ram)
+        if Self::addr_touches_mmio(addr) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            self.read_mmio_byte(addr)
+        } else {
+            self.read_ram_byte(addr)
+        }
     }
 
     pub fn read_u16(&self, addr: u32) -> u16 {
         let addr = addr & 0xFFFFFFFE;
-        let mut ram = self.ram.lock().unwrap();
-        let lo = self.read_internal(addr, &mut ram);
-        let hi = self.read_internal(addr + 1, &mut ram);
-        (u16::from(hi) << 8) | u16::from(lo)
+        let addrs = [addr, addr + 1];
+        let mut bytes = [0u8; 2];
+        self.read_phys_bytes(&addrs, &mut bytes);
+        u16::from_le_bytes(bytes)
     }
 
     pub fn read_u32(&self, addr: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
-        let mut ram = self.ram.lock().unwrap();
-        self.read_u32_internal(addr, &mut ram)
+        let addrs = [addr, addr + 1, addr + 2, addr + 3];
+        let mut bytes = [0u8; 4];
+        self.read_phys_bytes(&addrs, &mut bytes);
+        u32::from_le_bytes(bytes)
     }
 
     // Read specific physical addresses under one lock to avoid tearing.
     pub fn read_phys_bytes(&self, addrs: &[u32], out: &mut [u8]) {
         assert_eq!(addrs.len(), out.len());
-        let mut ram = self.ram.lock().unwrap();
-        for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
-            *slot = self.read_internal(*addr, &mut ram);
+        if Self::addrs_touch_mmio(addrs) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            self.read_phys_bytes_inner(addrs, out);
+        } else {
+            self.read_phys_bytes_inner(addrs, out);
         }
     }
 
     pub fn atomic_swap_u32(&self, addr: u32, value: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
-        let mut ram = self.ram.lock().unwrap();
-        let prev = self.read_u32_internal(addr, &mut ram);
-        self.write_u32_internal(addr, value, &mut ram);
-        prev
+        let bytes = value.to_le_bytes();
+        if Self::addr_touches_mmio(addr) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            let mut prev = [0u8; 4];
+            for (offset, slot) in prev.iter_mut().enumerate() {
+                *slot = self.read_mmio_byte(addr + offset as u32);
+            }
+            for (offset, byte) in bytes.iter().enumerate() {
+                self.write_mmio_byte(addr + offset as u32, *byte);
+            }
+            u32::from_le_bytes(prev)
+        } else {
+            let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
+            let mut prev = [0u8; 4];
+            for (offset, slot) in prev.iter_mut().enumerate() {
+                *slot = page.read_byte(Self::ram_page_offset(addr + offset as u32));
+            }
+            for (offset, byte) in bytes.iter().enumerate() {
+                page.write_byte(Self::ram_page_offset(addr + offset as u32), *byte);
+            }
+            u32::from_le_bytes(prev)
+        }
     }
 
     pub fn atomic_add_u32(&self, addr: u32, value: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
-        let mut ram = self.ram.lock().unwrap();
-        let prev = self.read_u32_internal(addr, &mut ram);
-        let next = u32::wrapping_add(prev, value);
-        self.write_u32_internal(addr, next, &mut ram);
-        prev
+        if Self::addr_touches_mmio(addr) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            let mut prev = [0u8; 4];
+            for (offset, slot) in prev.iter_mut().enumerate() {
+                *slot = self.read_mmio_byte(addr + offset as u32);
+            }
+            let prev_u32 = u32::from_le_bytes(prev);
+            let next = prev_u32.wrapping_add(value).to_le_bytes();
+            for (offset, byte) in next.iter().enumerate() {
+                self.write_mmio_byte(addr + offset as u32, *byte);
+            }
+            prev_u32
+        } else {
+            let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
+            let mut prev = [0u8; 4];
+            for (offset, slot) in prev.iter_mut().enumerate() {
+                *slot = page.read_byte(Self::ram_page_offset(addr + offset as u32));
+            }
+            let prev_u32 = u32::from_le_bytes(prev);
+            let next = prev_u32.wrapping_add(value).to_le_bytes();
+            for (offset, byte) in next.iter().enumerate() {
+                page.write_byte(Self::ram_page_offset(addr + offset as u32), *byte);
+            }
+            prev_u32
+        }
     }
 
     // Purpose: load a raw SD image into the selected SD device.
@@ -622,15 +812,7 @@ impl Memory {
         true
     }
 
-    fn read_u32_internal(&self, addr: u32, ram: &mut HashMap<u32, u8>) -> u32 {
-        let b0 = self.read_internal(addr, ram) as u32;
-        let b1 = self.read_internal(addr + 1, ram) as u32;
-        let b2 = self.read_internal(addr + 2, ram) as u32;
-        let b3 = self.read_internal(addr + 3, ram) as u32;
-        (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
-    }
-
-    fn read_internal(&self, addr: u32, ram: &mut HashMap<u32, u8>) -> u8 {
+    fn read_mmio_byte(&self, addr: u32) -> u8 {
         assert!(
             addr <= PHYSMEM_MAX,
             "Physical memory address out of bounds: 0x{:08X}",
@@ -780,44 +962,44 @@ impl Memory {
             panic!("read from unmapped IO address 0x{:08X}", addr);
         }
 
-        ram.get(&addr).copied().unwrap_or(0)
+        self.read_ram_byte(addr)
     }
 
     pub fn write(&self, addr: u32, data: u8) {
-        let mut ram = self.ram.lock().unwrap();
-        self.write_internal(addr, data, &mut ram);
+        if Self::addr_touches_mmio(addr) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            self.write_mmio_byte(addr, data);
+        } else {
+            self.write_ram_byte(addr, data);
+        }
     }
 
     pub fn write_u16(&self, addr: u32, data: u16) {
         let addr = addr & 0xFFFFFFFE;
-        let mut ram = self.ram.lock().unwrap();
-        self.write_internal(addr, data as u8, &mut ram);
-        self.write_internal(addr + 1, (data >> 8) as u8, &mut ram);
+        let addrs = [addr, addr + 1];
+        let bytes = data.to_le_bytes();
+        self.write_phys_bytes(&addrs, &bytes);
     }
 
     pub fn write_u32(&self, addr: u32, data: u32) {
         let addr = addr & 0xFFFFFFFC;
-        let mut ram = self.ram.lock().unwrap();
-        self.write_u32_internal(addr, data, &mut ram);
+        let addrs = [addr, addr + 1, addr + 2, addr + 3];
+        let bytes = data.to_le_bytes();
+        self.write_phys_bytes(&addrs, &bytes);
     }
 
     // Write specific physical addresses under one lock to avoid tearing.
     pub fn write_phys_bytes(&self, addrs: &[u32], data: &[u8]) {
         assert_eq!(addrs.len(), data.len());
-        let mut ram = self.ram.lock().unwrap();
-        for (addr, byte) in addrs.iter().zip(data.iter()) {
-            self.write_internal(*addr, *byte, &mut ram);
+        if Self::addrs_touch_mmio(addrs) {
+            let _mmio = self.mmio_lock.lock().unwrap();
+            self.write_phys_bytes_inner(addrs, data);
+        } else {
+            self.write_phys_bytes_inner(addrs, data);
         }
     }
 
-    fn write_u32_internal(&self, addr: u32, data: u32, ram: &mut HashMap<u32, u8>) {
-        self.write_internal(addr, data as u8, ram);
-        self.write_internal(addr + 1, (data >> 8) as u8, ram);
-        self.write_internal(addr + 2, (data >> 16) as u8, ram);
-        self.write_internal(addr + 3, (data >> 24) as u8, ram);
-    }
-
-    fn write_internal(&self, addr: u32, data: u8, ram: &mut HashMap<u32, u8>) {
+    fn write_mmio_byte(&self, addr: u32, data: u8) {
         assert!(
             addr <= PHYSMEM_MAX,
             "Physical memory address out of bounds: 0x{:08X}",
@@ -964,8 +1146,9 @@ impl Memory {
         if addr >= IO_START && !handled {
             panic!("write to unmapped IO address 0x{:08X}", addr);
         }
-
-        ram.insert(addr, data);
+        if !handled {
+            self.write_ram_byte(addr, data);
+        }
     }
 
     // Purpose: advance the SD DMA engines by one device tick.
@@ -1057,12 +1240,11 @@ impl Memory {
 
         if dir_ram_to_sd {
             let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
-            {
-                let mut ram = self.ram.lock().unwrap();
-                for i in 0..bytes {
-                    buf[i as usize] = self.read_internal(mem_addr + i, &mut ram);
-                }
+            let mut addrs = [0u32; SD_DMA_BYTES_PER_TICK as usize];
+            for i in 0..bytes {
+                addrs[i as usize] = mem_addr + i;
             }
+            self.read_phys_bytes(&addrs[..bytes as usize], &mut buf[..bytes as usize]);
             let mut sd = sd.write().unwrap();
             for i in 0..bytes {
                 sd.write_storage_byte(sd_offset + i as u64, buf[i as usize]);
@@ -1075,10 +1257,11 @@ impl Memory {
                     buf[i as usize] = sd.read_storage_byte(sd_offset + i as u64);
                 }
             }
-            let mut ram = self.ram.lock().unwrap();
+            let mut addrs = [0u32; SD_DMA_BYTES_PER_TICK as usize];
             for i in 0..bytes {
-                self.write_internal(mem_addr + i, buf[i as usize], &mut ram);
+                addrs[i as usize] = mem_addr + i;
             }
+            self.write_phys_bytes(&addrs[..bytes as usize], &buf[..bytes as usize]);
         }
 
         if done_after && irq_enable {
@@ -1117,6 +1300,11 @@ impl Memory {
 }
 
 #[cfg(test)]
+/*
+Summary:
+- Verifies SD image serialization preserves sparse/block-backed state.
+- Verifies RAM pages stay zero-filled until first write and support cross-page access.
+*/
 mod tests {
     use super::*;
 
@@ -1150,6 +1338,40 @@ mod tests {
         assert_eq!(image[0], 0);
         assert_eq!(image[599], 0);
         assert_eq!(image[600], 0x5A);
+    }
+
+    #[test]
+    fn ram_reads_zero_from_unallocated_pages() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        assert_eq!(memory.read(0x0000_1234), 0);
+        assert_eq!(memory.read_u32(0x0000_1FFC), 0);
+    }
+
+    #[test]
+    fn ram_image_initializes_multiple_pages() {
+        let mut image = HashMap::new();
+        image.insert(0x0000_0010, 0x12);
+        image.insert(0x0000_1001, 0x34);
+
+        let memory = Memory::new(image, false, 1);
+
+        assert_eq!(memory.read(0x0000_0010), 0x12);
+        assert_eq!(memory.read(0x0000_1001), 0x34);
+        assert_eq!(memory.read(0x0000_1002), 0);
+    }
+
+    #[test]
+    fn ram_phys_byte_helpers_span_page_boundaries() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let addrs = [0x0000_0FFF, 0x0000_1000, 0x0000_1FFF, 0x0000_2000];
+        let expected = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        memory.write_phys_bytes(&addrs, &expected);
+
+        let mut actual = [0u8; 4];
+        memory.read_phys_bytes(&addrs, &mut actual);
+        assert_eq!(actual, expected);
     }
 }
 

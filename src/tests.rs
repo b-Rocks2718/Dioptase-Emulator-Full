@@ -469,6 +469,11 @@ fn rfi() {
 }
 
 #[test]
+fn eoi() {
+    run_test("tests/asm/eoi.s", 0);
+}
+
+#[test]
 fn tlb_reg() {
     run_test("tests/asm/tlb_reg.s", 0x000fffff);
 }

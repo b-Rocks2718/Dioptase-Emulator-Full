@@ -48,7 +48,7 @@ INT_VGA:
   push r4
 
   # mark interrupt as handled
-  mov  isr, r0
+  eoi 4
 
   # Read live frame counter in-handler so output does not depend on
   # foreground loop register timing.

@@ -51,5 +51,5 @@ core1:
 
 INT_IPI:
   # Clear interrupt and return.
-  mov  isr, r0
+  eoi 5
   rfi

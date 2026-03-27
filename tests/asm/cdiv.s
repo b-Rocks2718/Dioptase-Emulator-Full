@@ -55,10 +55,7 @@ key_q:
 
 end:
   # mark interrupt as handled
-  mov  r4, isr
-  movi r3, 0xFFFFFFFD
-  and  r4, r4, r3
-  mov  isr, r4
+  eoi 1
 
   # return from the interrupt
   jmp  wait
@@ -70,10 +67,7 @@ INT_TIMER:
   sw   r6, [COLOR]
 
   # mark interrupt as handled
-  mov  r4, isr
-  movi r3, 0xFFFFFFFE
-  and  r4, r4, r3
-  mov  isr, r4
+  eoi 0
 
   # return from the interrupt
   jmp  set_color

@@ -322,7 +322,14 @@ fn disassemble_kernel(instr: u32) -> String {
                 format!("ipi {}, {}", reg_name(r_a), instr & 0x3)
             }
         }
-        5 => "rft".to_string(),
+        5 => {
+            let all = ((instr >> 11) & 1) != 0;
+            if all {
+                "eoi all".to_string()
+            } else {
+                format!("eoi {}", instr & 0xF)
+            }
+        }
         _ => format!("kernel {}", fmt_imm_hex(instr)),
     }
 }
@@ -342,5 +349,22 @@ pub fn disassemble(instr: u32) -> String {
         16..=21 => disassemble_atomic(opcode, instr),
         31 => disassemble_kernel(instr),
         _ => format!("data {}", fmt_imm_hex(instr)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::disassemble;
+
+    #[test]
+    fn disassembles_eoi_specific() {
+        let instr = (31u32 << 27) | (5u32 << 12) | 6u32;
+        assert_eq!(disassemble(instr), "eoi 6");
+    }
+
+    #[test]
+    fn disassembles_eoi_all() {
+        let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
+        assert_eq!(disassemble(instr), "eoi all");
     }
 }

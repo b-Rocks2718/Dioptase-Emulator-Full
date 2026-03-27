@@ -520,6 +520,10 @@ impl InterruptController {
         self.pending[core].fetch_or(bits, Ordering::Release);
     }
 
+    fn peek_pending(&self, core: usize) -> u32 {
+        self.pending[core].load(Ordering::Acquire)
+    }
+
     fn take_pending(&self, core: usize) -> u32 {
         self.pending[core].swap(0, Ordering::AcqRel)
     }
@@ -1062,9 +1066,15 @@ impl Emulator {
 
     fn write_isr(&mut self, value: u32) {
         let old = self.cregfile[2];
-        self.cregfile[2] = value;
+        // Match the hardware cregfile semantics: software ISR writes must not
+        // drop interrupts that become pending during a read/modify/write clear.
+        let pending = self.interrupts.peek_pending(self.core_id as usize);
+        if (pending & IPI_INTERRUPT_BIT) != 0 {
+            self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
+        }
+        self.cregfile[2] = value | pending;
         // Let the interrupt controller know when input interrupts are cleared.
-        let cleared = old & !value;
+        let cleared = old & !self.cregfile[2];
         if cleared != 0 {
             self.interrupts.ack_input(self.core_id as usize, cleared);
         }
@@ -1090,10 +1100,9 @@ impl Emulator {
     fn write_creg(&mut self, idx: usize, value: u32) {
         match idx {
             // Route ISR/MBI through helpers so we can track clears and core-local state.
-            2 => self.write_isr(value),
-            9 => {
+            2 | 9 => {
                 // CID is read-only.
-                println!("Warning: attempt to write read-only CID register");
+                println!("Warning: attempt to write read-only register cr{}", idx);
             }
             10 => self.write_mbi(value),
 
@@ -2683,6 +2692,7 @@ impl Emulator {
             2 => self.mode_op(instr),
             3 => self.rfe(instr),
             4 => self.ipi_op(instr),
+            5 => self.eoi_op(instr),
             _ => {
                 self.raise_exc_instr();
                 return;
@@ -2771,6 +2781,18 @@ impl Emulator {
             }
         }
 
+        self.pc += 4;
+    }
+
+    fn eoi_op(&mut self, instr: u32) {
+        let all = ((instr >> 11) & 1) != 0;
+        let cleared_mask = if all {
+            u32::MAX
+        } else {
+            1u32 << (instr & 0xF)
+        };
+        let next_isr = self.cregfile[2] & !cleared_mask;
+        self.write_isr(next_isr);
         self.pc += 4;
     }
 
@@ -2879,4 +2901,99 @@ fn run_core_loop(
     }
 
     shared.record_exit(core_id, cpu.regfile[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_isr_preserves_concurrently_pending_ipi() {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(2);
+        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
+
+        cpu.cregfile[2] = TIMER_INTERRUPT_BIT;
+
+        assert!(interrupts.send_ipi(0, 0x1234_5678));
+
+        cpu.write_isr(0);
+
+        assert_eq!(
+            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            "writing ISR to clear one interrupt must preserve a concurrently pending IPI",
+        );
+        assert_eq!(
+            cpu.cregfile[10], 0x1234_5678,
+            "MBI must reflect the visible pending IPI payload",
+        );
+
+        cpu.check_for_interrupts();
+
+        assert_eq!(
+            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            "taking the queued pending IPI on the next tick must not change the visible ISR bit",
+        );
+        assert_eq!(
+            cpu.cregfile[10], 0x1234_5678,
+            "the queued IPI payload must remain stable after the next tick snapshots it",
+        );
+    }
+
+    #[test]
+    fn crmv_write_to_isr_is_ignored() {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(1);
+        let mut cpu = Emulator::from_shared(memory, interrupts, false, 0);
+
+        cpu.cregfile[2] = TIMER_INTERRUPT_BIT;
+        cpu.regfile[1] = 0xFFFF_FFFF;
+
+        let instr = (31u32 << 27) | (2u32 << 22) | (1u32 << 17) | (1u32 << 12);
+        cpu.crmv_op(instr);
+
+        assert_eq!(
+            cpu.cregfile[2], TIMER_INTERRUPT_BIT,
+            "crmv writes to ISR must be ignored so interrupt acknowledgement goes through eoi",
+        );
+    }
+
+    #[test]
+    fn eoi_specific_clears_only_selected_isr_bit() {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(1);
+        let mut cpu = Emulator::from_shared(memory, interrupts, false, 0);
+
+        cpu.cregfile[2] = TIMER_INTERRUPT_BIT | SD_INTERRUPT_BIT;
+
+        let instr = (31u32 << 27) | (5u32 << 12);
+        cpu.eoi_op(instr);
+
+        assert_eq!(
+            cpu.cregfile[2], SD_INTERRUPT_BIT,
+            "eoi n must clear only the requested ISR bit",
+        );
+    }
+
+    #[test]
+    fn eoi_all_preserves_concurrently_pending_ipi() {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(2);
+        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
+
+        cpu.cregfile[2] = TIMER_INTERRUPT_BIT | SD_INTERRUPT_BIT;
+        assert!(interrupts.send_ipi(0, 0xCAFE_BABE));
+
+        let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
+        cpu.eoi_op(instr);
+
+        assert_eq!(
+            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            "eoi all must clear handled ISR bits without dropping a concurrently pending IPI",
+        );
+        assert_eq!(
+            cpu.cregfile[10], 0xCAFE_BABE,
+            "eoi all must expose the visible pending IPI payload in MBI",
+        );
+    }
 }

@@ -131,7 +131,7 @@ pub struct Memory {
 }
 
 struct RamPage {
-    bytes: Option<Box<[u8; RAM_PAGE_SIZE]>>,
+    bytes: [u8; RAM_PAGE_SIZE],
 }
 
 // Purpose: tile layer for the VGA output (two bytes per tile entry).
@@ -173,19 +173,41 @@ pub struct Sprite {
 }
 
 impl RamPage {
-    fn new(bytes: Option<Box<[u8; RAM_PAGE_SIZE]>>) -> Self {
-        RamPage { bytes }
+    fn new() -> Self {
+        RamPage {
+            bytes: [0; RAM_PAGE_SIZE],
+        }
     }
 
     fn read_byte(&self, offset: usize) -> u8 {
-        self.bytes.as_ref().map_or(0, |bytes| bytes[offset])
+        self.bytes[offset]
     }
 
     fn write_byte(&mut self, offset: usize, value: u8) {
-        let bytes = self
-            .bytes
-            .get_or_insert_with(|| Box::new([0; RAM_PAGE_SIZE]));
-        bytes[offset] = value;
+        self.bytes[offset] = value;
+    }
+
+    fn read_u16_le(&self, offset: usize) -> u16 {
+        u16::from_le_bytes([self.bytes[offset], self.bytes[offset + 1]])
+    }
+
+    fn read_u32_le(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+        ])
+    }
+
+    fn write_u16_le(&mut self, offset: usize, value: u16) {
+        let bytes = value.to_le_bytes();
+        self.bytes[offset..offset + 2].copy_from_slice(&bytes);
+    }
+
+    fn write_u32_le(&mut self, offset: usize, value: u32) {
+        let bytes = value.to_le_bytes();
+        self.bytes[offset..offset + 4].copy_from_slice(&bytes);
     }
 }
 
@@ -470,22 +492,21 @@ impl Memory {
     }
 
     fn build_ram_pages(image: HashMap<u32, u8>) -> Box<[RwLock<RamPage>]> {
-        let mut pages: Vec<Option<Box<[u8; RAM_PAGE_SIZE]>>> = Vec::with_capacity(RAM_PAGE_COUNT);
-        pages.resize_with(RAM_PAGE_COUNT, || None);
+        // The kernel's physical frame allocator first-touches nearly every RAM
+        // page during boot, so sparse per-page host allocations make early boot
+        // disproportionately expensive. Keep page-level locking for multicore
+        // safety, but back each page with dense zero-initialized storage.
+        let mut pages: Vec<RwLock<RamPage>> = Vec::with_capacity(RAM_PAGE_COUNT);
+        pages.resize_with(RAM_PAGE_COUNT, || RwLock::new(RamPage::new()));
         for (addr, value) in image {
             if addr >= IO_START {
                 continue;
             }
             let page = Self::ram_page_index(addr);
             let offset = Self::ram_page_offset(addr);
-            let bytes = pages[page].get_or_insert_with(|| Box::new([0; RAM_PAGE_SIZE]));
-            bytes[offset] = value;
+            pages[page].get_mut().unwrap().write_byte(offset, value);
         }
-        pages
-            .into_iter()
-            .map(|bytes| RwLock::new(RamPage::new(bytes)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
+        pages.into_boxed_slice()
     }
 
     fn ram_page_index(addr: u32) -> usize {
@@ -527,6 +548,22 @@ impl Memory {
             .iter()
             .all(|addr| *addr < IO_START && Self::ram_page_index(*addr) == page)
         {
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    fn ram_range_within_single_page(addr: u32, width: u32) -> Option<usize> {
+        if width == 0 || addr >= IO_START {
+            return None;
+        }
+        let end = addr.checked_add(width - 1)?;
+        if end >= IO_START {
+            return None;
+        }
+        let page = Self::ram_page_index(addr);
+        if Self::ram_page_index(end) == page {
             Some(page)
         } else {
             None
@@ -721,6 +758,11 @@ impl Memory {
 
     pub fn read_u16(&self, addr: u32) -> u16 {
         let addr = addr & 0xFFFFFFFE;
+        if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
+            Self::maybe_warn_null_read(addr);
+            let page = self.ram_pages[page_index].read().unwrap();
+            return page.read_u16_le(Self::ram_page_offset(addr));
+        }
         let addrs = [addr, addr + 1];
         let mut bytes = [0u8; 2];
         self.read_phys_bytes(&addrs, &mut bytes);
@@ -729,6 +771,11 @@ impl Memory {
 
     pub fn read_u32(&self, addr: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
+        if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
+            Self::maybe_warn_null_read(addr);
+            let page = self.ram_pages[page_index].read().unwrap();
+            return page.read_u32_le(Self::ram_page_offset(addr));
+        }
         let addrs = [addr, addr + 1, addr + 2, addr + 3];
         let mut bytes = [0u8; 4];
         self.read_phys_bytes(&addrs, &mut bytes);
@@ -1049,6 +1096,12 @@ impl Memory {
 
     pub fn write_u16(&self, addr: u32, data: u16) {
         let addr = addr & 0xFFFFFFFE;
+        if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
+            Self::maybe_warn_null_write(addr, data.to_le_bytes()[0]);
+            let mut page = self.ram_pages[page_index].write().unwrap();
+            page.write_u16_le(Self::ram_page_offset(addr), data);
+            return;
+        }
         let addrs = [addr, addr + 1];
         let bytes = data.to_le_bytes();
         self.write_phys_bytes(&addrs, &bytes);
@@ -1056,6 +1109,12 @@ impl Memory {
 
     pub fn write_u32(&self, addr: u32, data: u32) {
         let addr = addr & 0xFFFFFFFC;
+        if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
+            Self::maybe_warn_null_write(addr, data.to_le_bytes()[0]);
+            let mut page = self.ram_pages[page_index].write().unwrap();
+            page.write_u32_le(Self::ram_page_offset(addr), data);
+            return;
+        }
         let addrs = [addr, addr + 1, addr + 2, addr + 3];
         let bytes = data.to_le_bytes();
         self.write_phys_bytes(&addrs, &bytes);

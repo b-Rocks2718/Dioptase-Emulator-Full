@@ -2624,18 +2624,20 @@ impl Emulator {
     fn syscall(&mut self, instr: u32) {
         let imm = instr & 0xFF;
 
-        self.psr_inc_checked("syscall");
-
         match imm {
             1 => {
                 // sys EXIT
-
-                // save pc and flags
-                self.cregfile[4] = self.pc + 4;
+                // Syscalls resume at the following instruction, but otherwise
+                // snapshot trap state like other exception entries.
+                self.save_state();
+                self.cregfile[4] = self.pc.wrapping_add(4);
+                self.psr_inc_checked("syscall");
 
                 self.pc = self.mem_read32(0x01 * 4).expect("shouldnt fail");
             }
             _ => {
+                // Unsupported syscall encodings are invalid instructions, not
+                // nested syscall+invalid-instruction traps.
                 self.raise_exc_instr();
                 return;
             }

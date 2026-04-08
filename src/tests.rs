@@ -484,6 +484,16 @@ fn syscall() {
 }
 
 #[test]
+fn syscall_masks_global_interrupts() {
+    run_test("tests/asm/syscall_imr.s", 1);
+}
+
+#[test]
+fn invalid_syscall_increments_psr_once() {
+    run_test("tests/asm/invalid_syscall_psr.s", 2);
+}
+
+#[test]
 fn ksp() {
     run_test("tests/asm/ksp.s", 0xA9);
 }

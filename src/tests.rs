@@ -474,6 +474,31 @@ fn tlb_reg() {
 }
 
 #[test]
+fn tlb_fault_absent() {
+    run_test("tests/asm/tlb_fault_absent.s", 0);
+}
+
+#[test]
+fn tlb_fault_read() {
+    run_test("tests/asm/tlb_fault_read.s", 0x1);
+}
+
+#[test]
+fn tlb_fault_write() {
+    run_test("tests/asm/tlb_fault_write.s", 0x2);
+}
+
+#[test]
+fn tlb_fault_exec() {
+    run_test("tests/asm/tlb_fault_exec.s", 0x4);
+}
+
+#[test]
+fn tlb_fault_user() {
+    run_test("tests/asm/tlb_fault_user.s", 0x8);
+}
+
+#[test]
 fn syscall() {
     run_test("tests/asm/syscall.s", 4);
 }

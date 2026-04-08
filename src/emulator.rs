@@ -40,6 +40,20 @@ const KERNEL_INT_STACK_END: u32 = 0x000F_0000;
 const KERNEL_STACK_START: u32 = 0x000F_0000;
 const KERNEL_STACK_END: u32 = 0x0010_0000;
 const TLB_ENTRIES: usize = 16;
+const TLB_FLAG_READ: u32 = 0x1;
+const TLB_FLAG_WRITE: u32 = 0x2;
+const TLB_FLAG_EXEC: u32 = 0x4;
+const TLB_FLAG_USER: u32 = 0x8;
+const TLB_FAULT_ABSENT: u32 = 0x0;
+const CREG_PID: usize = 1;
+const CREG_IMR: usize = 3;
+const CREG_EPC: usize = 4;
+const CREG_FLG: usize = 5;
+const CREG_EFG: usize = 6;
+const CREG_TLB: usize = 7;
+const CREG_CID: usize = 9;
+const CREG_MBI: usize = 10;
+const CREG_TLBF: usize = 12;
 
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
@@ -53,6 +67,12 @@ pub struct RandomCache {
     private_table: HashMap<(u32, u32), u32>,
     global_table: HashMap<u32, u32>,
     total_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TlbAccess {
+    Hit(u32),
+    Fault(u32),
 }
 
 impl RandomCache {
@@ -91,111 +111,62 @@ impl RandomCache {
         }
     }
 
-    pub fn access(&self, pid: u32, vpn: u32, operation: u32, kmode: bool) -> Option<u32> {
-        // used whenever a memory access is made
+    fn fault_flags(entry: u32, operation: u32, kmode: bool) -> u32 {
+        let mut flags = 0;
+        match operation {
+            0 => {
+                if entry & TLB_FLAG_READ == 0 {
+                    flags |= TLB_FLAG_READ;
+                }
+            }
+            1 => {
+                if entry & TLB_FLAG_WRITE == 0 {
+                    flags |= TLB_FLAG_WRITE;
+                }
+            }
+            2 => {
+                if entry & TLB_FLAG_EXEC == 0 {
+                    flags |= TLB_FLAG_EXEC;
+                }
+            }
+            _ => panic!("invalid operation code"),
+        }
 
+        if !kmode && entry & TLB_FLAG_USER == 0 {
+            flags |= TLB_FLAG_USER;
+        }
+
+        flags
+    }
+
+    fn classify_entry(entry: u32, operation: u32, kmode: bool) -> TlbAccess {
+        let flags = Self::fault_flags(entry, operation, kmode);
+        if flags == 0 {
+            TlbAccess::Hit(entry & 0xFFFFF000)
+        } else {
+            TlbAccess::Fault(flags)
+        }
+    }
+
+    fn access(&self, pid: u32, vpn: u32, operation: u32, kmode: bool) -> TlbAccess {
+        // Memory access keeps the existing private-then-global lookup order so
+        // emulator behavior does not change for duplicate private/global entries.
         assert!(self.total_size() <= self.total_capacity);
 
-        // operations: 0 => read, 1 => write, 2 => fetch
-
         let key = (pid, vpn);
-        let result = self
-            .private_table
-            .get(&key)
-            .copied()
-            .and_then(|v| {
-                if operation == 0 {
-                    // read operation
-                    if v & 0x00000001 == 0 {
-                        // not readable
-                        None
-                    } else {
-                        Some(v)
-                    }
-                } else if operation == 1 {
-                    // write operation
-                    if v & 0x00000002 == 0 {
-                        // not writable
-                        None
-                    } else {
-                        Some(v)
-                    }
-                } else if operation == 2 {
-                    // fetch operation
-                    if v & 0x00000004 == 0 {
-                        // not executable
-                        None
-                    } else {
-                        Some(v)
-                    }
-                } else {
-                    panic!("invalid operation code");
-                }
-            })
-            .and_then(|v| {
-                if !kmode {
-                    if v & 0x00000008 == 0 {
-                        // user mode access not allowed
-                        None
-                    } else {
-                        Some(v)
-                    }
-                } else {
-                    Some(v)
-                }
-            })
-            .map(|v| v & 0xFFFFF000);
-
-        if result.is_some() {
-            return result;
-        } else {
-            // try global table
-            self.global_table
-                .get(&vpn)
-                .copied()
-                .and_then(|v| {
-                    if operation == 0 {
-                        // read operation
-                        if v & 0x00000001 == 0 {
-                            // not readable
-                            None
-                        } else {
-                            Some(v)
-                        }
-                    } else if operation == 1 {
-                        // write operation
-                        if v & 0x00000002 == 0 {
-                            // not writable
-                            None
-                        } else {
-                            Some(v)
-                        }
-                    } else if operation == 2 {
-                        // fetch operation
-                        if v & 0x00000004 == 0 {
-                            // not executable
-                            None
-                        } else {
-                            Some(v)
-                        }
-                    } else {
-                        panic!("invalid operation code");
-                    }
-                })
-                .and_then(|v| {
-                    if !kmode {
-                        if v & 0x00000008 == 0 {
-                            // user mode access not allowed
-                            None
-                        } else {
-                            Some(v)
-                        }
-                    } else {
-                        Some(v)
-                    }
-                })
-                .map(|v| v & 0xFFFFF000)
+        let mut private_fault = None;
+        if let Some(entry) = self.private_table.get(&key).copied() {
+            match Self::classify_entry(entry, operation, kmode) {
+                TlbAccess::Hit(ppn) => return TlbAccess::Hit(ppn),
+                TlbAccess::Fault(flags) => private_fault = Some(flags),
+            }
         }
+
+        if let Some(entry) = self.global_table.get(&vpn).copied() {
+            return Self::classify_entry(entry, operation, kmode);
+        }
+
+        TlbAccess::Fault(private_fault.unwrap_or(TLB_FAULT_ABSENT))
     }
 
     pub fn read(&self, pid: u32, vpn: u32) -> Option<u32> {
@@ -674,7 +645,7 @@ impl RunShared {
 
 pub struct Emulator {
     regfile: [u32; 32],  // r0 - r31
-    cregfile: [u32; 12], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO
+    cregfile: [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, TLBF
     // in FLG, flags are: carry | zero | sign | overflow
     memory: Arc<Memory>,
     interrupts: Arc<InterruptController>,
@@ -687,6 +658,7 @@ pub struct Emulator {
     count: u32,
     core_id: u32,
     use_uart_rx: bool,
+    pending_tlb_fault: Option<u32>,
     watchpoints: Vec<Watchpoint>,
     watchpoint_hit: Option<WatchpointHit>,
 }
@@ -1031,12 +1003,12 @@ impl Emulator {
         use_uart_rx: bool,
         core_id: u32,
     ) -> Emulator {
-        let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
+        let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
         // CID is a read-only core identifier.
-        cregfile[9] = core_id;
+        cregfile[CREG_CID] = core_id;
         if core_id != 0 {
             // Allow IPI wakeups on secondary cores by default.
-            cregfile[3] = 0x80000020;
+            cregfile[CREG_IMR] = 0x80000020;
         }
 
         Emulator {
@@ -1055,6 +1027,7 @@ impl Emulator {
             count: 0,
             core_id,
             use_uart_rx,
+            pending_tlb_fault: None,
             watchpoints: Vec::new(),
             watchpoint_hit: None,
         }
@@ -1092,7 +1065,7 @@ impl Emulator {
         match idx {
             // ISR and MBI are core-local control registers.
             2 => self.read_isr(),
-            10 => self.read_mbi(),
+            CREG_MBI => self.read_mbi(),
             _ => self.cregfile[idx],
         }
     }
@@ -1100,11 +1073,11 @@ impl Emulator {
     fn write_creg(&mut self, idx: usize, value: u32) {
         match idx {
             // Route ISR/MBI through helpers so we can track clears and core-local state.
-            2 | 9 => {
+            2 | CREG_CID => {
                 // CID is read-only.
                 println!("Warning: attempt to write read-only register cr{}", idx);
             }
-            10 => self.write_mbi(value),
+            CREG_MBI => self.write_mbi(value),
 
             _ => {
                 if idx == 0 && TRACE_INTERRUPTS.load(Ordering::Relaxed) {
@@ -1116,6 +1089,18 @@ impl Emulator {
                 self.cregfile[idx] = value;
             }
         }
+    }
+
+    fn clear_pending_tlb_fault(&mut self) {
+        self.pending_tlb_fault = None;
+    }
+
+    fn record_pending_tlb_fault(&mut self, flags: u32) {
+        self.pending_tlb_fault = Some(flags);
+    }
+
+    fn take_pending_tlb_fault(&mut self) -> u32 {
+        self.pending_tlb_fault.take().unwrap_or(TLB_FAULT_ABSENT)
     }
 
     // Kernel mode is derived from the PSR (cr0) depth, not a cached flag.
@@ -1213,29 +1198,27 @@ impl Emulator {
         }
     }
 
-    fn convert_mem_address(&self, addr: u32, operation: u32) -> Option<u32> {
+    fn convert_mem_address(&mut self, addr: u32, operation: u32) -> Option<u32> {
         let kmode = self.get_kmode();
         if kmode {
             if addr <= PHYSMEM_MAX {
                 Some(addr)
-            } else if let Some(result) =
-                self.tlb
-                    .access(self.cregfile[1], addr >> 12, operation, kmode)
-            {
-                Some(result | (addr & 0xFFF))
             } else {
-                // TLB_KMISS
-                None
+                match self.tlb.access(self.cregfile[CREG_PID], addr >> 12, operation, kmode) {
+                    TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
+                    TlbAccess::Fault(flags) => {
+                        self.record_pending_tlb_fault(flags);
+                        None
+                    }
+                }
             }
         } else {
-            if let Some(result) = self
-                .tlb
-                .access(self.cregfile[1], addr >> 12, operation, kmode)
-            {
-                Some(result | (addr & 0xFFF))
-            } else {
-                // TLB_UMISS
-                None
+            match self.tlb.access(self.cregfile[CREG_PID], addr >> 12, operation, kmode) {
+                TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
+                TlbAccess::Fault(flags) => {
+                    self.record_pending_tlb_fault(flags);
+                    None
+                }
             }
         }
     }
@@ -1244,33 +1227,35 @@ impl Emulator {
         // save state as an interrupt happens
 
         // save pc
-        self.cregfile[4] = self.pc;
+        self.cregfile[CREG_EPC] = self.pc;
 
         // save flags
-        self.cregfile[6] = self.cregfile[5];
+        self.cregfile[CREG_EFG] = self.cregfile[CREG_FLG];
 
         // disable interrupts
-        self.cregfile[3] &= 0x7FFFFFFF;
+        self.cregfile[CREG_IMR] &= 0x7FFFFFFF;
     }
 
-    fn raise_tlb_miss(&mut self, addr: u32) {
+    fn raise_tlb_miss(&mut self, addr: u32, flags: u32) {
         // TLB_UMISS = 0x82
         // TLB_KMISS = 0x83
 
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             let kmode = self.get_kmode();
             println!(
-                "[core {}] exception tlb_{}miss addr=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
+                "[core {}] exception tlb_{}miss addr=0x{:08X} flags=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
                 self.core_id,
                 if kmode { "k" } else { "u" },
                 addr,
+                flags,
                 self.pc,
                 self.cregfile[0]
             );
         }
 
         // save address and pid that caused exception
-        self.cregfile[7] = (addr >> 12) | (self.cregfile[1] << 20);
+        self.cregfile[CREG_TLB] = (addr >> 12) | (self.cregfile[CREG_PID] << 20);
+        self.cregfile[CREG_TLBF] = flags;
 
         self.save_state();
 
@@ -1283,8 +1268,14 @@ impl Emulator {
         }
     }
 
+    fn raise_pending_tlb_miss(&mut self, addr: u32) {
+        let flags = self.take_pending_tlb_fault();
+        self.raise_tlb_miss(addr, flags);
+    }
+
     // memory operations must be aligned
     fn mem_write8(&mut self, addr: u32, data: u8) -> bool {
+        self.clear_pending_tlb_fault();
         if addr == 0 {
             println!(
                 "Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
@@ -1306,6 +1297,7 @@ impl Emulator {
     }
 
     fn mem_write16(&mut self, addr: u32, data: u16) -> bool {
+        self.clear_pending_tlb_fault();
         if (addr & 1) != 0 {
             // unaligned access
             println!("Warning: unaligned memory access at 0x{:08x}", addr);
@@ -1340,6 +1332,7 @@ impl Emulator {
     }
 
     fn mem_write32(&mut self, addr: u32, data: u32) -> bool {
+        self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
             // unaligned access
             println!("Warning: unaligned memory access at {:08x}", addr);
@@ -1375,6 +1368,7 @@ impl Emulator {
     }
 
     fn mem_read8(&mut self, addr: u32) -> Option<u8> {
+        self.clear_pending_tlb_fault();
         if addr == 0 {
             println!(
                 "Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
@@ -1395,6 +1389,7 @@ impl Emulator {
     }
 
     fn mem_read16(&mut self, addr: u32) -> Option<u16> {
+        self.clear_pending_tlb_fault();
         if (addr & 1) != 0 {
             // unaligned access
             println!("Warning: unaligned memory access at {:08x}", addr);
@@ -1417,6 +1412,7 @@ impl Emulator {
     }
 
     fn mem_read32(&mut self, addr: u32) -> Option<u32> {
+        self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
             // unaligned access
             println!("Warning: unaligned memory access at {:08x}", addr);
@@ -1440,6 +1436,7 @@ impl Emulator {
     }
 
     fn mem_atomic_swap32(&mut self, addr: u32, value: u32) -> Option<u32> {
+        self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
             println!("Warning: unaligned memory access at {:08x}", addr);
         }
@@ -1462,6 +1459,7 @@ impl Emulator {
     }
 
     fn mem_atomic_add32(&mut self, addr: u32, value: u32) -> Option<u32> {
+        self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
             println!("Warning: unaligned memory access at {:08x}", addr);
         }
@@ -1506,6 +1504,7 @@ impl Emulator {
     }
 
     fn fetch(&mut self, vaddr: u32) -> Option<u32> {
+        self.clear_pending_tlb_fault();
         if (vaddr & 3) != 0 {
             // unaligned access
             println!("Warning: unaligned memory access at {:08x}", vaddr);
@@ -1535,7 +1534,7 @@ impl Emulator {
             if let Some(instr) = instr {
                 self.execute(instr);
             } else {
-                self.raise_tlb_miss(self.pc);
+                self.raise_pending_tlb_miss(self.pc);
             }
         }
         self.count = self.count.wrapping_add(1);
@@ -2219,7 +2218,7 @@ impl Emulator {
                 self.write_reg(r_a, data);
             } else {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             };
         } else {
@@ -2244,7 +2243,7 @@ impl Emulator {
             };
             if !success {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             }
         }
@@ -2301,7 +2300,7 @@ impl Emulator {
                 self.write_reg(r_a, data);
             } else {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             };
         } else {
@@ -2328,7 +2327,7 @@ impl Emulator {
 
             if !success {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             }
         }
@@ -2375,7 +2374,7 @@ impl Emulator {
                 self.write_reg(r_a, data);
             } else {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             };
         } else {
@@ -2402,7 +2401,7 @@ impl Emulator {
 
             if !success {
                 // TLB Miss
-                self.raise_tlb_miss(addr);
+                self.raise_pending_tlb_miss(addr);
                 return;
             }
         }
@@ -2438,7 +2437,7 @@ impl Emulator {
             self.write_reg(r_a, data);
         } else {
             // TLB Miss
-            self.raise_tlb_miss(addr);
+            self.raise_pending_tlb_miss(addr);
             return;
         }
 
@@ -2477,7 +2476,7 @@ impl Emulator {
             self.write_reg(r_a, data);
         } else {
             // TLB Miss
-            self.raise_tlb_miss(addr);
+            self.raise_pending_tlb_miss(addr);
             return;
         }
 
@@ -2513,7 +2512,7 @@ impl Emulator {
             self.write_reg(r_a, data);
         } else {
             // TLB Miss
-            self.raise_tlb_miss(addr);
+            self.raise_pending_tlb_miss(addr);
             return;
         }
 

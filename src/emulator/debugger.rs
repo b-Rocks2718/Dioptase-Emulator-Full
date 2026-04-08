@@ -629,7 +629,7 @@ impl Emulator {
                 StepOutcome::Executed { pc, instr }
             }
             None => {
-                self.raise_tlb_miss(pc);
+                self.raise_pending_tlb_miss(pc);
                 self.count = self.count.wrapping_add(1);
                 StepOutcome::TlbMiss { pc }
             }
@@ -665,17 +665,18 @@ impl Emulator {
             self.read_creg(4)
         );
         println!(
-            "FLG: {:08X} CDV: {:08X} TLB: {:08X} KSP: {:08X}",
+            "FLG: {:08X} EFG: {:08X} TLB: {:08X} KSP: {:08X}",
             self.read_creg(5),
             self.read_creg(6),
             self.read_creg(7),
             self.read_creg(8)
         );
         println!(
-            "CID: {:08X} MBI: {:08X} MBO: {:08X}",
+            "CID: {:08X} MBI: {:08X} MBO: {:08X} TLBF: {:08X}",
             self.read_creg(9),
             self.read_creg(10),
-            self.read_creg(11)
+            self.read_creg(11),
+            self.read_creg(12)
         );
     }
 
@@ -687,12 +688,13 @@ impl Emulator {
         println!("cr3 (imr): {:08X}", self.read_creg(3));
         println!("cr4 (epc): {:08X}", self.read_creg(4));
         println!("cr5 (flg): {:08X}", self.read_creg(5));
-        println!("cr6 (cdv): {:08X}", self.read_creg(6));
+        println!("cr6 (efg): {:08X}", self.read_creg(6));
         println!("cr7 (tlb): {:08X}", self.read_creg(7));
         println!("cr8 (ksp): {:08X}", self.read_creg(8));
         println!("cr9 (cid): {:08X}", self.read_creg(9));
         println!("cr10 (mbi): {:08X}", self.read_creg(10));
         println!("cr11 (mbo): {:08X}", self.read_creg(11));
+        println!("cr12 (tlbf): {:08X}", self.read_creg(12));
     }
 
     fn print_single_reg(&self, token: &str) -> bool {
@@ -742,6 +744,10 @@ impl Emulator {
                 println!("flg (cr5) = {:08X}", self.read_creg(5));
                 return true;
             }
+            "efg" => {
+                println!("efg (cr6) = {:08X}", self.read_creg(6));
+                return true;
+            }
             "cdv" => {
                 println!("cdv (cr6) = {:08X}", self.read_creg(6));
                 return true;
@@ -760,6 +766,10 @@ impl Emulator {
             }
             "mbo" => {
                 println!("mbo (cr11) = {:08X}", self.read_creg(11));
+                return true;
+            }
+            "tlbf" => {
+                println!("tlbf (cr12) = {:08X}", self.read_creg(12));
                 return true;
             }
             _ => {}
@@ -829,6 +839,10 @@ impl Emulator {
                 self.write_creg(5, value);
                 return true;
             }
+            "efg" => {
+                self.write_creg(6, value);
+                return true;
+            }
             "cdv" => {
                 self.write_creg(6, value);
                 return true;
@@ -842,6 +856,10 @@ impl Emulator {
                 return true;
             }
             "isp" => {
+                self.write_creg(12, value);
+                return true;
+            }
+            "tlbf" => {
                 self.write_creg(12, value);
                 return true;
             }

@@ -38,4 +38,4 @@ INT_IPI:
   movi r3, 0x1000
   swa  r2 [r3, 0]
   eoi 5
-  rfi
+  rfe

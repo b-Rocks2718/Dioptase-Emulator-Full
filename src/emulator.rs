@@ -2692,7 +2692,13 @@ impl Emulator {
             0 => self.tlb_op(instr),
             1 => self.crmv_op(instr),
             2 => self.mode_op(instr),
-            3 => self.rfe(instr),
+            3 => {
+                if ((instr >> 11) & 1) != 0 {
+                    self.raise_exc_instr();
+                    return;
+                }
+                self.rfe(instr)
+            }
             4 => self.ipi_op(instr),
             5 => self.eoi_op(instr),
             _ => {
@@ -2818,18 +2824,15 @@ impl Emulator {
     fn rfe(&mut self, instr: u32) {
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             println!(
-                "[core {}] rfe/rfi instr=0x{:08X} pc=0x{:08X}",
+                "[core {}] rfe instr=0x{:08X} pc=0x{:08X}",
                 self.core_id, instr, self.pc
             );
         }
         // update kernel mode
-        self.psr_dec("rfe/rfi");
+        self.psr_dec("rfe");
 
-        if ((instr >> 11) & 1) == 1 {
-            // was rfi
-            // re-enable interrupts
-            self.cregfile[3] |= 0x80000000;
-        }
+        // Both trap-return encodings restore the global interrupt-enable bit.
+        self.cregfile[3] |= 0x80000000;
 
         // restore pc
         self.pc = self.cregfile[4];

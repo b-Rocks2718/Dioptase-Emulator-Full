@@ -89,7 +89,7 @@ end:
   pop r3
 
   # return from the interrupt
-  rfi
+  rfe
 
 _start:
   # register the keyboard interrupt handler

@@ -246,4 +246,4 @@ INT_IPI:
   # mark interrupt as handled
   eoi 5
 
-  rfi
+  rfe

@@ -19,6 +19,9 @@ _start:
 
   # handler should return here
   add  r3, r3, 2
+  # rfe restores the global interrupt-enable bit on return.
+  mov  r4, imr
+  add  r3, r4, r3
   mov  r1, r3
 
   mode halt

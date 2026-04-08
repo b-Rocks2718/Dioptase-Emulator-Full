@@ -52,4 +52,4 @@ core1:
 INT_IPI:
   # Clear interrupt and return.
   eoi 5
-  rfi
+  rfe

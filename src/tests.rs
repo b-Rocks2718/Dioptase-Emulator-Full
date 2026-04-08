@@ -460,12 +460,7 @@ fn instr() {
 
 #[test]
 fn rfe() {
-    run_test("tests/asm/rfe.s", 0x44);
-}
-
-#[test]
-fn rfi() {
-    run_test("tests/asm/rfi.s", 0x80000044);
+    run_test("tests/asm/rfe.s", 0x80000044);
 }
 
 #[test]
@@ -484,13 +479,18 @@ fn syscall() {
 }
 
 #[test]
-fn syscall_masks_global_interrupts() {
-    run_test("tests/asm/syscall_imr.s", 1);
+fn syscall_masks_global_interrupts_until_trap_return() {
+    run_test("tests/asm/syscall_imr.s", 0x80000002);
 }
 
 #[test]
 fn invalid_syscall_increments_psr_once() {
     run_test("tests/asm/invalid_syscall_psr.s", 2);
+}
+
+#[test]
+fn invalid_alt_rfe_encoding_increments_psr_once() {
+    run_test("tests/asm/invalid_alt_rfe_psr.s", 2);
 }
 
 #[test]

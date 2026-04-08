@@ -17,11 +17,17 @@ _start:
 
   sys  EXIT
 
+  # After rfe returns, IMR[31] should be restored while the handler-observed
+  # value in r2 still shows that syscall entry masked only the global bit.
+  mov  r1, imr
+  add  r1, r1, r2
+
   mode halt
 
 EXIT:
   # Syscall entry must preserve per-source enables while clearing IMR[31].
-  mov  r1, imr
+  # Save the masked value so user mode can verify that rfe restored IMR[31].
+  mov  r2, imr
   rfe
 
 EXIT_PTR:

@@ -63,7 +63,7 @@ end:
   pop  r3
 
   # return from the interrupt
-  rfi
+  rfe
 
 COUNTER:
   .fill 0

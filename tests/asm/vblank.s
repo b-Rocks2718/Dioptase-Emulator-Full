@@ -67,7 +67,7 @@ INT_VGA:
   mov  flg, r1
   pop  r1
 
-  rfi
+  rfe
 
 _start:
   # register the VGA interrupt handler

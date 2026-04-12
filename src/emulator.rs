@@ -46,7 +46,9 @@ const TLB_FLAG_EXEC: u32 = 0x4;
 const TLB_FLAG_USER: u32 = 0x8;
 const TLB_FAULT_ABSENT: u32 = 0x0;
 const EXC_TLB_MISS_VECTOR: u32 = 0x82;
+const EXC_MISALIGNED_PC_VECTOR: u32 = 0x84;
 const PSR_REASON_TLB_MISS: &str = "tlb_miss";
+const PSR_REASON_MISALIGNED_PC: &str = "misaligned_pc";
 const CREG_PID: usize = 1;
 const CREG_IMR: usize = 3;
 const CREG_EPC: usize = 4;
@@ -1268,6 +1270,21 @@ impl Emulator {
         self.raise_tlb_miss(addr, flags);
     }
 
+    fn raise_misaligned_pc(&mut self, pc: u32) {
+        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+            println!(
+                "[core {}] exception misaligned_pc pc=0x{:08X} psr=0x{:08X}",
+                self.core_id, pc, self.cregfile[0]
+            );
+        }
+
+        self.save_state();
+        self.psr_inc_checked(PSR_REASON_MISALIGNED_PC);
+        self.pc = self
+            .mem_read32(EXC_MISALIGNED_PC_VECTOR * 4)
+            .expect("misaligned-pc vector read should succeed");
+    }
+
     // memory operations must be aligned
     fn mem_write8(&mut self, addr: u32, data: u8) -> bool {
         self.clear_pending_tlb_fault();
@@ -1501,8 +1518,8 @@ impl Emulator {
     fn fetch(&mut self, vaddr: u32) -> Option<u32> {
         self.clear_pending_tlb_fault();
         if (vaddr & 3) != 0 {
-            // unaligned access
-            println!("Warning: unaligned memory access at {:08x}", vaddr);
+            self.raise_misaligned_pc(vaddr);
+            return None;
         }
         if vaddr == 0 {
             println!("Warning: fetching from virtual address 0x00000000");
@@ -1524,12 +1541,17 @@ impl Emulator {
         let clk_divider = self.memory.read_u32(CLK_REG_START);
 
         if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
-            let instr = self.fetch(self.pc);
+            let fetch_pc = self.pc;
+            let instr = self.fetch(fetch_pc);
 
-            if let Some(instr) = instr {
+            // Fetch can raise a synchronous exception before any instruction is
+            // decoded, so avoid reclassifying that cycle as a TLB miss.
+            if self.pc != fetch_pc {
+                // Exception redirect already installed by fetch.
+            } else if let Some(instr) = instr {
                 self.execute(instr);
             } else {
-                self.raise_pending_tlb_miss(self.pc);
+                self.raise_pending_tlb_miss(fetch_pc);
             }
         }
         self.count = self.count.wrapping_add(1);

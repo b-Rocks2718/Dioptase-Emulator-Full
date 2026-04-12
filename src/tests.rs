@@ -459,6 +459,11 @@ fn instr() {
 }
 
 #[test]
+fn misaligned_pc() {
+    run_test("tests/asm/misaligned_pc.s", 0x0000000D);
+}
+
+#[test]
 fn rfe() {
     run_test("tests/asm/rfe.s", 0x80000044);
 }

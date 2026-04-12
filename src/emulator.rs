@@ -45,6 +45,8 @@ const TLB_FLAG_WRITE: u32 = 0x2;
 const TLB_FLAG_EXEC: u32 = 0x4;
 const TLB_FLAG_USER: u32 = 0x8;
 const TLB_FAULT_ABSENT: u32 = 0x0;
+const EXC_TLB_MISS_VECTOR: u32 = 0x82;
+const PSR_REASON_TLB_MISS: &str = "tlb_miss";
 const CREG_PID: usize = 1;
 const CREG_IMR: usize = 3;
 const CREG_EPC: usize = 4;
@@ -1237,15 +1239,11 @@ impl Emulator {
     }
 
     fn raise_tlb_miss(&mut self, addr: u32, flags: u32) {
-        // TLB_UMISS = 0x82
-        // TLB_KMISS = 0x83
-
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-            let kmode = self.get_kmode();
             println!(
-                "[core {}] exception tlb_{}miss addr=0x{:08X} flags=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
+                "[core {}] exception tlb_miss mode={} addr=0x{:08X} flags=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
                 self.core_id,
-                if kmode { "k" } else { "u" },
+                if self.get_kmode() { "kernel" } else { "user" },
                 addr,
                 flags,
                 self.pc,
@@ -1259,13 +1257,10 @@ impl Emulator {
 
         self.save_state();
 
-        if self.get_kmode() {
-            self.psr_inc_checked("tlb_kmiss");
-            self.pc = self.mem_read32(0x83 * 4).expect("shouldnt fail");
-        } else {
-            self.psr_inc_checked("tlb_umiss");
-            self.pc = self.mem_read32(0x82 * 4).expect("shouldnt fail");
-        }
+        self.psr_inc_checked(PSR_REASON_TLB_MISS);
+        self.pc = self
+            .mem_read32(EXC_TLB_MISS_VECTOR * 4)
+            .expect("shouldnt fail");
     }
 
     fn raise_pending_tlb_miss(&mut self, addr: u32) {
@@ -1894,7 +1889,7 @@ impl Emulator {
             13 => self.branch_absolute(instr),
             14 => self.branch_relative(instr),
 
-            15 => self.syscall(instr),
+            15 => self.trap_instr(instr),
 
             22 => self.adpc(instr),
 
@@ -1915,7 +1910,7 @@ impl Emulator {
 
     fn get_reg(&self, regnum: u32) -> u32 {
         if self.get_kmode() && regnum == 31 {
-            // use ISP while handling interrupts or kernel TLB misses
+            // use ISP while handling exceptions or interrupts in kernel mode
             self.cregfile[8]
         } else {
             // normal register access
@@ -1937,7 +1932,7 @@ impl Emulator {
 
     fn write_reg(&mut self, regnum: u32, value: u32) {
         if self.get_kmode() && regnum == 31 {
-            // use ISP while handling interrupts or kernel TLB misses
+            // use ISP while handling exceptions or interrupts in kernel mode
             self.cregfile[8] = value;
         } else {
             // normal register access
@@ -2620,27 +2615,26 @@ impl Emulator {
         }
     }
 
-    fn syscall(&mut self, instr: u32) {
-        let imm = instr & 0xFF;
+    fn trap_instr(&mut self, instr: u32) {
+        const TRAP_PAYLOAD_MASK: u32 = 0x07FF_FFFF;
+        const TRAP_VECTOR_ADDR: u32 = 0x04;
 
-        match imm {
-            1 => {
-                // sys EXIT
-                // Syscalls resume at the following instruction, but otherwise
-                // snapshot trap state like other exception entries.
-                self.save_state();
-                self.cregfile[4] = self.pc.wrapping_add(4);
-                self.psr_inc_checked("syscall");
-
-                self.pc = self.mem_read32(0x01 * 4).expect("shouldnt fail");
-            }
-            _ => {
-                // Unsupported syscall encodings are invalid instructions, not
-                // nested syscall+invalid-instruction traps.
-                self.raise_exc_instr();
-                return;
-            }
+        if (instr & TRAP_PAYLOAD_MASK) != 0 {
+            // Reserved trap encodings are invalid instructions, not nested
+            // trap+invalid-instruction entries.
+            self.raise_exc_instr();
+            return;
         }
+
+        // Trap entry resumes at the following instruction, but otherwise
+        // snapshots architectural trap state like any other exception entry.
+        self.save_state();
+        self.cregfile[4] = self.pc.wrapping_add(4);
+        self.psr_inc_checked("trap");
+
+        self.pc = self
+            .mem_read32(TRAP_VECTOR_ADDR)
+            .expect("trap vector read should succeed");
     }
 
     // carry flag handled separately in each alu operation

@@ -444,8 +444,8 @@ fn tlb_evict() {
 }
 
 #[test]
-fn kmiss() {
-    run_test("tests/asm/kmiss.s", 2);
+fn tlb_miss() {
+    run_test("tests/asm/tlb_miss.s", 2);
 }
 
 #[test]
@@ -499,18 +499,18 @@ fn tlb_fault_user() {
 }
 
 #[test]
-fn syscall() {
-    run_test("tests/asm/syscall.s", 4);
+fn trap() {
+    run_test("tests/asm/trap.s", 4);
 }
 
 #[test]
-fn syscall_masks_global_interrupts_until_trap_return() {
-    run_test("tests/asm/syscall_imr.s", 0x80000002);
+fn trap_masks_global_interrupts_until_trap_return() {
+    run_test("tests/asm/trap_imr.s", 0x80000002);
 }
 
 #[test]
-fn invalid_syscall_increments_psr_once() {
-    run_test("tests/asm/invalid_syscall_psr.s", 2);
+fn invalid_trap_increments_psr_once() {
+    run_test("tests/asm/invalid_trap_psr.s", 2);
 }
 
 #[test]

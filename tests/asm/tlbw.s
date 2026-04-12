@@ -2,10 +2,8 @@
   # Interrupt vector table entries used by this test.
   .origin 0x204 # IVT EXC_PRIV (0x81 * 4)
   .fill EXIT
-  .origin 0x208 # IVT TLB_UMISS (0x82 * 4)
-  .fill TLB_UMISS
-  .origin 0x20C # IVT TLB_KMISS (0x83 * 4)
-  .fill TLB_KMISS
+  .origin 0x208 # IVT TLB_MISS (0x82 * 4)
+  .fill TLB_MISS
 
   .origin 0x400
   jmp _start
@@ -26,19 +24,15 @@ _start:
   
 EXIT:
   # change process to one with no tlb entries
-  # should cause a tlb umiss
+  # should cause a tlb miss
   mov  r5, pid
   add  r5, r5, 1
   mov  pid, r5
   mov  epc, r0
   rfe
 
-TLB_UMISS:
+TLB_MISS:
   add  r1, r1, 1
-  mode halt
-
-TLB_KMISS:
-  movi r1, 2
   mode halt
 
 # user mode

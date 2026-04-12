@@ -1,5 +1,5 @@
   # Summary:
-  # - Execute an unsupported syscall encoding.
+  # - Execute a reserved non-zero trap encoding.
   # - The invalid-instruction handler must observe exactly one PSR increment.
 
   .global _start
@@ -16,7 +16,7 @@ EXC_INSTR:
   rfe
 
 _start:
-  # Raw `sys` with immediate 0; the emulator only recognizes immediate 1.
-  .fill 0x78000000
+  # Raw `trap` with a non-zero reserved payload bit set.
+  .fill 0x78000001
 
   mode halt

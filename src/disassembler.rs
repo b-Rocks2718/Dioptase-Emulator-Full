@@ -218,12 +218,11 @@ fn disassemble_branch_rel(instr: u32) -> String {
     format!("{} {}, {}", name, reg_name(r_a), reg_name(r_b))
 }
 
-fn disassemble_sys(instr: u32) -> String {
-    let imm = (instr & 0xFF) as u32;
-    if imm == 1 {
-        "sys EXIT".to_string()
+fn disassemble_trap(instr: u32) -> String {
+    if (instr & 0x07FF_FFFF) == 0 {
+        "trap".to_string()
     } else {
-        format!("sys {}", imm)
+        format!("data {}", fmt_imm_hex(instr))
     }
 }
 
@@ -343,7 +342,7 @@ pub fn disassemble(instr: u32) -> String {
         12 => disassemble_branch_imm(instr),
         13 => disassemble_branch_abs(instr),
         14 => disassemble_branch_rel(instr),
-        15 => disassemble_sys(instr),
+        15 => disassemble_trap(instr),
         22 => disassemble_adpc(instr),
         16..=21 => disassemble_atomic(opcode, instr),
         31 => disassemble_kernel(instr),

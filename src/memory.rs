@@ -27,6 +27,26 @@ const SD_DMA_BYTES_PER_TICK: u32 = 4;
 pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
 pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
 pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
+pub const AUDIO_INTERRUPT_BIT: u32 = 1 << 7;
+
+// Audio output device.
+const AUDIO_RING_BUFFER_START: u32 = 0x7FB8000;
+const AUDIO_RING_BUFFER_SIZE: u32 = 0x4000;
+const AUDIO_SAMPLE_BYTES: u32 = 2;
+pub const AUDIO_SAMPLE_RATE_HZ: u32 = 25_000;
+const AUDIO_TICKS_PER_SAMPLE: u32 = 100_000_000 / AUDIO_SAMPLE_RATE_HZ;
+const AUDIO_CTRL_START: u32 = 0x7FE5840;
+const AUDIO_STATUS_START: u32 = 0x7FE5844;
+const AUDIO_WRITE_IDX_START: u32 = 0x7FE5848;
+const AUDIO_READ_IDX_START: u32 = 0x7FE584C;
+const AUDIO_WATERMARK_START: u32 = 0x7FE5850;
+const AUDIO_CTRL_ENABLE: u32 = 1 << 0;
+const AUDIO_CTRL_IRQ_ENABLE: u32 = 1 << 1;
+const AUDIO_CTRL_CLEAR_UNDERRUN: u32 = 1 << 2;
+const AUDIO_STATUS_ENABLED: u32 = 1 << 0;
+const AUDIO_STATUS_LOW_WATER: u32 = 1 << 1;
+const AUDIO_STATUS_UNDERRUN: u32 = 1 << 2;
+const AUDIO_STATUS_IRQ_PENDING: u32 = 1 << 3;
 
 const PIXEL_FRAME_BUFFER_START: u32 = 0x7FC0000;
 const PIXEL_FRAME_BUFFER_SIZE: u32 = PIXEL_FRAME_WIDTH * PIXEL_FRAME_HEIGHT * 2;
@@ -37,7 +57,7 @@ const TILE_FRAME_BUFFER_SIZE: u32 =
     TILE_FRAME_BUFFER_WIDTH_TILES * TILE_FRAME_BUFFER_HEIGHT_TILES * 2;
 // Align the tile framebuffer to the 4KB page size for TLB mappings.
 const TILE_FRAME_BUFFER_START: u32 = (PIXEL_FRAME_BUFFER_START - TILE_FRAME_BUFFER_SIZE) & !0xFFF;
-const IO_START: u32 = TILE_FRAME_BUFFER_START;
+const IO_START: u32 = AUDIO_RING_BUFFER_START;
 const RAM_PAGE_SIZE: usize = 4096;
 const RAM_PAGE_SHIFT: u32 = 12;
 const RAM_PAGE_MASK: usize = RAM_PAGE_SIZE - 1;
@@ -126,12 +146,31 @@ pub struct Memory {
     sprite_map: Arc<RwLock<SpriteMap>>,
     sd_card: Arc<RwLock<SdCard>>,
     sd_card2: Arc<RwLock<SdCard>>,
+    audio: Arc<RwLock<AudioDevice>>,
     pending_interrupt: Arc<AtomicU32>,
     use_uart_rx: bool,
 }
 
 struct RamPage {
     bytes: [u8; RAM_PAGE_SIZE],
+}
+
+// Purpose: fixed-format PCM sink exposed through MMIO registers plus a byte ring buffer.
+// Inputs/outputs: software writes PCM bytes + producer index; the device advances the
+// consumer index at the fixed sample rate and raises a level interrupt for low-water
+// or underrun state when enabled.
+// Invariants:
+// - ring length matches AUDIO_RING_BUFFER_SIZE
+// - read_idx always stays normalized to the ring size
+// - UNDERRUN is sticky until software clears it through AUDIO_CTRL
+struct AudioDevice {
+    ring: Vec<u8>,
+    ctrl: u32,
+    write_idx: u32,
+    read_idx: u32,
+    watermark: u32,
+    underrun: bool,
+    sample_tick_countdown: u32,
 }
 
 // Purpose: tile layer for the VGA output (two bytes per tile entry).
@@ -395,6 +434,188 @@ impl SdCard {
     }
 }
 
+impl AudioDevice {
+    fn new() -> Self {
+        AudioDevice {
+            ring: vec![0; AUDIO_RING_BUFFER_SIZE as usize],
+            ctrl: 0,
+            write_idx: 0,
+            read_idx: 0,
+            watermark: 0,
+            underrun: false,
+            sample_tick_countdown: 0,
+        }
+    }
+
+    fn normalized_idx(idx: u32) -> u32 {
+        idx % AUDIO_RING_BUFFER_SIZE
+    }
+
+    fn buffered_bytes(&self) -> u32 {
+        let write = Self::normalized_idx(self.write_idx);
+        let read = self.read_idx;
+        if write >= read {
+            write - read
+        } else {
+            AUDIO_RING_BUFFER_SIZE - (read - write)
+        }
+    }
+
+    fn low_water(&self) -> bool {
+        self.buffered_bytes() <= self.watermark
+    }
+
+    fn irq_pending(&self) -> bool {
+        self.low_water() || self.underrun
+    }
+
+    fn irq_level(&self) -> bool {
+        (self.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 && self.irq_pending()
+    }
+
+    fn status(&self) -> u32 {
+        let mut status = 0u32;
+        if (self.ctrl & AUDIO_CTRL_ENABLE) != 0 {
+            status |= AUDIO_STATUS_ENABLED;
+        }
+        if self.low_water() {
+            status |= AUDIO_STATUS_LOW_WATER;
+        }
+        if self.underrun {
+            status |= AUDIO_STATUS_UNDERRUN;
+        }
+        if self.irq_pending() {
+            status |= AUDIO_STATUS_IRQ_PENDING;
+        }
+        status
+    }
+
+    fn read_ring_byte(&self, addr: u32) -> Option<u8> {
+        if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
+            .contains(&addr)
+        {
+            return None;
+        }
+        Some(self.ring[(addr - AUDIO_RING_BUFFER_START) as usize])
+    }
+
+    fn write_ring_byte(&mut self, addr: u32, value: u8) -> bool {
+        if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
+            .contains(&addr)
+        {
+            return false;
+        }
+        self.ring[(addr - AUDIO_RING_BUFFER_START) as usize] = value;
+        true
+    }
+
+    fn read_reg_byte(&self, addr: u32) -> Option<u8> {
+        if addr >= AUDIO_CTRL_START && addr < AUDIO_CTRL_START + 4 {
+            return Some(read_reg_byte(self.ctrl, addr, AUDIO_CTRL_START));
+        }
+        if addr >= AUDIO_STATUS_START && addr < AUDIO_STATUS_START + 4 {
+            return Some(read_reg_byte(self.status(), addr, AUDIO_STATUS_START));
+        }
+        if addr >= AUDIO_WRITE_IDX_START && addr < AUDIO_WRITE_IDX_START + 4 {
+            return Some(read_reg_byte(self.write_idx, addr, AUDIO_WRITE_IDX_START));
+        }
+        if addr >= AUDIO_READ_IDX_START && addr < AUDIO_READ_IDX_START + 4 {
+            return Some(read_reg_byte(self.read_idx, addr, AUDIO_READ_IDX_START));
+        }
+        if addr >= AUDIO_WATERMARK_START && addr < AUDIO_WATERMARK_START + 4 {
+            return Some(read_reg_byte(self.watermark, addr, AUDIO_WATERMARK_START));
+        }
+        None
+    }
+
+    fn write_ctrl_byte(&mut self, addr: u32, value: u8) -> bool {
+        if !(AUDIO_CTRL_START..AUDIO_CTRL_START + 4).contains(&addr) {
+            return false;
+        }
+        let mut next = self.ctrl;
+        write_reg_byte(&mut next, addr, AUDIO_CTRL_START, value);
+        if (next & AUDIO_CTRL_CLEAR_UNDERRUN) != 0 {
+            self.underrun = false;
+        }
+        self.ctrl = next & (AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+        true
+    }
+
+    fn write_write_idx_byte(&mut self, addr: u32, value: u8) -> bool {
+        if !(AUDIO_WRITE_IDX_START..AUDIO_WRITE_IDX_START + 4).contains(&addr) {
+            return false;
+        }
+        write_reg_byte(&mut self.write_idx, addr, AUDIO_WRITE_IDX_START, value);
+        true
+    }
+
+    fn write_watermark_byte(&mut self, addr: u32, value: u8) -> bool {
+        if !(AUDIO_WATERMARK_START..AUDIO_WATERMARK_START + 4).contains(&addr) {
+            return false;
+        }
+        write_reg_byte(&mut self.watermark, addr, AUDIO_WATERMARK_START, value);
+        true
+    }
+
+    fn sample_at(&self, idx: u32) -> i16 {
+        let lo = self.ring[idx as usize];
+        let hi = self.ring[((idx + 1) % AUDIO_RING_BUFFER_SIZE) as usize];
+        i16::from_le_bytes([lo, hi])
+    }
+
+    // Purpose: consume one sample immediately from the MMIO audio device.
+    // Inputs: none; this bypasses the 100 MHz device-tick countdown and is
+    // only used by the optional wall-clock host-audio mode.
+    // Outputs: the exact sample the hardware would output right now, including
+    // signed-zero underrun output while enabled and the buffer is empty.
+    // Invariants:
+    // - READ_IDX advances by exactly one sample when buffered PCM exists
+    // - UNDERRUN latches when enabled playback needs data and the ring is empty
+    // - disabled playback leaves READ_IDX unchanged and outputs silence
+    fn consume_sample_now(&mut self) -> i16 {
+        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
+            return 0;
+        }
+
+        if self.buffered_bytes() < AUDIO_SAMPLE_BYTES {
+            self.underrun = true;
+            return 0;
+        }
+
+        let sample = self.sample_at(self.read_idx);
+        self.read_idx = (self.read_idx + AUDIO_SAMPLE_BYTES) % AUDIO_RING_BUFFER_SIZE;
+        sample
+    }
+
+    // Purpose: fill a reusable host buffer with wall-clock playback samples.
+    // Inputs: number of 25 kHz samples to emit immediately and a caller-owned
+    // output vector to reuse across batches.
+    // Outputs: replaces `out` with exactly `sample_count` PCM samples.
+    fn consume_samples_now(&mut self, sample_count: usize, out: &mut Vec<i16>) {
+        out.clear();
+        if out.capacity() < sample_count {
+            out.reserve(sample_count - out.capacity());
+        }
+        for _ in 0..sample_count {
+            out.push(self.consume_sample_now());
+        }
+    }
+
+    fn tick(&mut self) -> Option<i16> {
+        if self.sample_tick_countdown > 0 {
+            self.sample_tick_countdown -= 1;
+            return None;
+        }
+        self.sample_tick_countdown = AUDIO_TICKS_PER_SAMPLE.saturating_sub(1);
+
+        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
+            return None;
+        }
+
+        Some(self.consume_sample_now())
+    }
+}
+
 // Purpose: extract a little-endian register byte from a 32-bit value.
 // Inputs: full register value, byte address, base register address.
 // Outputs: the addressed byte.
@@ -486,6 +707,7 @@ impl Memory {
             sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
             sd_card: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
+            audio: Arc::new(RwLock::new(AudioDevice::new())),
             pending_interrupt: Arc::new(AtomicU32::new(0)),
             use_uart_rx: use_uart_rx,
         }
@@ -951,7 +1173,11 @@ impl Memory {
             addr
         );
 
-        if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
+        if let Some(value) = self.audio.read().unwrap().read_ring_byte(addr) {
+            return value;
+        } else if let Some(value) = self.audio.read().unwrap().read_reg_byte(addr) {
+            return value;
+        } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             return self
                 .tile_map
                 .read()
@@ -1140,7 +1366,25 @@ impl Memory {
 
         let mut handled = false;
 
-        if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
+        if self.audio.write().unwrap().write_ring_byte(addr, data) {
+            handled = true;
+        } else if self.audio.write().unwrap().write_ctrl_byte(addr, data) {
+            handled = true;
+        } else if self.audio.write().unwrap().write_write_idx_byte(addr, data) {
+            handled = true;
+        } else if self.audio.write().unwrap().write_watermark_byte(addr, data) {
+            handled = true;
+        } else if AUDIO_STATUS_START <= addr && addr < AUDIO_STATUS_START + 4 {
+            panic!(
+                "attempting to write read-only audio status register (0x{:08X})",
+                AUDIO_STATUS_START
+            );
+        } else if AUDIO_READ_IDX_START <= addr && addr < AUDIO_READ_IDX_START + 4 {
+            panic!(
+                "attempting to write read-only audio read index register (0x{:08X})",
+                AUDIO_READ_IDX_START
+            );
+        } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             self.tile_map
                 .write()
                 .unwrap()
@@ -1418,12 +1662,40 @@ impl Memory {
         false
     }
 
+    // Purpose: advance the fixed-rate audio consumer by one 100 MHz device tick.
+    // Inputs: none.
+    // Outputs: may advance AUDIO_READ_IDX, latch UNDERRUN, and return the exact
+    // 16-bit PCM sample the device would output this tick (including signed-zero
+    // during underrun) so the optional host backend can mirror hardware output.
+    pub fn tick_audio(&self) -> Option<i16> {
+        let _mmio = self.mmio_lock.lock().unwrap();
+        self.audio.write().unwrap().tick()
+    }
+
+    // Purpose: drive the optional wall-clock host-audio mode.
+    // Inputs: number of 25 kHz samples to emit immediately and a caller-owned
+    // buffer that is reused across batches.
+    // Outputs: fills `out` with the PCM samples the MMIO audio device would
+    // output over that wall-clock slice while updating READ_IDX/UNDERRUN state.
+    pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
+        let _mmio = self.mmio_lock.lock().unwrap();
+        self.audio
+            .write()
+            .unwrap()
+            .consume_samples_now(sample_count, out);
+    }
+
     pub fn clock() {
         // do stuff that should happen every clock cycle
     }
 
     pub fn check_interrupts(&self) -> u32 {
-        self.pending_interrupt.swap(0, Ordering::SeqCst)
+        let mut pending = self.pending_interrupt.swap(0, Ordering::SeqCst);
+        let _mmio = self.mmio_lock.lock().unwrap();
+        if self.audio.read().unwrap().irq_level() {
+            pending |= AUDIO_INTERRUPT_BIT;
+        }
+        pending
     }
 }
 
@@ -1525,6 +1797,112 @@ mod tests {
             SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT
         );
         assert_eq!(memory.check_interrupts(), 0);
+    }
+
+    #[test]
+    fn audio_ring_extends_mmio_downward() {
+        let mut image = HashMap::new();
+        image.insert(AUDIO_RING_BUFFER_START - 1, 0x11);
+        image.insert(AUDIO_RING_BUFFER_START, 0x22);
+
+        let memory = Memory::new(image, false, 1);
+
+        assert_eq!(memory.read(AUDIO_RING_BUFFER_START - 1), 0x11);
+        assert_eq!(
+            memory.read(AUDIO_RING_BUFFER_START),
+            0,
+            "MMIO-backed audio ring bytes must not be initialized from the RAM image",
+        );
+
+        memory.write(AUDIO_RING_BUFFER_START, 0x33);
+        assert_eq!(memory.read(AUDIO_RING_BUFFER_START), 0x33);
+    }
+
+    #[test]
+    fn audio_tick_advances_read_idx_and_latches_underrun() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.write(AUDIO_RING_BUFFER_START, 0x34);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE);
+
+        assert_eq!(
+            memory.tick_audio(),
+            Some(i16::from_le_bytes([0x34, 0x12])),
+            "audio tick must return the PCM sample consumed from the MMIO ring",
+        );
+        assert_eq!(memory.read_u32(AUDIO_READ_IDX_START), 2);
+        assert_eq!(
+            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
+            0
+        );
+
+        let mut underrun_sample = None;
+        for _ in 0..AUDIO_TICKS_PER_SAMPLE {
+            underrun_sample = memory.tick_audio();
+        }
+
+        assert_eq!(
+            underrun_sample,
+            Some(0),
+            "audio underrun must output signed-zero samples",
+        );
+        assert_ne!(
+            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
+            0,
+            "enabled playback must latch UNDERRUN after the ring becomes empty",
+        );
+        assert_eq!(
+            memory.read_u32(AUDIO_READ_IDX_START),
+            2,
+            "the device must not advance READ_IDX while outputting underrun silence",
+        );
+
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_CLEAR_UNDERRUN);
+        assert_eq!(
+            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
+            0
+        );
+    }
+
+    #[test]
+    fn audio_irq_is_level_triggered() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_IRQ_ENABLE);
+        memory.write_u32(AUDIO_WATERMARK_START, 0);
+
+        assert_eq!(memory.check_interrupts(), AUDIO_INTERRUPT_BIT);
+        assert_eq!(
+            memory.check_interrupts(),
+            AUDIO_INTERRUPT_BIT,
+            "audio IRQ level must remain asserted while LOW_WATER stays true",
+        );
+    }
+
+    #[test]
+    fn wallclock_audio_consumption_advances_without_waiting_for_device_ticks() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let mut samples = Vec::new();
+
+        memory.write(AUDIO_RING_BUFFER_START, 0x34);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE);
+
+        memory.consume_audio_wallclock_samples(1, &mut samples);
+
+        assert_eq!(
+            samples,
+            vec![i16::from_le_bytes([0x34, 0x12])],
+            "wall-clock audio mode must emit the queued sample immediately",
+        );
+        assert_eq!(
+            memory.read_u32(AUDIO_READ_IDX_START),
+            2,
+            "wall-clock audio mode must advance READ_IDX by one sample",
+        );
     }
 }
 

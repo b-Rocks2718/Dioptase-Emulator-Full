@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::audio::{AudioOutput, AudioSink};
 use crate::memory::{
-    CLK_REG_START, Memory, PHYSMEM_MAX, SD_INTERRUPT_BIT, SD2_INTERRUPT_BIT, SdSlot,
-    VGA_INTERRUPT_BIT,
+    AUDIO_INTERRUPT_BIT, AUDIO_SAMPLE_RATE_HZ, CLK_REG_START, Memory, PHYSMEM_MAX,
+    SD_INTERRUPT_BIT, SD2_INTERRUPT_BIT, SdSlot, VGA_INTERRUPT_BIT,
 };
 
 use crate::graphics::Graphics;
@@ -266,6 +267,21 @@ impl ScheduleMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Host audio policy for emulator runs.
+pub enum AudioMode {
+    // Do not start a host audio player. The MMIO audio device still advances on
+    // emulated device ticks so guest-visible timing stays intact.
+    Disabled,
+    // Mirror the emulated device output to the host player only when core 0
+    // advances the shared device tick.
+    Emulated,
+    // Drive the MMIO audio device from wall-clock time on a helper thread so
+    // host playback stays intelligible even when emulation is slow. This is an
+    // opt-in debugging mode because it changes guest-visible timing.
+    Fast,
+}
+
 struct SchedulerState {
     // Next core allowed to execute in non-free scheduling modes.
     next_core: usize,
@@ -442,6 +458,9 @@ fn format_interrupts(bits: u32) -> String {
     if (bits & VGA_INTERRUPT_BIT) != 0 {
         parts.push("vga");
     }
+    if (bits & AUDIO_INTERRUPT_BIT) != 0 {
+        parts.push("audio");
+    }
     if (bits & IPI_INTERRUPT_BIT) != 0 {
         parts.push("ipi");
     }
@@ -459,6 +478,7 @@ struct InterruptRouteState {
     next_sd: usize,
     next_sd2: usize,
     next_vga: usize,
+    next_audio: usize,
     // Track which core currently has a pending KB/UART interrupt.
     kb_inflight: Option<usize>,
     uart_inflight: Option<usize>,
@@ -485,6 +505,7 @@ impl InterruptController {
                 next_sd: 0,
                 next_sd2: 0,
                 next_vga: 0,
+                next_audio: 0,
                 kb_inflight: None,
                 uart_inflight: None,
             }),
@@ -580,6 +601,12 @@ impl InterruptController {
             routes.next_vga = (routes.next_vga + 1) % self.cores;
             self.set_pending_bits(core, VGA_INTERRUPT_BIT);
         }
+        if pending & AUDIO_INTERRUPT_BIT != 0 {
+            // Audio interrupts go to one core at a time, round-robin.
+            let core = routes.next_audio % self.cores;
+            routes.next_audio = (routes.next_audio + 1) % self.cores;
+            self.set_pending_bits(core, AUDIO_INTERRUPT_BIT);
+        }
     }
 
     fn broadcast_timer(&self) {
@@ -662,9 +689,132 @@ pub struct Emulator {
     count: u32,
     core_id: u32,
     use_uart_rx: bool,
+    audio_mode: AudioMode,
+    audio_sink: Option<Arc<AudioSink>>,
     pending_tlb_fault: Option<u32>,
     watchpoints: Vec<Watchpoint>,
     watchpoint_hit: Option<WatchpointHit>,
+}
+
+const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
+const FAST_AUDIO_MAX_CATCH_UP_BATCHES: usize = 8;
+
+struct AudioPlayback {
+    output: Option<AudioOutput>,
+    worker_stop: Option<Arc<AtomicBool>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl AudioPlayback {
+    fn start(requested_mode: AudioMode, memory: Arc<Memory>) -> (AudioMode, Option<Self>) {
+        if requested_mode == AudioMode::Disabled {
+            return (AudioMode::Disabled, None);
+        }
+
+        let output = match AudioOutput::start() {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Warning: failed to start host audio output: {}", err);
+                return (AudioMode::Disabled, None);
+            }
+        };
+
+        if requested_mode == AudioMode::Fast {
+            let sink = output.shared_sink();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = spawn_fast_audio_worker(memory, sink, Arc::clone(&stop));
+            return (
+                AudioMode::Fast,
+                Some(AudioPlayback {
+                    output: Some(output),
+                    worker_stop: Some(stop),
+                    worker: Some(worker),
+                }),
+            );
+        }
+
+        (
+            AudioMode::Emulated,
+            Some(AudioPlayback {
+                output: Some(output),
+                worker_stop: None,
+                worker: None,
+            }),
+        )
+    }
+
+    fn emulated_sink(&self) -> Option<Arc<AudioSink>> {
+        if self.worker.is_some() {
+            return None;
+        }
+        self.output.as_ref().map(|output| output.shared_sink())
+    }
+}
+
+impl Drop for AudioPlayback {
+    fn drop(&mut self) {
+        if let Some(stop) = self.worker_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.output.take();
+    }
+}
+
+fn audio_batch_duration(batch_count: usize) -> Duration {
+    Duration::from_nanos(
+        ((FAST_AUDIO_BATCH_SAMPLES as u64) * (batch_count as u64) * 1_000_000_000u64)
+            / (AUDIO_SAMPLE_RATE_HZ as u64),
+    )
+}
+
+// Purpose: keep the optional fast host-audio mode close to real-time wall clock.
+// Inputs: shared memory, host audio sink, and a stop flag owned by the run loop.
+// Outputs: consumes MMIO audio samples in 10 ms wall-clock batches until stop.
+// Invariants:
+// - only this helper thread advances the audio MMIO consumer in fast mode
+// - batches are capped so a stalled host does not build unbounded catch-up work
+// - the normal emulated-tick path must stay disabled while this thread runs
+fn spawn_fast_audio_worker(
+    memory: Arc<Memory>,
+    sink: Arc<AudioSink>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let batch_duration = audio_batch_duration(1);
+        let mut next_deadline = Instant::now() + batch_duration;
+        let mut batch =
+            Vec::with_capacity(FAST_AUDIO_BATCH_SAMPLES * FAST_AUDIO_MAX_CATCH_UP_BATCHES);
+
+        while !stop.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now < next_deadline {
+                thread::sleep(next_deadline.duration_since(now));
+                continue;
+            }
+
+            let mut batch_count = 1usize;
+            let late = now.duration_since(next_deadline);
+            let batch_nanos = batch_duration.as_nanos();
+            if batch_nanos != 0 {
+                batch_count += (late.as_nanos() / batch_nanos) as usize;
+            }
+            if batch_count > FAST_AUDIO_MAX_CATCH_UP_BATCHES {
+                batch_count = FAST_AUDIO_MAX_CATCH_UP_BATCHES;
+                next_deadline = now + batch_duration;
+            } else {
+                next_deadline += audio_batch_duration(batch_count);
+            }
+
+            memory.consume_audio_wallclock_samples(
+                batch_count * FAST_AUDIO_BATCH_SAMPLES,
+                &mut batch,
+            );
+            sink.write_samples(&batch);
+        }
+    })
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -1031,10 +1181,17 @@ impl Emulator {
             count: 0,
             core_id,
             use_uart_rx,
+            audio_mode: AudioMode::Disabled,
+            audio_sink: None,
             pending_tlb_fault: None,
             watchpoints: Vec::new(),
             watchpoint_hit: None,
         }
+    }
+
+    fn configure_audio(&mut self, audio_mode: AudioMode, sink: Option<Arc<AudioSink>>) {
+        self.audio_mode = audio_mode;
+        self.audio_sink = sink;
     }
 
     fn read_isr(&self) -> u32 {
@@ -1208,7 +1365,10 @@ impl Emulator {
             if addr <= PHYSMEM_MAX {
                 Some(addr)
             } else {
-                match self.tlb.access(self.cregfile[CREG_PID], addr >> 12, operation, kmode) {
+                match self
+                    .tlb
+                    .access(self.cregfile[CREG_PID], addr >> 12, operation, kmode)
+                {
                     TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
                     TlbAccess::Fault(flags) => {
                         self.record_pending_tlb_fault(flags);
@@ -1217,7 +1377,10 @@ impl Emulator {
                 }
             }
         } else {
-            match self.tlb.access(self.cregfile[CREG_PID], addr >> 12, operation, kmode) {
+            match self
+                .tlb
+                .access(self.cregfile[CREG_PID], addr >> 12, operation, kmode)
+            {
                 TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
                 TlbAccess::Fault(flags) => {
                     self.record_pending_tlb_fault(flags);
@@ -1557,7 +1720,12 @@ impl Emulator {
         self.count = self.count.wrapping_add(1);
     }
 
-    pub fn run(mut self, max_iters: u32, with_graphics: bool) -> Option<u32> {
+    pub fn run(
+        mut self,
+        max_iters: u32,
+        with_graphics: bool,
+        audio_mode: AudioMode,
+    ) -> Option<u32> {
         let mut graphics: Option<Graphics> = None;
         if with_graphics {
             graphics = Some(Graphics::new(
@@ -1579,6 +1747,11 @@ impl Emulator {
                 self.memory.get_pending_interrupt(),
             ));
         }
+        let (audio_mode, audio_output) = AudioPlayback::start(audio_mode, Arc::clone(&self.memory));
+        let emulated_sink = audio_output
+            .as_ref()
+            .and_then(|output| output.emulated_sink());
+        self.configure_audio(audio_mode, emulated_sink);
 
         // Return value and termination signal
         let ret: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
@@ -1610,6 +1783,7 @@ impl Emulator {
         }
 
         handle.join().unwrap();
+        drop(audio_output);
 
         // return the value in r3
         return *ret.lock().unwrap();
@@ -1624,6 +1798,7 @@ impl Emulator {
         sched: ScheduleMode,
         max_iters: u32,
         with_graphics: bool,
+        audio_mode: AudioMode,
         use_uart_rx: bool,
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
@@ -1673,15 +1848,22 @@ impl Emulator {
                 memory.get_pending_interrupt(),
             ));
         }
+        let (audio_mode, audio_output) = AudioPlayback::start(audio_mode, Arc::clone(&memory));
+        let emulated_sink = audio_output
+            .as_ref()
+            .and_then(|output| output.emulated_sink());
 
         let mut handles = Vec::new();
         for core_id in 0..cores {
-            let cpu = Emulator::from_shared(
+            let mut cpu = Emulator::from_shared(
                 Arc::clone(&memory),
                 Arc::clone(&interrupts),
                 use_uart_rx,
                 core_id as u32,
             );
+            if core_id == 0 {
+                cpu.configure_audio(audio_mode, emulated_sink.clone());
+            }
             // Each core runs in its own thread to allow real races.
             let shared_clone = Arc::clone(&shared);
             let scheduler_clone = scheduler.clone();
@@ -1698,6 +1880,7 @@ impl Emulator {
         for handle in handles {
             handle.join().unwrap();
         }
+        drop(audio_output);
 
         // Return value is r1 from core 0.
         let results = shared.results.lock().unwrap();
@@ -1713,6 +1896,7 @@ impl Emulator {
         sched: ScheduleMode,
         max_iters: u32,
         with_graphics: bool,
+        audio_mode: AudioMode,
         use_uart_rx: bool,
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
@@ -1724,6 +1908,7 @@ impl Emulator {
             sched,
             max_iters,
             with_graphics,
+            audio_mode,
             use_uart_rx,
             sd_dma_ticks_per_word,
             sd0_image,
@@ -1738,8 +1923,26 @@ impl Emulator {
         self.interrupts
             .dispatch_input(self.use_uart_rx, io_nonempty);
 
-        let ints = self.memory.check_interrupts();
-        self.interrupts.dispatch_device_interrupts(ints);
+        if self.core_id == 0 {
+            let ints = self.memory.check_interrupts();
+            self.interrupts.dispatch_device_interrupts(ints);
+
+            // Shared PIT countdown is advanced by core 0 only.
+            if self.memory.tick_pit() {
+                self.interrupts.broadcast_timer();
+            }
+
+            // Advance shared device engines after sampling the current interrupt
+            // lines so newly-raised device interrupts appear on the next tick.
+            self.memory.tick_sd_dma();
+            if self.audio_mode != AudioMode::Fast {
+                if let Some(sample) = self.memory.tick_audio() {
+                    if let Some(sink) = self.audio_sink.as_ref() {
+                        sink.write_sample(sample);
+                    }
+                }
+            }
+        }
 
         let pending = self.interrupts.take_pending(self.core_id as usize);
         if pending != 0 {
@@ -1748,16 +1951,6 @@ impl Emulator {
                 self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
             }
             self.cregfile[2] |= pending;
-        }
-
-        // Shared PIT countdown is advanced by core 0 only.
-        if self.core_id == 0 && self.memory.tick_pit() {
-            self.interrupts.broadcast_timer();
-        }
-
-        // Advance SD DMA after the timer update to share the same tick cadence.
-        if self.core_id == 0 {
-            self.memory.tick_sd_dma();
         }
     }
 
@@ -2809,11 +3002,7 @@ impl Emulator {
 
     fn eoi_op(&mut self, instr: u32) {
         let all = ((instr >> 11) & 1) != 0;
-        let cleared_mask = if all {
-            u32::MAX
-        } else {
-            1u32 << (instr & 0xF)
-        };
+        let cleared_mask = if all { u32::MAX } else { 1u32 << (instr & 0xF) };
         let next_isr = self.cregfile[2] & !cleared_mask;
         self.write_isr(next_isr);
         self.pc += 4;

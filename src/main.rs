@@ -2,16 +2,17 @@ use std::env;
 use std::fs;
 use std::process;
 
+pub mod audio;
 pub mod disassembler;
 pub mod emulator;
 pub mod graphics;
 pub mod memory;
 pub mod tests;
 
-use emulator::{Emulator, ScheduleMode, set_trace_interrupts};
+use emulator::{AudioMode, Emulator, ScheduleMode, set_trace_interrupts};
 use memory::SdSlot;
 
-const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N]";
+const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N]";
 
 fn print_usage_and_exit() -> ! {
     println!("{}", USAGE);
@@ -39,6 +40,7 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
 
     let mut with_graphics = false;
+    let mut audio_mode = AudioMode::Disabled;
     let mut use_uart_rx = false;
     let mut debug = false;
     let mut debugc = false;
@@ -57,6 +59,20 @@ fn main() {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--vga" => with_graphics = true,
+            "--audio" => {
+                if audio_mode == AudioMode::Fast {
+                    println!("Error: --audio and --audio-fast are mutually exclusive");
+                    process::exit(1);
+                }
+                audio_mode = AudioMode::Emulated;
+            }
+            "--audio-fast" => {
+                if audio_mode == AudioMode::Emulated {
+                    println!("Error: --audio and --audio-fast are mutually exclusive");
+                    process::exit(1);
+                }
+                audio_mode = AudioMode::Fast;
+            }
             "--uart" => use_uart_rx = true,
             "--debug" => debug = true,
             "--debugc" => debugc = true,
@@ -235,6 +251,9 @@ fn main() {
         if with_graphics {
             println!("Warning: --vga is ignored in debugc mode");
         }
+        if audio_mode != AudioMode::Disabled {
+            println!("Warning: host audio flags are ignored in debugc mode");
+        }
         if cores != 1 {
             println!("Warning: --cores is ignored in debugc mode");
         }
@@ -260,6 +279,9 @@ fn main() {
     } else if debug {
         if with_graphics {
             println!("Warning: --vga is ignored in debug mode");
+        }
+        if audio_mode != AudioMode::Disabled {
+            println!("Warning: host audio flags are ignored in debug mode");
         }
         if cores != 1 {
             println!("Warning: --cores is ignored in debug mode");
@@ -298,7 +320,7 @@ fn main() {
             );
             let memory = cpu.shared_memory();
             let result = cpu
-                .run(max_cycles, with_graphics)
+                .run(max_cycles, with_graphics, audio_mode)
                 .expect("did not terminate"); // programs should return a value in r1
             write_sd_export(sd0_out_path.as_deref(), SdSlot::Sd0, || {
                 memory.dump_sd_image(SdSlot::Sd0)
@@ -314,6 +336,7 @@ fn main() {
                 sched,
                 max_cycles,
                 with_graphics,
+                audio_mode,
                 use_uart_rx,
                 sd_dma_ticks_per_word,
                 sd0_image.as_deref(),

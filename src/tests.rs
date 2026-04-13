@@ -14,7 +14,7 @@ use std::sync::Once;
 use super::*;
 
 #[cfg(test)]
-use crate::emulator::ScheduleMode;
+use crate::emulator::{AudioMode, ScheduleMode};
 
 #[cfg(test)]
 fn assembler_profile() -> &'static str {
@@ -86,7 +86,7 @@ fn run_test(asm_file: &'static str, expected: u32) {
 
     // execute hex file
     let cpu = Emulator::new(hex_file.to_string_lossy().to_string(), false, 1, None, None);
-    let result = cpu.run(10000, false);
+    let result = cpu.run(10000, false, AudioMode::Disabled);
 
     // check result
     assert_eq!(result, Some(expected));
@@ -115,6 +115,7 @@ fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
         ScheduleMode::RoundRobin,
         200000,
         false,
+        AudioMode::Disabled,
         false,
         1,
         None,

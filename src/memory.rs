@@ -42,7 +42,6 @@ const AUDIO_READ_IDX_START: u32 = 0x7FE584C;
 const AUDIO_WATERMARK_START: u32 = 0x7FE5850;
 const AUDIO_CTRL_ENABLE: u32 = 1 << 0;
 const AUDIO_CTRL_IRQ_ENABLE: u32 = 1 << 1;
-const AUDIO_CTRL_CLEAR_UNDERRUN: u32 = 1 << 2;
 const AUDIO_STATUS_ENABLED: u32 = 1 << 0;
 const AUDIO_STATUS_LOW_WATER: u32 = 1 << 1;
 const AUDIO_STATUS_UNDERRUN: u32 = 1 << 2;
@@ -157,12 +156,13 @@ struct RamPage {
 
 // Purpose: fixed-format PCM sink exposed through MMIO registers plus a byte ring buffer.
 // Inputs/outputs: software writes PCM bytes + producer index; the device advances the
-// consumer index at the fixed sample rate and raises a level interrupt for low-water
-// or underrun state when enabled.
+// consumer index at the fixed sample rate and raises an interrupt only when
+// LOW_WATER transitions from false to true while IRQ delivery is enabled.
 // Invariants:
 // - ring length matches AUDIO_RING_BUFFER_SIZE
 // - read_idx always stays normalized to the ring size
-// - UNDERRUN is sticky until software clears it through AUDIO_CTRL
+// - UNDERRUN clears automatically when playback is disabled or software
+//   publishes at least one full sample again
 struct AudioDevice {
     ring: Vec<u8>,
     ctrl: u32,
@@ -466,11 +466,7 @@ impl AudioDevice {
     }
 
     fn irq_pending(&self) -> bool {
-        self.low_water() || self.underrun
-    }
-
-    fn irq_level(&self) -> bool {
-        (self.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 && self.irq_pending()
+        self.low_water()
     }
 
     fn status(&self) -> u32 {
@@ -534,10 +530,10 @@ impl AudioDevice {
         }
         let mut next = self.ctrl;
         write_reg_byte(&mut next, addr, AUDIO_CTRL_START, value);
-        if (next & AUDIO_CTRL_CLEAR_UNDERRUN) != 0 {
+        self.ctrl = next & (AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
             self.underrun = false;
         }
-        self.ctrl = next & (AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
         true
     }
 
@@ -555,6 +551,12 @@ impl AudioDevice {
         }
         write_reg_byte(&mut self.watermark, addr, AUDIO_WATERMARK_START, value);
         true
+    }
+
+    fn clear_underrun_if_recovered(&mut self) {
+        if self.buffered_bytes() >= AUDIO_SAMPLE_BYTES {
+            self.underrun = false;
+        }
     }
 
     fn sample_at(&self, idx: u32) -> i16 {
@@ -1351,7 +1353,13 @@ impl Memory {
         assert_eq!(addrs.len(), data.len());
         if Self::addrs_touch_mmio(addrs) {
             let _mmio = self.mmio_lock.lock().unwrap();
+            let was_low_water = self.audio.read().unwrap().low_water();
             self.write_phys_bytes_inner(addrs, data);
+            let mut audio = self.audio.write().unwrap();
+            audio.clear_underrun_if_recovered();
+            if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
+                self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
+            }
         } else {
             self.write_phys_bytes_inner(addrs, data);
         }
@@ -1669,7 +1677,13 @@ impl Memory {
     // during underrun) so the optional host backend can mirror hardware output.
     pub fn tick_audio(&self) -> Option<i16> {
         let _mmio = self.mmio_lock.lock().unwrap();
-        self.audio.write().unwrap().tick()
+        let mut audio = self.audio.write().unwrap();
+        let was_low_water = audio.low_water();
+        let sample = audio.tick();
+        if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
+            self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
+        }
+        sample
     }
 
     // Purpose: drive the optional wall-clock host-audio mode.
@@ -1679,10 +1693,12 @@ impl Memory {
     // output over that wall-clock slice while updating READ_IDX/UNDERRUN state.
     pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
         let _mmio = self.mmio_lock.lock().unwrap();
-        self.audio
-            .write()
-            .unwrap()
-            .consume_samples_now(sample_count, out);
+        let mut audio = self.audio.write().unwrap();
+        let was_low_water = audio.low_water();
+        audio.consume_samples_now(sample_count, out);
+        if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
+            self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
+        }
     }
 
     pub fn clock() {
@@ -1690,12 +1706,7 @@ impl Memory {
     }
 
     pub fn check_interrupts(&self) -> u32 {
-        let mut pending = self.pending_interrupt.swap(0, Ordering::SeqCst);
-        let _mmio = self.mmio_lock.lock().unwrap();
-        if self.audio.read().unwrap().irq_level() {
-            pending |= AUDIO_INTERRUPT_BIT;
-        }
-        pending
+        self.pending_interrupt.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -1819,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_tick_advances_read_idx_and_latches_underrun() {
+    fn audio_tick_advances_read_idx_and_recovers_underrun_after_refill() {
         let memory = Memory::new(HashMap::new(), false, 1);
 
         memory.write(AUDIO_RING_BUFFER_START, 0x34);
@@ -1859,25 +1870,77 @@ mod tests {
             "the device must not advance READ_IDX while outputting underrun silence",
         );
 
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_CLEAR_UNDERRUN);
+        memory.write(AUDIO_RING_BUFFER_START + 2, 0x78);
+        memory.write(AUDIO_RING_BUFFER_START + 3, 0x56);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 4);
         assert_eq!(
             memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
-            0
+            0,
+            "publishing another sample must clear UNDERRUN automatically",
         );
     }
 
     #[test]
-    fn audio_irq_is_level_triggered() {
+    fn audio_irq_fires_once_on_low_water_rising_edge() {
         let memory = Memory::new(HashMap::new(), false, 1);
 
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_IRQ_ENABLE);
+        memory.write(AUDIO_RING_BUFFER_START, 0x34);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
         memory.write_u32(AUDIO_WATERMARK_START, 0);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+
+        assert_eq!(
+            memory.check_interrupts(),
+            0,
+            "enabling IRQ while LOW_WATER is false must not synthesize an interrupt",
+        );
+
+        assert_eq!(memory.tick_audio(), Some(i16::from_le_bytes([0x34, 0x12])));
 
         assert_eq!(memory.check_interrupts(), AUDIO_INTERRUPT_BIT);
         assert_eq!(
             memory.check_interrupts(),
-            AUDIO_INTERRUPT_BIT,
-            "audio IRQ level must remain asserted while LOW_WATER stays true",
+            0,
+            "audio IRQ must be edge-triggered rather than level-triggered",
+        );
+    }
+
+    #[test]
+    fn audio_enabling_irq_while_low_water_is_already_true_does_not_backfill_interrupt() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.write_u32(AUDIO_WATERMARK_START, 0);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_IRQ_ENABLE);
+
+        assert_eq!(
+            memory.check_interrupts(),
+            0,
+            "enabling IRQ after LOW_WATER asserted must not backfill an interrupt",
+        );
+    }
+
+    #[test]
+    fn audio_underrun_does_not_raise_a_separate_interrupt() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        memory.write(AUDIO_RING_BUFFER_START, 0x34);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
+        memory.write_u32(AUDIO_WATERMARK_START, 0);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+
+        assert_eq!(memory.tick_audio(), Some(i16::from_le_bytes([0x34, 0x12])));
+        assert_eq!(memory.check_interrupts(), AUDIO_INTERRUPT_BIT);
+
+        for _ in 0..AUDIO_TICKS_PER_SAMPLE {
+            let _ = memory.tick_audio();
+        }
+
+        assert_eq!(
+            memory.check_interrupts(),
+            0,
+            "UNDERRUN must not raise a second audio interrupt once LOW_WATER is already active",
         );
     }
 

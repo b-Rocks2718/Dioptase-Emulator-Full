@@ -78,6 +78,14 @@ fn guest_keycode_for_key(key: Key) -> Option<u8> {
         Key::Return | Key::Return2 | Key::NumPadEnter => Some(0x0D),
         Key::Escape => Some(0x1B),
         Key::Space | Key::NumPadSpace => Some(b' '),
+        Key::Exclaim => Some(b'1'),
+        Key::Quotedbl => Some(b'\''),
+        Key::Hash => Some(b'3'),
+        Key::Dollar => Some(b'4'),
+        Key::Percent => Some(b'5'),
+        Key::Ampersand => Some(b'7'),
+        Key::LeftParen => Some(b'9'),
+        Key::RightParen => Some(b'0'),
         Key::D0 | Key::NumPad0 => Some(b'0'),
         Key::D1 | Key::NumPad1 => Some(b'1'),
         Key::D2 | Key::NumPad2 => Some(b'2'),
@@ -114,19 +122,26 @@ fn guest_keycode_for_key(key: Key) -> Option<u8> {
         Key::X => Some(b'x'),
         Key::Y => Some(b'y'),
         Key::Z => Some(b'z'),
+        Key::Colon => Some(b';'),
+        Key::Less | Key::NumPadLess => Some(b','),
         Key::Minus | Key::NumPadMinus => Some(b'-'),
+        Key::Underscore => Some(b'-'),
         Key::Equals | Key::NumPadEquals | Key::NumPadEqualsAS400 => Some(b'='),
+        Key::Greater | Key::NumPadGreater => Some(b'.'),
+        Key::Question => Some(b'/'),
+        Key::At | Key::NumPadAt => Some(b'2'),
         Key::LeftBracket => Some(b'['),
         Key::RightBracket => Some(b']'),
         Key::Backslash => Some(b'\\'),
+        Key::Caret => Some(b'6'),
         Key::Semicolon => Some(b';'),
         Key::Quote => Some(b'\''),
         Key::Backquote => Some(b'`'),
         Key::Comma | Key::NumPadComma => Some(b','),
         Key::Period | Key::NumPadPeriod | Key::NumPadDecimal => Some(b'.'),
         Key::Slash | Key::NumPadDivide => Some(b'/'),
-        Key::Asterisk | Key::NumPadMultiply => Some(b'*'),
-        Key::Plus | Key::NumPadPlus => Some(b'+'),
+        Key::Asterisk | Key::NumPadMultiply => Some(b'8'),
+        Key::Plus | Key::NumPadPlus => Some(b'='),
         Key::Delete | Key::NumPadBackspace => Some(0x7F),
         Key::Insert => Some(KEY_INSERT),
         Key::Home | Key::AcHome => Some(KEY_HOME),
@@ -206,9 +221,15 @@ fn guest_keycode_from_text_char(ch: char) -> Option<u8> {
 //   `Key::Unknown` press events waiting for the following text event.
 // - `fallback_keycodes_by_scancode` remembers the resolved guest keycode for
 //   those keys so the matching release event can emit the same low byte.
+// - `pending_text_press_code` remembers a make event emitted directly from a
+//   text event until the matching unknown button press arrives, if any.
+// - `recent_button_press_code` suppresses the duplicate text event many
+//   backends send immediately after a normal printable button press.
 struct GuestKeyboardMapper {
     pending_unknown_press_scancodes: VecDeque<i32>,
     fallback_keycodes_by_scancode: HashMap<i32, u8>,
+    pending_text_press_code: Option<u8>,
+    recent_button_press_code: Option<u8>,
 }
 
 impl GuestKeyboardMapper {
@@ -216,12 +237,16 @@ impl GuestKeyboardMapper {
         Self {
             pending_unknown_press_scancodes: VecDeque::new(),
             fallback_keycodes_by_scancode: HashMap::new(),
+            pending_text_press_code: None,
+            recent_button_press_code: None,
         }
     }
 
     fn clear(&mut self) {
         self.pending_unknown_press_scancodes.clear();
         self.fallback_keycodes_by_scancode.clear();
+        self.pending_text_press_code = None;
+        self.recent_button_press_code = None;
     }
 
     fn translate_button(
@@ -230,39 +255,60 @@ impl GuestKeyboardMapper {
         state: ButtonState,
         scancode: Option<i32>,
     ) -> Option<u16> {
-        if let Some(code) = guest_keycode_for_key(key) {
-            return Some(encode_guest_key_event(code, state));
-        }
+        if key == Key::Unknown {
+            match state {
+                ButtonState::Press => {
+                    // Some backends deliver the text event before the matching
+                    // unknown button press. When that happens, the text path
+                    // already emitted the guest make event, so only remember the
+                    // scancode for the later break event.
+                    if let Some(code) = self.pending_text_press_code.take() {
+                        if let Some(scancode) = scancode {
+                            self.fallback_keycodes_by_scancode.insert(scancode, code);
+                        }
+                        self.recent_button_press_code = None;
+                        return None;
+                    }
 
-        if key != Key::Unknown {
-            return None;
-        }
-
-        let scancode = scancode?;
-        match state {
-            ButtonState::Press => {
-                self.pending_unknown_press_scancodes.push_back(scancode);
-                None
-            }
-            ButtonState::Release => {
-                if let Some(code) = self.fallback_keycodes_by_scancode.remove(&scancode) {
-                    return Some(encode_guest_key_event(code, ButtonState::Release));
+                    let scancode = scancode?;
+                    self.pending_unknown_press_scancodes.push_back(scancode);
+                    self.recent_button_press_code = None;
+                    None
                 }
+                ButtonState::Release => {
+                    self.pending_text_press_code = None;
+                    self.recent_button_press_code = None;
 
-                if let Some(index) = self
-                    .pending_unknown_press_scancodes
-                    .iter()
-                    .position(|pending| *pending == scancode)
-                {
-                    self.pending_unknown_press_scancodes.remove(index);
+                    let scancode = scancode?;
+                    if let Some(code) = self.fallback_keycodes_by_scancode.remove(&scancode) {
+                        return Some(encode_guest_key_event(code, ButtonState::Release));
+                    }
+
+                    if let Some(index) = self
+                        .pending_unknown_press_scancodes
+                        .iter()
+                        .position(|pending| *pending == scancode)
+                    {
+                        self.pending_unknown_press_scancodes.remove(index);
+                    }
+                    None
                 }
-                None
             }
+        } else if let Some(code) = guest_keycode_for_key(key) {
+            self.pending_text_press_code = None;
+            self.recent_button_press_code = match state {
+                ButtonState::Press => Some(code),
+                ButtonState::Release => None,
+            };
+            Some(encode_guest_key_event(code, state))
+        } else {
+            self.pending_text_press_code = None;
+            self.recent_button_press_code = None;
+            None
         }
     }
 
     fn translate_text(&mut self, text: &str) -> Option<u16> {
-        let scancode = self.pending_unknown_press_scancodes.pop_front()?;
         let mut chars = text.chars();
         let ch = chars.next()?;
         if chars.next().is_some() {
@@ -270,7 +316,27 @@ impl GuestKeyboardMapper {
         }
 
         let code = guest_keycode_from_text_char(ch)?;
-        self.fallback_keycodes_by_scancode.insert(scancode, code);
+        if let Some(scancode) = self.pending_unknown_press_scancodes.pop_front() {
+            self.fallback_keycodes_by_scancode.insert(scancode, code);
+            self.pending_text_press_code = None;
+            self.recent_button_press_code = None;
+            return Some(encode_guest_key_event(code, ButtonState::Press));
+        }
+
+        // Most backends emit both a logical button press and a text event for
+        // printable keys. Ignore the follow-up text when we already emitted the
+        // guest make event from the button path.
+        if self.recent_button_press_code == Some(code) {
+            self.pending_text_press_code = None;
+            self.recent_button_press_code = None;
+            return None;
+        }
+
+        // If the backend exposes only a text event or delivers it before the
+        // corresponding unknown button press, still emit the guest make event so
+        // interactive text entry keeps working.
+        self.pending_text_press_code = Some(code);
+        self.recent_button_press_code = None;
         Some(encode_guest_key_event(code, ButtonState::Press))
     }
 }
@@ -316,6 +382,7 @@ pub struct Graphics {
     pending_interrupt: Arc<AtomicU32>,
     sprite_map: Arc<RwLock<SpriteMap>>,
     keyboard_mapper: GuestKeyboardMapper,
+    keyboard_debug: bool,
 }
 
 impl Graphics {
@@ -374,6 +441,7 @@ impl Graphics {
             vga_frame_register,
             pending_interrupt,
             keyboard_mapper: GuestKeyboardMapper::new(),
+            keyboard_debug: std::env::var_os("PS2_DEBUG").is_some(),
         }
     }
 
@@ -406,15 +474,29 @@ impl Graphics {
                     }),
                     _,
                 ) => {
+                    if self.keyboard_debug {
+                        eprintln!(
+                            "ps2 host button: key={key:?} state={state:?} scancode={scancode:?}"
+                        );
+                    }
                     if let Some(event_code) =
                         self.keyboard_mapper.translate_button(key, state, scancode)
                     {
+                        if self.keyboard_debug {
+                            eprintln!("ps2 guest event: 0x{event_code:04X}");
+                        }
                         self.io_buffer.write().unwrap().push_back(event_code);
                         self.input_pending.store(true, Ordering::SeqCst);
                     }
                 }
                 Event::Input(Input::Text(text), _) => {
+                    if self.keyboard_debug {
+                        eprintln!("ps2 host text: {text:?}");
+                    }
                     if let Some(event_code) = self.keyboard_mapper.translate_text(&text) {
+                        if self.keyboard_debug {
+                            eprintln!("ps2 guest event: 0x{event_code:04X}");
+                        }
                         self.io_buffer.write().unwrap().push_back(event_code);
                         self.input_pending.store(true, Ordering::SeqCst);
                     }
@@ -630,6 +712,22 @@ mod tests {
     }
 
     #[test]
+    fn guest_keycode_normalizes_shifted_symbol_variants_to_base_keys() {
+        assert_eq!(guest_keycode_for_key(Key::Exclaim), Some(b'1'));
+        assert_eq!(guest_keycode_for_key(Key::At), Some(b'2'));
+        assert_eq!(guest_keycode_for_key(Key::Hash), Some(b'3'));
+        assert_eq!(guest_keycode_for_key(Key::Question), Some(b'/'));
+        assert_eq!(guest_keycode_for_key(Key::Asterisk), Some(b'8'));
+        assert_eq!(guest_keycode_for_key(Key::Plus), Some(b'='));
+        assert_eq!(guest_keycode_for_key(Key::Colon), Some(b';'));
+        assert_eq!(guest_keycode_for_key(Key::Underscore), Some(b'-'));
+        assert_eq!(guest_keycode_for_key(Key::Quotedbl), Some(b'\''));
+        assert_eq!(guest_keycode_for_key(Key::Less), Some(b','));
+        assert_eq!(guest_keycode_for_key(Key::Greater), Some(b'.'));
+        assert_eq!(guest_keycode_for_key(Key::Caret), Some(b'6'));
+    }
+
+    #[test]
     fn text_fallback_recovers_base_key_from_shifted_punctuation() {
         assert_eq!(guest_keycode_from_text_char('!'), Some(b'1'));
         assert_eq!(guest_keycode_from_text_char('"'), Some(b'\''));
@@ -649,6 +747,51 @@ mod tests {
         assert_eq!(
             mapper.translate_button(Key::Unknown, ButtonState::Release, Some(41)),
             Some(0x0100 | b'\'' as u16)
+        );
+    }
+
+    #[test]
+    fn text_before_unknown_key_press_still_preserves_break_event() {
+        let mut mapper = GuestKeyboardMapper::new();
+
+        assert_eq!(mapper.translate_text("!"), Some(b'1' as u16));
+        assert_eq!(
+            mapper.translate_button(Key::Unknown, ButtonState::Press, Some(2)),
+            None
+        );
+        assert_eq!(
+            mapper.translate_button(Key::Unknown, ButtonState::Release, Some(2)),
+            Some(0x0100 | b'1' as u16)
+        );
+    }
+
+    #[test]
+    fn text_after_known_button_press_is_ignored_as_duplicate() {
+        let mut mapper = GuestKeyboardMapper::new();
+
+        assert_eq!(
+            mapper.translate_button(Key::D3, ButtonState::Press, Some(4)),
+            Some(b'3' as u16)
+        );
+        assert_eq!(mapper.translate_text("#"), None);
+        assert_eq!(
+            mapper.translate_button(Key::D3, ButtonState::Release, Some(4)),
+            Some(0x0100 | b'3' as u16)
+        );
+    }
+
+    #[test]
+    fn unknown_key_without_scancode_can_still_emit_text_make_event() {
+        let mut mapper = GuestKeyboardMapper::new();
+
+        assert_eq!(
+            mapper.translate_button(Key::Unknown, ButtonState::Press, None),
+            None
+        );
+        assert_eq!(mapper.translate_text("?"), Some(b'/' as u16));
+        assert_eq!(
+            mapper.translate_button(Key::Unknown, ButtonState::Release, None),
+            None
         );
     }
 }

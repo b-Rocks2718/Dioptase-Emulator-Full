@@ -270,13 +270,13 @@ impl ScheduleMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // Host audio policy for emulator runs.
 pub enum AudioMode {
-    // Do not start a host audio player. The MMIO audio device still advances on
+    // Do not start a host audio player. The MMIO audio devices still advance on
     // emulated device ticks so guest-visible timing stays intact.
     Disabled,
     // Mirror the emulated device output to the host player only when core 0
     // advances the shared device tick.
     Emulated,
-    // Drive the MMIO audio device from wall-clock time on a helper thread so
+    // Drive the MMIO audio devices from wall-clock time on a helper thread so
     // host playback stays intelligible even when emulation is slow. This is an
     // opt-in debugging mode because it changes guest-visible timing.
     Fast,
@@ -698,11 +698,13 @@ pub struct Emulator {
 
 const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
 const FAST_AUDIO_MAX_CATCH_UP_BATCHES: usize = 8;
+const FAST_AUDIO_CORE_YIELD_TICKS: u32 = 1024;
 
 struct AudioPlayback {
     output: Option<AudioOutput>,
     worker_stop: Option<Arc<AtomicBool>>,
     worker: Option<thread::JoinHandle<()>>,
+    fast_memory: Option<Arc<Memory>>,
 }
 
 impl AudioPlayback {
@@ -711,7 +713,7 @@ impl AudioPlayback {
             return (AudioMode::Disabled, None);
         }
 
-        let output = match AudioOutput::start() {
+        let output = match AudioOutput::start(requested_mode == AudioMode::Fast) {
             Ok(output) => output,
             Err(err) => {
                 eprintln!("Warning: failed to start host audio output: {}", err);
@@ -722,13 +724,15 @@ impl AudioPlayback {
         if requested_mode == AudioMode::Fast {
             let sink = output.shared_sink();
             let stop = Arc::new(AtomicBool::new(false));
-            let worker = spawn_fast_audio_worker(memory, sink, Arc::clone(&stop));
+            memory.set_fast_audio_active(true);
+            let worker = spawn_fast_audio_worker(Arc::clone(&memory), sink, Arc::clone(&stop));
             return (
                 AudioMode::Fast,
                 Some(AudioPlayback {
                     output: Some(output),
                     worker_stop: Some(stop),
                     worker: Some(worker),
+                    fast_memory: Some(memory),
                 }),
             );
         }
@@ -739,6 +743,7 @@ impl AudioPlayback {
                 output: Some(output),
                 worker_stop: None,
                 worker: None,
+                fast_memory: None,
             }),
         )
     }
@@ -759,6 +764,9 @@ impl Drop for AudioPlayback {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        if let Some(memory) = self.fast_memory.take() {
+            memory.set_fast_audio_active(false);
+        }
         self.output.take();
     }
 }
@@ -772,7 +780,7 @@ fn audio_batch_duration(batch_count: usize) -> Duration {
 
 // Purpose: keep the optional fast host-audio mode close to real-time wall clock.
 // Inputs: shared memory, host audio sink, and a stop flag owned by the run loop.
-// Outputs: consumes MMIO audio samples in 10 ms wall-clock batches until stop.
+// Outputs: consumes mixed MMIO audio samples in 10 ms wall-clock batches until stop.
 // Invariants:
 // - only this helper thread advances the audio MMIO consumer in fast mode
 // - batches are capped so a stalled host does not build unbounded catch-up work
@@ -1718,6 +1726,15 @@ impl Emulator {
             }
         }
         self.count = self.count.wrapping_add(1);
+        if self.memory.fast_audio_active() && self.count % FAST_AUDIO_CORE_YIELD_TICKS == 0 {
+            /*
+             * Audio-fast mode has an extra host thread that must periodically
+             * acquire the shared MMIO lock to advance the synth command ring.
+             * Multicore guest idle loops can otherwise monopolize CPU time in
+             * the emulator process while user code waits on synth status.
+             */
+            thread::yield_now();
+        }
     }
 
     pub fn run(

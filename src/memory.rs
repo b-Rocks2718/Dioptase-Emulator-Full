@@ -5,6 +5,8 @@ use std::convert::TryFrom;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 use std::u16;
 
 pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
@@ -46,6 +48,84 @@ const AUDIO_STATUS_ENABLED: u32 = 1 << 0;
 const AUDIO_STATUS_LOW_WATER: u32 = 1 << 1;
 const AUDIO_STATUS_UNDERRUN: u32 = 1 << 2;
 const AUDIO_STATUS_IRQ_PENDING: u32 = 1 << 3;
+
+// Synth audio device. This is a separate register-driven sound generator that
+// mixes with the existing PCM ring device at the shared 25 kHz output rate.
+const SYNTH_AUDIO_START: u32 = 0x7FBC000;
+const SYNTH_AUDIO_SIZE: u32 = 0x1000;
+const SYNTH_AUDIO_CTRL_START: u32 = SYNTH_AUDIO_START;
+const SYNTH_AUDIO_STATUS_START: u32 = SYNTH_AUDIO_START + 0x04;
+const SYNTH_AUDIO_MASTER_VOLUME_START: u32 = SYNTH_AUDIO_START + 0x08;
+const SYNTH_AUDIO_VERSION_START: u32 = SYNTH_AUDIO_START + 0x0C;
+const SYNTH_AUDIO_CLOCK_HZ_START: u32 = SYNTH_AUDIO_START + 0x10;
+const SYNTH_AUDIO_SAMPLE_RATE_HZ_START: u32 = SYNTH_AUDIO_START + 0x14;
+const SYNTH_AUDIO_SAMPLE_COUNTER_START: u32 = SYNTH_AUDIO_START + 0x18;
+const SYNTH_AUDIO_CMD_STATUS_START: u32 = SYNTH_AUDIO_START + 0x120;
+const SYNTH_AUDIO_CMD_WRITE_IDX_START: u32 = SYNTH_AUDIO_START + 0x124;
+const SYNTH_AUDIO_CMD_READ_IDX_START: u32 = SYNTH_AUDIO_START + 0x128;
+const SYNTH_AUDIO_CMD_CTRL_START: u32 = SYNTH_AUDIO_START + 0x12C;
+const SYNTH_AUDIO_CMD_RING_BASE_START: u32 = SYNTH_AUDIO_START + 0x130;
+const SYNTH_AUDIO_CMD_RING_BYTES_START: u32 = SYNTH_AUDIO_START + 0x134;
+const SYNTH_AUDIO_CMD_RECORD_BYTES_START: u32 = SYNTH_AUDIO_START + 0x138;
+const SYNTH_AUDIO_CMD_RING_START: u32 = SYNTH_AUDIO_START + 0x200;
+const SYNTH_AUDIO_CMD_RING_OFFSET: u32 = SYNTH_AUDIO_CMD_RING_START - SYNTH_AUDIO_START;
+const SYNTH_AUDIO_CMD_RING_BYTES: u32 = SYNTH_AUDIO_SIZE - SYNTH_AUDIO_CMD_RING_OFFSET;
+const SYNTH_AUDIO_CMD_RECORD_BYTES: u32 = 16;
+const SYNTH_AUDIO_CMD_TARGET_SAMPLE_OFFSET: u32 = 0x00;
+const SYNTH_AUDIO_CMD_REG_OFFSET_OFFSET: u32 = 0x04;
+const SYNTH_AUDIO_CMD_VALUE_OFFSET: u32 = 0x08;
+const SYNTH_AUDIO_CMD_FLAGS_OFFSET: u32 = 0x0C;
+const SYNTH_AUDIO_CHANNEL_STRIDE: u32 = 0x20;
+const SYNTH_AUDIO_SQUARE_BASE: u32 = SYNTH_AUDIO_START + 0x20;
+const SYNTH_AUDIO_TRIANGLE_BASE: u32 = SYNTH_AUDIO_START + 0xA0;
+const SYNTH_AUDIO_NOISE_BASE: u32 = SYNTH_AUDIO_START + 0xE0;
+const SYNTH_AUDIO_SQUARE_CHANNELS: usize = 4;
+const SYNTH_AUDIO_TRIANGLE_CHANNELS: usize = 2;
+const SYNTH_AUDIO_NOISE_CHANNELS: usize = 2;
+const SYNTH_AUDIO_VERSION: u32 = 4;
+const SYNTH_AUDIO_CLOCK_HZ: u32 = 100_000_000;
+const SYNTH_AUDIO_CTRL_ENABLE: u32 = 1 << 0;
+const SYNTH_AUDIO_CTRL_RESET_STATE: u32 = 1 << 1;
+const SYNTH_AUDIO_STATUS_ENABLED: u32 = 1 << 0;
+const SYNTH_AUDIO_STATUS_SQUARE_SHIFT: u32 = 8;
+const SYNTH_AUDIO_STATUS_TRIANGLE_SHIFT: u32 = 12;
+const SYNTH_AUDIO_STATUS_NOISE_SHIFT: u32 = 14;
+const SYNTH_AUDIO_MASTER_VOLUME_MAX: u32 = 255;
+const SYNTH_AUDIO_MIX_SCALE: i32 = 16;
+const SYNTH_AUDIO_CH_CTRL_OFFSET: u32 = 0x00;
+const SYNTH_AUDIO_CH_TIMER_OFFSET: u32 = 0x04;
+const SYNTH_AUDIO_CH_VOLUME_OFFSET: u32 = 0x08;
+const SYNTH_AUDIO_CH_LENGTH_OFFSET: u32 = 0x0C;
+const SYNTH_AUDIO_CH_PHASE_OFFSET: u32 = 0x10;
+const SYNTH_AUDIO_CH_TRIGGER_OFFSET: u32 = 0x14;
+const SYNTH_AUDIO_CH_ENABLE: u32 = 1 << 0;
+const SYNTH_AUDIO_CH_LENGTH_ENABLE: u32 = 1 << 1;
+const SYNTH_AUDIO_SQUARE_DUTY_MASK: u32 = 0x30;
+const SYNTH_AUDIO_SQUARE_CTRL_MASK: u32 =
+    SYNTH_AUDIO_CH_ENABLE | SYNTH_AUDIO_CH_LENGTH_ENABLE | SYNTH_AUDIO_SQUARE_DUTY_MASK;
+const SYNTH_AUDIO_TRIANGLE_CTRL_MASK: u32 = SYNTH_AUDIO_CH_ENABLE | SYNTH_AUDIO_CH_LENGTH_ENABLE;
+const SYNTH_AUDIO_NOISE_SHORT_MODE: u32 = 1 << 4;
+const SYNTH_AUDIO_NOISE_CTRL_MASK: u32 =
+    SYNTH_AUDIO_CH_ENABLE | SYNTH_AUDIO_CH_LENGTH_ENABLE | SYNTH_AUDIO_NOISE_SHORT_MODE;
+const SYNTH_AUDIO_TRIGGER_START: u32 = 1 << 0;
+const SYNTH_AUDIO_SQUARE_PHASE_STEPS: u32 = 8;
+const SYNTH_AUDIO_TRIANGLE_PHASE_STEPS: u32 = 32;
+const SYNTH_AUDIO_NOISE_LFSR_MASK: u32 = 0x7FFF;
+const SYNTH_AUDIO_NOISE_LFSR_SEED: u32 = 1;
+const SYNTH_AUDIO_CMD_RING_CAPACITY: u32 =
+    SYNTH_AUDIO_CMD_RING_BYTES / SYNTH_AUDIO_CMD_RECORD_BYTES;
+const SYNTH_AUDIO_CMD_RING_USABLE_COMMANDS: u32 = SYNTH_AUDIO_CMD_RING_CAPACITY - 1;
+const SYNTH_AUDIO_CMD_STATUS_FULL: u32 = 1 << 0;
+const SYNTH_AUDIO_CMD_STATUS_EMPTY: u32 = 1 << 1;
+const SYNTH_AUDIO_CMD_STATUS_LATE: u32 = 1 << 2;
+const SYNTH_AUDIO_CMD_STATUS_OVERFLOW: u32 = 1 << 3;
+const SYNTH_AUDIO_CMD_STATUS_BAD_OFFSET: u32 = 1 << 4;
+const SYNTH_AUDIO_CMD_STATUS_BAD_FLAGS: u32 = 1 << 5;
+const SYNTH_AUDIO_CMD_STATUS_COUNT_SHIFT: u32 = 8;
+const SYNTH_AUDIO_CMD_STATUS_SPACE_SHIFT: u32 = 20;
+const SYNTH_AUDIO_CMD_CTRL_RESET: u32 = 1 << 0;
+const SYNTH_AUDIO_CMD_CTRL_CLEAR_FLAGS: u32 = 1 << 1;
+const SYNTH_AUDIO_FAST_POLL_SLEEP_MICROS: u64 = 50;
 
 const PIXEL_FRAME_BUFFER_START: u32 = 0x7FC0000;
 const PIXEL_FRAME_BUFFER_SIZE: u32 = PIXEL_FRAME_WIDTH * PIXEL_FRAME_HEIGHT * 2;
@@ -146,6 +226,8 @@ pub struct Memory {
     sd_card: Arc<RwLock<SdCard>>,
     sd_card2: Arc<RwLock<SdCard>>,
     audio: Arc<RwLock<AudioDevice>>,
+    synth_audio: Arc<RwLock<SynthAudioDevice>>,
+    fast_audio_active: AtomicBool,
     pending_interrupt: Arc<AtomicU32>,
     use_uart_rx: bool,
 }
@@ -171,6 +253,64 @@ struct AudioDevice {
     watermark: u32,
     underrun: bool,
     sample_tick_countdown: u32,
+}
+
+// Purpose: register-programmed synth audio device with four square channels,
+// two triangle channels, and two noise channels.
+// Inputs/outputs: software writes channel registers through MMIO; the emulator
+// mixes the generated sample into the same signed 16-bit mono host stream as
+// the existing PCM device.
+// Invariants:
+// - channel register writes are byte-addressable and little-endian
+// - trigger writes are one-shot commands and never read back as set
+// - length counters count 25 kHz output samples, not 100 MHz device ticks
+// - sample_counter is a wrapping device timebase; RESET_STATE preserves it
+// - command-ring entries are applied before rendering the sample whose counter
+//   is greater than or equal to the command target, preserving ring order
+struct SynthAudioDevice {
+    ctrl: u32,
+    master_volume: u32,
+    sample_counter: u32,
+    command_ring: Vec<u8>,
+    command_write_idx: u32,
+    command_read_idx: u32,
+    command_late: bool,
+    command_overflow: bool,
+    command_bad_offset: bool,
+    command_bad_flags: bool,
+    squares: [ToneChannel; SYNTH_AUDIO_SQUARE_CHANNELS],
+    triangles: [ToneChannel; SYNTH_AUDIO_TRIANGLE_CHANNELS],
+    noises: [NoiseChannel; SYNTH_AUDIO_NOISE_CHANNELS],
+}
+
+#[derive(Clone, Copy)]
+struct SynthCommand {
+    target_sample: u32,
+    reg_offset: u32,
+    value: u32,
+    flags: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ToneChannel {
+    ctrl: u32,
+    timer: u32,
+    volume: u32,
+    length_reload: u32,
+    length_counter: u32,
+    phase: u32,
+    tick_accum: u64,
+}
+
+#[derive(Clone, Copy)]
+struct NoiseChannel {
+    ctrl: u32,
+    timer: u32,
+    volume: u32,
+    length_reload: u32,
+    length_counter: u32,
+    lfsr: u32,
+    tick_accum: u64,
 }
 
 // Purpose: tile layer for the VGA output (two bytes per tile entry).
@@ -486,6 +626,10 @@ impl AudioDevice {
         status
     }
 
+    fn enabled(&self) -> bool {
+        (self.ctrl & AUDIO_CTRL_ENABLE) != 0
+    }
+
     fn read_ring_byte(&self, addr: u32) -> Option<u8> {
         if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
             .contains(&addr)
@@ -589,33 +733,770 @@ impl AudioDevice {
         sample
     }
 
-    // Purpose: fill a reusable host buffer with wall-clock playback samples.
-    // Inputs: number of 25 kHz samples to emit immediately and a caller-owned
-    // output vector to reuse across batches.
-    // Outputs: replaces `out` with exactly `sample_count` PCM samples.
-    fn consume_samples_now(&mut self, sample_count: usize, out: &mut Vec<i16>) {
-        out.clear();
-        if out.capacity() < sample_count {
-            out.reserve(sample_count - out.capacity());
-        }
-        for _ in 0..sample_count {
-            out.push(self.consume_sample_now());
-        }
-    }
-
-    fn tick(&mut self) -> Option<i16> {
+    fn tick_sample_clock(&mut self) -> bool {
         if self.sample_tick_countdown > 0 {
             self.sample_tick_countdown -= 1;
-            return None;
+            return false;
         }
         self.sample_tick_countdown = AUDIO_TICKS_PER_SAMPLE.saturating_sub(1);
+        true
+    }
+}
 
-        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
-            return None;
+impl ToneChannel {
+    const fn new() -> Self {
+        ToneChannel {
+            ctrl: 0,
+            timer: 0,
+            volume: 0,
+            length_reload: 0,
+            length_counter: 0,
+            phase: 0,
+            tick_accum: 0,
+        }
+    }
+
+    fn length_enabled(&self) -> bool {
+        (self.ctrl & SYNTH_AUDIO_CH_LENGTH_ENABLE) != 0
+    }
+
+    fn running(&self) -> bool {
+        (self.ctrl & SYNTH_AUDIO_CH_ENABLE) != 0
+            && (!self.length_enabled() || self.length_counter != 0)
+    }
+
+    fn trigger(&mut self) {
+        self.ctrl |= SYNTH_AUDIO_CH_ENABLE;
+        self.length_counter = self.length_reload;
+        self.phase = 0;
+        self.tick_accum = 0;
+    }
+
+    fn finish_sample(&mut self, phase_steps: u32) {
+        if !self.running() {
+            return;
+        }
+        self.advance_phase(phase_steps);
+        if self.length_enabled() && self.length_counter > 0 {
+            self.length_counter -= 1;
+        }
+    }
+
+    fn advance_phase(&mut self, phase_steps: u32) {
+        let period = (self.timer as u64) + 1;
+        self.tick_accum += AUDIO_TICKS_PER_SAMPLE as u64;
+        let steps = self.tick_accum / period;
+        self.tick_accum %= period;
+        self.phase = (self.phase + (steps as u32 % phase_steps)) % phase_steps;
+    }
+
+    fn square_sample(&self) -> i32 {
+        if !self.running() {
+            return 0;
+        }
+        let duty_index = (self.ctrl & SYNTH_AUDIO_SQUARE_DUTY_MASK) >> 4;
+        let high_steps = match duty_index {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 6,
+        };
+        let volume = (self.volume & SYNTH_AUDIO_MASTER_VOLUME_MAX) as i32;
+        if self.phase < high_steps {
+            volume
+        } else {
+            -volume
+        }
+    }
+
+    fn triangle_sample(&self) -> i32 {
+        const TRIANGLE_LEVELS: [i32; SYNTH_AUDIO_TRIANGLE_PHASE_STEPS as usize] = [
+            15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+            11, 12, 13, 14, 15,
+        ];
+
+        if !self.running() {
+            return 0;
+        }
+        let level = TRIANGLE_LEVELS[self.phase as usize];
+        let volume = (self.volume & SYNTH_AUDIO_MASTER_VOLUME_MAX) as i32;
+        ((level * 2) - 15) * volume / 15
+    }
+}
+
+impl NoiseChannel {
+    const fn new() -> Self {
+        NoiseChannel {
+            ctrl: 0,
+            timer: 0,
+            volume: 0,
+            length_reload: 0,
+            length_counter: 0,
+            lfsr: SYNTH_AUDIO_NOISE_LFSR_SEED,
+            tick_accum: 0,
+        }
+    }
+
+    fn length_enabled(&self) -> bool {
+        (self.ctrl & SYNTH_AUDIO_CH_LENGTH_ENABLE) != 0
+    }
+
+    fn running(&self) -> bool {
+        (self.ctrl & SYNTH_AUDIO_CH_ENABLE) != 0
+            && (!self.length_enabled() || self.length_counter != 0)
+    }
+
+    fn trigger(&mut self) {
+        self.ctrl |= SYNTH_AUDIO_CH_ENABLE;
+        self.length_counter = self.length_reload;
+        if self.lfsr == 0 {
+            self.lfsr = SYNTH_AUDIO_NOISE_LFSR_SEED;
+        }
+        self.lfsr &= SYNTH_AUDIO_NOISE_LFSR_MASK;
+        self.tick_accum = 0;
+    }
+
+    fn sample(&self) -> i32 {
+        if !self.running() {
+            return 0;
+        }
+        let volume = (self.volume & SYNTH_AUDIO_MASTER_VOLUME_MAX) as i32;
+        if (self.lfsr & 1) != 0 {
+            volume
+        } else {
+            -volume
+        }
+    }
+
+    fn finish_sample(&mut self) {
+        if !self.running() {
+            return;
+        }
+        self.advance_lfsr();
+        if self.length_enabled() && self.length_counter > 0 {
+            self.length_counter -= 1;
+        }
+    }
+
+    fn advance_lfsr(&mut self) {
+        let period = (self.timer as u64) + 1;
+        self.tick_accum += AUDIO_TICKS_PER_SAMPLE as u64;
+        let steps = self.tick_accum / period;
+        self.tick_accum %= period;
+        for _ in 0..steps {
+            let tap_bit = if (self.ctrl & SYNTH_AUDIO_NOISE_SHORT_MODE) != 0 {
+                6
+            } else {
+                1
+            };
+            let feedback = (self.lfsr ^ (self.lfsr >> tap_bit)) & 1;
+            self.lfsr = (self.lfsr >> 1) | (feedback << 14);
+            self.lfsr &= SYNTH_AUDIO_NOISE_LFSR_MASK;
+            if self.lfsr == 0 {
+                self.lfsr = SYNTH_AUDIO_NOISE_LFSR_SEED;
+            }
+        }
+    }
+}
+
+impl SynthAudioDevice {
+    fn new() -> Self {
+        SynthAudioDevice {
+            ctrl: 0,
+            master_volume: SYNTH_AUDIO_MASTER_VOLUME_MAX,
+            sample_counter: 0,
+            command_ring: vec![0; SYNTH_AUDIO_CMD_RING_BYTES as usize],
+            command_write_idx: 0,
+            command_read_idx: 0,
+            command_late: false,
+            command_overflow: false,
+            command_bad_offset: false,
+            command_bad_flags: false,
+            squares: [ToneChannel::new(); SYNTH_AUDIO_SQUARE_CHANNELS],
+            triangles: [ToneChannel::new(); SYNTH_AUDIO_TRIANGLE_CHANNELS],
+            noises: [NoiseChannel::new(); SYNTH_AUDIO_NOISE_CHANNELS],
+        }
+    }
+
+    fn reset_sound_state(&mut self) {
+        self.ctrl = 0;
+        self.master_volume = SYNTH_AUDIO_MASTER_VOLUME_MAX;
+        self.squares = [ToneChannel::new(); SYNTH_AUDIO_SQUARE_CHANNELS];
+        self.triangles = [ToneChannel::new(); SYNTH_AUDIO_TRIANGLE_CHANNELS];
+        self.noises = [NoiseChannel::new(); SYNTH_AUDIO_NOISE_CHANNELS];
+    }
+
+    fn enabled(&self) -> bool {
+        (self.ctrl & SYNTH_AUDIO_CTRL_ENABLE) != 0
+    }
+
+    fn status(&self) -> u32 {
+        let mut status = 0u32;
+        if self.enabled() {
+            status |= SYNTH_AUDIO_STATUS_ENABLED;
+        }
+        for (index, channel) in self.squares.iter().enumerate() {
+            if channel.running() {
+                status |= 1 << (SYNTH_AUDIO_STATUS_SQUARE_SHIFT + index as u32);
+            }
+        }
+        for (index, channel) in self.triangles.iter().enumerate() {
+            if channel.running() {
+                status |= 1 << (SYNTH_AUDIO_STATUS_TRIANGLE_SHIFT + index as u32);
+            }
+        }
+        for (index, channel) in self.noises.iter().enumerate() {
+            if channel.running() {
+                status |= 1 << (SYNTH_AUDIO_STATUS_NOISE_SHIFT + index as u32);
+            }
+        }
+        status
+    }
+
+    fn normalize_command_ring_idx(idx: u32) -> u32 {
+        (idx % SYNTH_AUDIO_CMD_RING_BYTES) & !(SYNTH_AUDIO_CMD_RECORD_BYTES - 1)
+    }
+
+    fn command_ring_queued_commands(&self) -> u32 {
+        let write = Self::normalize_command_ring_idx(self.command_write_idx);
+        let read = Self::normalize_command_ring_idx(self.command_read_idx);
+        let queued_bytes = if write >= read {
+            write - read
+        } else {
+            SYNTH_AUDIO_CMD_RING_BYTES - (read - write)
+        };
+        queued_bytes / SYNTH_AUDIO_CMD_RECORD_BYTES
+    }
+
+    fn command_ring_status(&self) -> u32 {
+        let count = self.command_ring_queued_commands();
+        let space = SYNTH_AUDIO_CMD_RING_USABLE_COMMANDS.saturating_sub(count);
+        let mut status = (count << SYNTH_AUDIO_CMD_STATUS_COUNT_SHIFT)
+            | (space << SYNTH_AUDIO_CMD_STATUS_SPACE_SHIFT);
+        if count == SYNTH_AUDIO_CMD_RING_USABLE_COMMANDS {
+            status |= SYNTH_AUDIO_CMD_STATUS_FULL;
+        }
+        if count == 0 {
+            status |= SYNTH_AUDIO_CMD_STATUS_EMPTY;
+        }
+        if self.command_late {
+            status |= SYNTH_AUDIO_CMD_STATUS_LATE;
+        }
+        if self.command_overflow {
+            status |= SYNTH_AUDIO_CMD_STATUS_OVERFLOW;
+        }
+        if self.command_bad_offset {
+            status |= SYNTH_AUDIO_CMD_STATUS_BAD_OFFSET;
+        }
+        if self.command_bad_flags {
+            status |= SYNTH_AUDIO_CMD_STATUS_BAD_FLAGS;
+        }
+        status
+    }
+
+    fn reset_command_ring(&mut self) {
+        self.command_write_idx = 0;
+        self.command_read_idx = 0;
+        self.clear_command_ring_flags();
+    }
+
+    fn clear_command_ring_flags(&mut self) {
+        self.command_late = false;
+        self.command_overflow = false;
+        self.command_bad_offset = false;
+        self.command_bad_flags = false;
+    }
+
+    fn valid_command_reg_offset(offset: u32) -> bool {
+        offset < SYNTH_AUDIO_CMD_STATUS_START - SYNTH_AUDIO_START && (offset & 0x3) == 0
+    }
+
+    fn read_command_ring_u32(&self, ring_idx: u32, field_offset: u32) -> u32 {
+        let base = (ring_idx + field_offset) as usize;
+        u32::from_le_bytes([
+            self.command_ring[base],
+            self.command_ring[base + 1],
+            self.command_ring[base + 2],
+            self.command_ring[base + 3],
+        ])
+    }
+
+    fn command_at_read_idx(&self) -> SynthCommand {
+        let read = Self::normalize_command_ring_idx(self.command_read_idx);
+        SynthCommand {
+            target_sample: self.read_command_ring_u32(read, SYNTH_AUDIO_CMD_TARGET_SAMPLE_OFFSET),
+            reg_offset: self.read_command_ring_u32(read, SYNTH_AUDIO_CMD_REG_OFFSET_OFFSET),
+            value: self.read_command_ring_u32(read, SYNTH_AUDIO_CMD_VALUE_OFFSET),
+            flags: self.read_command_ring_u32(read, SYNTH_AUDIO_CMD_FLAGS_OFFSET),
+        }
+    }
+
+    fn advance_command_read_idx(&mut self) {
+        self.command_read_idx =
+            Self::normalize_command_ring_idx(self.command_read_idx + SYNTH_AUDIO_CMD_RECORD_BYTES);
+    }
+
+    fn apply_due_command_ring_commands(&mut self) {
+        while self.command_ring_queued_commands() > 0 {
+            let command = self.command_at_read_idx();
+            if command.flags != 0 {
+                self.command_bad_flags = true;
+                self.advance_command_read_idx();
+                continue;
+            }
+            if !Self::valid_command_reg_offset(command.reg_offset) {
+                self.command_bad_offset = true;
+                self.advance_command_read_idx();
+                continue;
+            }
+            if !sample_counter_reached(self.sample_counter, command.target_sample) {
+                break;
+            }
+            if command.target_sample != self.sample_counter {
+                self.command_late = true;
+            }
+            self.advance_command_read_idx();
+            self.apply_ring_command(command);
+        }
+    }
+
+    fn apply_ring_command(&mut self, command: SynthCommand) {
+        let absolute_addr = SYNTH_AUDIO_START + command.reg_offset;
+        for (offset, byte) in command.value.to_le_bytes().iter().enumerate() {
+            self.write_reg_byte(absolute_addr + offset as u32, *byte);
+        }
+    }
+
+    fn read_reg_byte(&self, addr: u32) -> u8 {
+        if (SYNTH_AUDIO_CTRL_START..SYNTH_AUDIO_CTRL_START + 4).contains(&addr) {
+            return read_reg_byte(self.ctrl, addr, SYNTH_AUDIO_CTRL_START);
+        }
+        if (SYNTH_AUDIO_STATUS_START..SYNTH_AUDIO_STATUS_START + 4).contains(&addr) {
+            return read_reg_byte(self.status(), addr, SYNTH_AUDIO_STATUS_START);
+        }
+        if (SYNTH_AUDIO_MASTER_VOLUME_START..SYNTH_AUDIO_MASTER_VOLUME_START + 4).contains(&addr) {
+            return read_reg_byte(self.master_volume, addr, SYNTH_AUDIO_MASTER_VOLUME_START);
+        }
+        if (SYNTH_AUDIO_VERSION_START..SYNTH_AUDIO_VERSION_START + 4).contains(&addr) {
+            return read_reg_byte(SYNTH_AUDIO_VERSION, addr, SYNTH_AUDIO_VERSION_START);
+        }
+        if (SYNTH_AUDIO_CLOCK_HZ_START..SYNTH_AUDIO_CLOCK_HZ_START + 4).contains(&addr) {
+            return read_reg_byte(SYNTH_AUDIO_CLOCK_HZ, addr, SYNTH_AUDIO_CLOCK_HZ_START);
+        }
+        if (SYNTH_AUDIO_SAMPLE_RATE_HZ_START..SYNTH_AUDIO_SAMPLE_RATE_HZ_START + 4).contains(&addr)
+        {
+            return read_reg_byte(AUDIO_SAMPLE_RATE_HZ, addr, SYNTH_AUDIO_SAMPLE_RATE_HZ_START);
+        }
+        if (SYNTH_AUDIO_SAMPLE_COUNTER_START..SYNTH_AUDIO_SAMPLE_COUNTER_START + 4).contains(&addr)
+        {
+            return read_reg_byte(self.sample_counter, addr, SYNTH_AUDIO_SAMPLE_COUNTER_START);
+        }
+        if (SYNTH_AUDIO_CMD_STATUS_START..SYNTH_AUDIO_CMD_STATUS_START + 4).contains(&addr) {
+            return read_reg_byte(
+                self.command_ring_status(),
+                addr,
+                SYNTH_AUDIO_CMD_STATUS_START,
+            );
+        }
+        if (SYNTH_AUDIO_CMD_WRITE_IDX_START..SYNTH_AUDIO_CMD_WRITE_IDX_START + 4).contains(&addr) {
+            return read_reg_byte(
+                self.command_write_idx,
+                addr,
+                SYNTH_AUDIO_CMD_WRITE_IDX_START,
+            );
+        }
+        if (SYNTH_AUDIO_CMD_READ_IDX_START..SYNTH_AUDIO_CMD_READ_IDX_START + 4).contains(&addr) {
+            return read_reg_byte(self.command_read_idx, addr, SYNTH_AUDIO_CMD_READ_IDX_START);
+        }
+        if (SYNTH_AUDIO_CMD_CTRL_START..SYNTH_AUDIO_CMD_CTRL_START + 4).contains(&addr) {
+            return 0;
+        }
+        if (SYNTH_AUDIO_CMD_RING_BASE_START..SYNTH_AUDIO_CMD_RING_BASE_START + 4).contains(&addr) {
+            return read_reg_byte(
+                SYNTH_AUDIO_CMD_RING_OFFSET,
+                addr,
+                SYNTH_AUDIO_CMD_RING_BASE_START,
+            );
+        }
+        if (SYNTH_AUDIO_CMD_RING_BYTES_START..SYNTH_AUDIO_CMD_RING_BYTES_START + 4).contains(&addr)
+        {
+            return read_reg_byte(
+                SYNTH_AUDIO_CMD_RING_BYTES,
+                addr,
+                SYNTH_AUDIO_CMD_RING_BYTES_START,
+            );
+        }
+        if (SYNTH_AUDIO_CMD_RECORD_BYTES_START..SYNTH_AUDIO_CMD_RECORD_BYTES_START + 4)
+            .contains(&addr)
+        {
+            return read_reg_byte(
+                SYNTH_AUDIO_CMD_RECORD_BYTES,
+                addr,
+                SYNTH_AUDIO_CMD_RECORD_BYTES_START,
+            );
+        }
+        if (SYNTH_AUDIO_CMD_RING_START..SYNTH_AUDIO_START + SYNTH_AUDIO_SIZE).contains(&addr) {
+            return self.command_ring[(addr - SYNTH_AUDIO_CMD_RING_START) as usize];
+        }
+        if let Some(value) = read_tone_channel_reg(addr, SYNTH_AUDIO_SQUARE_BASE, &self.squares) {
+            return value;
+        }
+        if let Some(value) = read_tone_channel_reg(addr, SYNTH_AUDIO_TRIANGLE_BASE, &self.triangles)
+        {
+            return value;
+        }
+        if let Some(value) = read_noise_channel_reg(addr, SYNTH_AUDIO_NOISE_BASE, &self.noises) {
+            return value;
+        }
+        0
+    }
+
+    fn write_reg_byte(&mut self, addr: u32, value: u8) {
+        if (SYNTH_AUDIO_CTRL_START..SYNTH_AUDIO_CTRL_START + 4).contains(&addr) {
+            let mut next = self.ctrl;
+            write_reg_byte(&mut next, addr, SYNTH_AUDIO_CTRL_START, value);
+            let reset_requested = (next & SYNTH_AUDIO_CTRL_RESET_STATE) != 0;
+            let enable = next & SYNTH_AUDIO_CTRL_ENABLE;
+            if reset_requested {
+                self.reset_sound_state();
+            }
+            self.ctrl = enable;
+            return;
+        }
+        if (SYNTH_AUDIO_MASTER_VOLUME_START..SYNTH_AUDIO_MASTER_VOLUME_START + 4).contains(&addr) {
+            write_reg_byte(
+                &mut self.master_volume,
+                addr,
+                SYNTH_AUDIO_MASTER_VOLUME_START,
+                value,
+            );
+            self.master_volume &= SYNTH_AUDIO_MASTER_VOLUME_MAX;
+            return;
+        }
+        if (SYNTH_AUDIO_CMD_WRITE_IDX_START..SYNTH_AUDIO_CMD_WRITE_IDX_START + 4).contains(&addr) {
+            write_reg_byte(
+                &mut self.command_write_idx,
+                addr,
+                SYNTH_AUDIO_CMD_WRITE_IDX_START,
+                value,
+            );
+            self.command_write_idx = Self::normalize_command_ring_idx(self.command_write_idx);
+            return;
+        }
+        if (SYNTH_AUDIO_CMD_CTRL_START..SYNTH_AUDIO_CMD_CTRL_START + 4).contains(&addr) {
+            if addr == SYNTH_AUDIO_CMD_CTRL_START {
+                if ((value as u32) & SYNTH_AUDIO_CMD_CTRL_RESET) != 0 {
+                    self.reset_command_ring();
+                }
+                if ((value as u32) & SYNTH_AUDIO_CMD_CTRL_CLEAR_FLAGS) != 0 {
+                    self.clear_command_ring_flags();
+                }
+            }
+            return;
+        }
+        if (SYNTH_AUDIO_CMD_RING_START..SYNTH_AUDIO_START + SYNTH_AUDIO_SIZE).contains(&addr) {
+            self.command_ring[(addr - SYNTH_AUDIO_CMD_RING_START) as usize] = value;
+            return;
+        }
+        if write_tone_channel_reg(
+            addr,
+            value,
+            SYNTH_AUDIO_SQUARE_BASE,
+            &mut self.squares,
+            SYNTH_AUDIO_SQUARE_CTRL_MASK,
+            SYNTH_AUDIO_SQUARE_PHASE_STEPS,
+        ) {
+            return;
+        }
+        if write_tone_channel_reg(
+            addr,
+            value,
+            SYNTH_AUDIO_TRIANGLE_BASE,
+            &mut self.triangles,
+            SYNTH_AUDIO_TRIANGLE_CTRL_MASK,
+            SYNTH_AUDIO_TRIANGLE_PHASE_STEPS,
+        ) {
+            return;
+        }
+        let _ = write_noise_channel_reg(addr, value, SYNTH_AUDIO_NOISE_BASE, &mut self.noises);
+    }
+
+    fn consume_sample_now(&mut self) -> i16 {
+        self.sample_counter = self.sample_counter.wrapping_add(1);
+        self.apply_due_command_ring_commands();
+
+        if !self.enabled() {
+            return 0;
         }
 
-        Some(self.consume_sample_now())
+        let mut mixed = 0i32;
+        for channel in self.squares.iter() {
+            mixed += channel.square_sample();
+        }
+        for channel in self.triangles.iter() {
+            mixed += channel.triangle_sample();
+        }
+        for channel in self.noises.iter() {
+            mixed += channel.sample();
+        }
+
+        for channel in self.squares.iter_mut() {
+            channel.finish_sample(SYNTH_AUDIO_SQUARE_PHASE_STEPS);
+        }
+        for channel in self.triangles.iter_mut() {
+            channel.finish_sample(SYNTH_AUDIO_TRIANGLE_PHASE_STEPS);
+        }
+        for channel in self.noises.iter_mut() {
+            channel.finish_sample();
+        }
+
+        clamp_i16(
+            mixed * SYNTH_AUDIO_MIX_SCALE * (self.master_volume as i32)
+                / (SYNTH_AUDIO_MASTER_VOLUME_MAX as i32),
+        )
     }
+}
+
+fn read_tone_channel_reg<const N: usize>(
+    addr: u32,
+    base: u32,
+    channels: &[ToneChannel; N],
+) -> Option<u8> {
+    let (index, channel_base, offset) = decode_synth_channel_addr(addr, base, N)?;
+    let channel = channels[index];
+    match offset {
+        SYNTH_AUDIO_CH_CTRL_OFFSET..=0x03 => Some(read_reg_byte(
+            channel.ctrl,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_CTRL_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_TIMER_OFFSET..=0x07 => Some(read_reg_byte(
+            channel.timer,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_TIMER_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_VOLUME_OFFSET..=0x0B => Some(read_reg_byte(
+            channel.volume,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_VOLUME_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_LENGTH_OFFSET..=0x0F => Some(read_reg_byte(
+            channel.length_reload,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_LENGTH_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_PHASE_OFFSET..=0x13 => Some(read_reg_byte(
+            channel.phase,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_PHASE_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_TRIGGER_OFFSET..=0x17 => Some(0),
+        _ => Some(0),
+    }
+}
+
+fn write_tone_channel_reg<const N: usize>(
+    addr: u32,
+    value: u8,
+    base: u32,
+    channels: &mut [ToneChannel; N],
+    ctrl_mask: u32,
+    phase_steps: u32,
+) -> bool {
+    let Some((index, channel_base, offset)) = decode_synth_channel_addr(addr, base, N) else {
+        return false;
+    };
+    let channel = &mut channels[index];
+    match offset {
+        SYNTH_AUDIO_CH_CTRL_OFFSET..=0x03 => {
+            write_reg_byte(
+                &mut channel.ctrl,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_CTRL_OFFSET,
+                value,
+            );
+            channel.ctrl &= ctrl_mask;
+        }
+        SYNTH_AUDIO_CH_TIMER_OFFSET..=0x07 => {
+            write_reg_byte(
+                &mut channel.timer,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_TIMER_OFFSET,
+                value,
+            );
+        }
+        SYNTH_AUDIO_CH_VOLUME_OFFSET..=0x0B => {
+            write_reg_byte(
+                &mut channel.volume,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_VOLUME_OFFSET,
+                value,
+            );
+            channel.volume &= SYNTH_AUDIO_MASTER_VOLUME_MAX;
+        }
+        SYNTH_AUDIO_CH_LENGTH_OFFSET..=0x0F => {
+            write_reg_byte(
+                &mut channel.length_reload,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_LENGTH_OFFSET,
+                value,
+            );
+        }
+        SYNTH_AUDIO_CH_PHASE_OFFSET..=0x13 => {
+            write_reg_byte(
+                &mut channel.phase,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_PHASE_OFFSET,
+                value,
+            );
+            channel.phase %= phase_steps;
+        }
+        SYNTH_AUDIO_CH_TRIGGER_OFFSET..=0x17 => {
+            if offset == SYNTH_AUDIO_CH_TRIGGER_OFFSET
+                && ((value as u32) & SYNTH_AUDIO_TRIGGER_START) != 0
+            {
+                channel.trigger();
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn read_noise_channel_reg<const N: usize>(
+    addr: u32,
+    base: u32,
+    channels: &[NoiseChannel; N],
+) -> Option<u8> {
+    let (index, channel_base, offset) = decode_synth_channel_addr(addr, base, N)?;
+    let channel = channels[index];
+    match offset {
+        SYNTH_AUDIO_CH_CTRL_OFFSET..=0x03 => Some(read_reg_byte(
+            channel.ctrl,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_CTRL_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_TIMER_OFFSET..=0x07 => Some(read_reg_byte(
+            channel.timer,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_TIMER_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_VOLUME_OFFSET..=0x0B => Some(read_reg_byte(
+            channel.volume,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_VOLUME_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_LENGTH_OFFSET..=0x0F => Some(read_reg_byte(
+            channel.length_reload,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_LENGTH_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_PHASE_OFFSET..=0x13 => Some(read_reg_byte(
+            channel.lfsr,
+            addr,
+            channel_base + SYNTH_AUDIO_CH_PHASE_OFFSET,
+        )),
+        SYNTH_AUDIO_CH_TRIGGER_OFFSET..=0x17 => Some(0),
+        _ => Some(0),
+    }
+}
+
+fn write_noise_channel_reg<const N: usize>(
+    addr: u32,
+    value: u8,
+    base: u32,
+    channels: &mut [NoiseChannel; N],
+) -> bool {
+    let Some((index, channel_base, offset)) = decode_synth_channel_addr(addr, base, N) else {
+        return false;
+    };
+    let channel = &mut channels[index];
+    match offset {
+        SYNTH_AUDIO_CH_CTRL_OFFSET..=0x03 => {
+            write_reg_byte(
+                &mut channel.ctrl,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_CTRL_OFFSET,
+                value,
+            );
+            channel.ctrl &= SYNTH_AUDIO_NOISE_CTRL_MASK;
+        }
+        SYNTH_AUDIO_CH_TIMER_OFFSET..=0x07 => {
+            write_reg_byte(
+                &mut channel.timer,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_TIMER_OFFSET,
+                value,
+            );
+        }
+        SYNTH_AUDIO_CH_VOLUME_OFFSET..=0x0B => {
+            write_reg_byte(
+                &mut channel.volume,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_VOLUME_OFFSET,
+                value,
+            );
+            channel.volume &= SYNTH_AUDIO_MASTER_VOLUME_MAX;
+        }
+        SYNTH_AUDIO_CH_LENGTH_OFFSET..=0x0F => {
+            write_reg_byte(
+                &mut channel.length_reload,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_LENGTH_OFFSET,
+                value,
+            );
+        }
+        SYNTH_AUDIO_CH_PHASE_OFFSET..=0x13 => {
+            write_reg_byte(
+                &mut channel.lfsr,
+                addr,
+                channel_base + SYNTH_AUDIO_CH_PHASE_OFFSET,
+                value,
+            );
+            channel.lfsr &= SYNTH_AUDIO_NOISE_LFSR_MASK;
+            if channel.lfsr == 0 {
+                channel.lfsr = SYNTH_AUDIO_NOISE_LFSR_SEED;
+            }
+        }
+        SYNTH_AUDIO_CH_TRIGGER_OFFSET..=0x17 => {
+            if offset == SYNTH_AUDIO_CH_TRIGGER_OFFSET
+                && ((value as u32) & SYNTH_AUDIO_TRIGGER_START) != 0
+            {
+                channel.trigger();
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn decode_synth_channel_addr(addr: u32, base: u32, count: usize) -> Option<(usize, u32, u32)> {
+    let end = base + (count as u32) * SYNTH_AUDIO_CHANNEL_STRIDE;
+    if !(base..end).contains(&addr) {
+        return None;
+    }
+    let relative = addr - base;
+    let index = (relative / SYNTH_AUDIO_CHANNEL_STRIDE) as usize;
+    let channel_base = base + (index as u32) * SYNTH_AUDIO_CHANNEL_STRIDE;
+    Some((index, channel_base, relative % SYNTH_AUDIO_CHANNEL_STRIDE))
+}
+
+fn clamp_i16(value: i32) -> i16 {
+    if value > i16::MAX as i32 {
+        i16::MAX
+    } else if value < i16::MIN as i32 {
+        i16::MIN
+    } else {
+        value as i16
+    }
+}
+
+fn mix_i16(lhs: i16, rhs: i16) -> i16 {
+    clamp_i16(lhs as i32 + rhs as i32)
+}
+
+fn sample_counter_reached(now: u32, target: u32) -> bool {
+    now.wrapping_sub(target) < 0x8000_0000
 }
 
 // Purpose: extract a little-endian register byte from a 32-bit value.
@@ -710,6 +1591,8 @@ impl Memory {
             sd_card: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
             audio: Arc::new(RwLock::new(AudioDevice::new())),
+            synth_audio: Arc::new(RwLock::new(SynthAudioDevice::new())),
+            fast_audio_active: AtomicBool::new(false),
             pending_interrupt: Arc::new(AtomicU32::new(0)),
             use_uart_rx: use_uart_rx,
         }
@@ -760,6 +1643,21 @@ impl Memory {
 
     fn addrs_touch_mmio(addrs: &[u32]) -> bool {
         addrs.iter().any(|addr| Self::addr_touches_mmio(*addr))
+    }
+
+    fn addr_is_synth_wait_poll_reg(addr: u32) -> bool {
+        (SYNTH_AUDIO_SAMPLE_COUNTER_START..SYNTH_AUDIO_SAMPLE_COUNTER_START + 4).contains(&addr)
+            || (SYNTH_AUDIO_CMD_STATUS_START..SYNTH_AUDIO_CMD_STATUS_START + 4).contains(&addr)
+    }
+
+    fn addrs_touch_synth_wait_poll_reg(addrs: &[u32]) -> bool {
+        addrs.iter().copied().any(Self::addr_is_synth_wait_poll_reg)
+    }
+
+    fn yield_after_synth_wait_poll_read(&self) {
+        if self.fast_audio_active.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_micros(SYNTH_AUDIO_FAST_POLL_SLEEP_MICROS));
+        }
     }
 
     fn single_ram_page(addrs: &[u32]) -> Option<usize> {
@@ -967,14 +1865,35 @@ impl Memory {
         return Arc::clone(&self.pending_interrupt);
     }
 
+    pub fn set_fast_audio_active(&self, active: bool) {
+        self.fast_audio_active.store(active, Ordering::SeqCst);
+    }
+
+    pub fn fast_audio_active(&self) -> bool {
+        self.fast_audio_active.load(Ordering::SeqCst)
+    }
+
     pub fn has_pending_input(&self) -> bool {
         self.input_pending.load(Ordering::SeqCst)
     }
 
     pub fn read(&self, addr: u32) -> u8 {
         if Self::addr_touches_mmio(addr) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            self.read_mmio_byte(addr)
+            let value = {
+                let _mmio = self.mmio_lock.lock().unwrap();
+                self.read_mmio_byte(addr)
+            };
+            if Self::addr_is_synth_wait_poll_reg(addr) {
+                /*
+                 * The guest DSYN player intentionally polls these registers in
+                 * user mode. In audio-fast mode, a host helper thread advances
+                 * the synth ring under the same MMIO lock. Yielding only after
+                 * the coherent MMIO read preserves read atomicity while giving
+                 * that helper a scheduling point to consume queued commands.
+                 */
+                self.yield_after_synth_wait_poll_read();
+            }
+            value
         } else {
             self.read_ram_byte(addr)
         }
@@ -1010,8 +1929,17 @@ impl Memory {
     pub fn read_phys_bytes(&self, addrs: &[u32], out: &mut [u8]) {
         assert_eq!(addrs.len(), out.len());
         if Self::addrs_touch_mmio(addrs) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            self.read_phys_bytes_inner(addrs, out);
+            {
+                let _mmio = self.mmio_lock.lock().unwrap();
+                self.read_phys_bytes_inner(addrs, out);
+            }
+            if Self::addrs_touch_synth_wait_poll_reg(addrs) {
+                /*
+                 * See read(): multi-byte MMIO loads still happen under one
+                 * lock, then yield after the lock is released.
+                 */
+                self.yield_after_synth_wait_poll_read();
+            }
         } else {
             self.read_phys_bytes_inner(addrs, out);
         }
@@ -1179,6 +2107,8 @@ impl Memory {
             return value;
         } else if let Some(value) = self.audio.read().unwrap().read_reg_byte(addr) {
             return value;
+        } else if (SYNTH_AUDIO_START..SYNTH_AUDIO_START + SYNTH_AUDIO_SIZE).contains(&addr) {
+            return self.synth_audio.read().unwrap().read_reg_byte(addr);
         } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             return self
                 .tile_map
@@ -1392,6 +2322,9 @@ impl Memory {
                 "attempting to write read-only audio read index register (0x{:08X})",
                 AUDIO_READ_IDX_START
             );
+        } else if (SYNTH_AUDIO_START..SYNTH_AUDIO_START + SYNTH_AUDIO_SIZE).contains(&addr) {
+            self.synth_audio.write().unwrap().write_reg_byte(addr, data);
+            handled = true;
         } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
             self.tile_map
                 .write()
@@ -1670,32 +2603,53 @@ impl Memory {
         false
     }
 
-    // Purpose: advance the fixed-rate audio consumer by one 100 MHz device tick.
+    // Purpose: advance the fixed-rate audio devices by one 100 MHz device tick.
     // Inputs: none.
-    // Outputs: may advance AUDIO_READ_IDX, latch UNDERRUN, and return the exact
-    // 16-bit PCM sample the device would output this tick (including signed-zero
-    // during underrun) so the optional host backend can mirror hardware output.
+    // Outputs: may advance PCM AUDIO_READ_IDX, update synth channel state, and
+    // return the mixed 16-bit output sample for the optional host backend.
     pub fn tick_audio(&self) -> Option<i16> {
         let _mmio = self.mmio_lock.lock().unwrap();
         let mut audio = self.audio.write().unwrap();
         let was_low_water = audio.low_water();
-        let sample = audio.tick();
+        if !audio.tick_sample_clock() {
+            return None;
+        }
+        let pcm_enabled = audio.enabled();
+        let pcm_sample = audio.consume_sample_now();
         if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
             self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
         }
-        sample
+        drop(audio);
+
+        let mut synth_audio = self.synth_audio.write().unwrap();
+        let synth_enabled = synth_audio.enabled();
+        let synth_sample = synth_audio.consume_sample_now();
+        if pcm_enabled || synth_enabled {
+            Some(mix_i16(pcm_sample, synth_sample))
+        } else {
+            None
+        }
     }
 
     // Purpose: drive the optional wall-clock host-audio mode.
     // Inputs: number of 25 kHz samples to emit immediately and a caller-owned
     // buffer that is reused across batches.
-    // Outputs: fills `out` with the PCM samples the MMIO audio device would
-    // output over that wall-clock slice while updating READ_IDX/UNDERRUN state.
+    // Outputs: fills `out` with mixed samples the MMIO audio devices would
+    // output over that wall-clock slice while updating device state.
     pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
         let _mmio = self.mmio_lock.lock().unwrap();
         let mut audio = self.audio.write().unwrap();
+        let mut synth_audio = self.synth_audio.write().unwrap();
         let was_low_water = audio.low_water();
-        audio.consume_samples_now(sample_count, out);
+        out.clear();
+        if out.capacity() < sample_count {
+            out.reserve(sample_count - out.capacity());
+        }
+        for _ in 0..sample_count {
+            let pcm_sample = audio.consume_sample_now();
+            let synth_sample = synth_audio.consume_sample_now();
+            out.push(mix_i16(pcm_sample, synth_sample));
+        }
         if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
             self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
         }
@@ -1719,6 +2673,38 @@ Summary:
 */
 mod tests {
     use super::*;
+
+    fn write_synth_ring_command(
+        memory: &Memory,
+        ring_idx: u32,
+        target_sample: u32,
+        reg_offset: u32,
+        value: u32,
+    ) {
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_RING_START + ring_idx + SYNTH_AUDIO_CMD_TARGET_SAMPLE_OFFSET,
+            target_sample,
+        );
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_RING_START + ring_idx + SYNTH_AUDIO_CMD_REG_OFFSET_OFFSET,
+            reg_offset,
+        );
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_RING_START + ring_idx + SYNTH_AUDIO_CMD_VALUE_OFFSET,
+            value,
+        );
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_RING_START + ring_idx + SYNTH_AUDIO_CMD_FLAGS_OFFSET,
+            0,
+        );
+    }
+
+    fn publish_synth_ring_commands(memory: &Memory, command_count: u32) {
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_WRITE_IDX_START,
+            command_count * SYNTH_AUDIO_CMD_RECORD_BYTES,
+        );
+    }
 
     #[test]
     fn sd_dump_preserves_loaded_image_length() {
@@ -1965,6 +2951,269 @@ mod tests {
             memory.read_u32(AUDIO_READ_IDX_START),
             2,
             "wall-clock audio mode must advance READ_IDX by one sample",
+        );
+    }
+
+    #[test]
+    fn synth_audio_registers_live_in_reserved_mmio_page() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_VERSION_START),
+            SYNTH_AUDIO_VERSION
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CLOCK_HZ_START),
+            SYNTH_AUDIO_CLOCK_HZ
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_SAMPLE_RATE_HZ_START),
+            AUDIO_SAMPLE_RATE_HZ
+        );
+        let mut samples = Vec::new();
+        let counter_before = memory.read_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START);
+        memory.consume_audio_wallclock_samples(2, &mut samples);
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START),
+            counter_before.wrapping_add(2),
+            "synth sample counter must follow output samples consumed by audio-fast mode",
+        );
+        memory.write_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START, 0xFFFF);
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START),
+            counter_before.wrapping_add(2),
+            "synth sample counter is read-only",
+        );
+
+        memory.write_u32(SYNTH_AUDIO_MASTER_VOLUME_START, 0x1FF);
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_MASTER_VOLUME_START),
+            SYNTH_AUDIO_MASTER_VOLUME_MAX,
+            "synth master volume must be clamped to the documented 8-bit range",
+        );
+
+        memory.write_u32(SYNTH_AUDIO_START + 0x1F0, 0x1234_5678);
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_START + 0x1F0),
+            0,
+            "reserved synth-page addresses must read as zero after ignored writes",
+        );
+    }
+
+    #[test]
+    fn synth_audio_command_ring_applies_commands_inside_wallclock_batch() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let square0_offset = SYNTH_AUDIO_SQUARE_BASE - SYNTH_AUDIO_START;
+        let target = memory
+            .read_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START)
+            .wrapping_add(2);
+        let mut samples = Vec::new();
+        let mut ring_idx = 0;
+
+        write_synth_ring_command(
+            &memory,
+            ring_idx,
+            target,
+            SYNTH_AUDIO_CTRL_START - SYNTH_AUDIO_START,
+            SYNTH_AUDIO_CTRL_RESET_STATE | SYNTH_AUDIO_CTRL_ENABLE,
+        );
+        ring_idx += SYNTH_AUDIO_CMD_RECORD_BYTES;
+        write_synth_ring_command(
+            &memory,
+            ring_idx,
+            target,
+            square0_offset + SYNTH_AUDIO_CH_CTRL_OFFSET,
+            2 << 4,
+        );
+        ring_idx += SYNTH_AUDIO_CMD_RECORD_BYTES;
+        write_synth_ring_command(
+            &memory,
+            ring_idx,
+            target,
+            square0_offset + SYNTH_AUDIO_CH_TIMER_OFFSET,
+            AUDIO_TICKS_PER_SAMPLE - 1,
+        );
+        ring_idx += SYNTH_AUDIO_CMD_RECORD_BYTES;
+        write_synth_ring_command(
+            &memory,
+            ring_idx,
+            target,
+            square0_offset + SYNTH_AUDIO_CH_VOLUME_OFFSET,
+            10,
+        );
+        ring_idx += SYNTH_AUDIO_CMD_RECORD_BYTES;
+        write_synth_ring_command(
+            &memory,
+            ring_idx,
+            target,
+            square0_offset + SYNTH_AUDIO_CH_TRIGGER_OFFSET,
+            SYNTH_AUDIO_TRIGGER_START,
+        );
+        publish_synth_ring_commands(&memory, 5);
+
+        memory.consume_audio_wallclock_samples(3, &mut samples);
+
+        assert_eq!(
+            samples[0], 0,
+            "queued synth commands must not apply before their target sample",
+        );
+        assert_eq!(
+            samples[1], 160,
+            "queued synth commands must apply inside a wall-clock audio batch before rendering the target sample",
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_STATUS_START) & SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            "all due ring commands should be drained after the target sample renders",
+        );
+    }
+
+    #[test]
+    fn synth_audio_command_ring_reports_full_and_resets() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_RING_BASE_START),
+            SYNTH_AUDIO_CMD_RING_OFFSET,
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_RING_BYTES_START),
+            SYNTH_AUDIO_CMD_RING_BYTES,
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_RECORD_BYTES_START),
+            SYNTH_AUDIO_CMD_RECORD_BYTES,
+        );
+        memory.write_u32(
+            SYNTH_AUDIO_CMD_WRITE_IDX_START,
+            SYNTH_AUDIO_CMD_RING_USABLE_COMMANDS * SYNTH_AUDIO_CMD_RECORD_BYTES,
+        );
+
+        let full_status = memory.read_u32(SYNTH_AUDIO_CMD_STATUS_START);
+        assert_ne!(
+            full_status & SYNTH_AUDIO_CMD_STATUS_FULL,
+            0,
+            "command-ring status must report full when all usable entries are pending",
+        );
+        assert_eq!(
+            (full_status >> SYNTH_AUDIO_CMD_STATUS_COUNT_SHIFT) & 0x0FFF,
+            SYNTH_AUDIO_CMD_RING_USABLE_COMMANDS,
+            "command-ring status must report the pending command count",
+        );
+
+        memory.write_u32(SYNTH_AUDIO_CMD_CTRL_START, SYNTH_AUDIO_CMD_CTRL_RESET);
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_STATUS_START) & SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            "command-ring reset must drop pending commands",
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_WRITE_IDX_START),
+            0,
+            "command-ring reset must reset the producer index",
+        );
+    }
+
+    #[test]
+    fn synth_audio_command_ring_rejects_bad_command_record() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let target = memory
+            .read_u32(SYNTH_AUDIO_SAMPLE_COUNTER_START)
+            .wrapping_add(1);
+        let mut samples = Vec::new();
+
+        write_synth_ring_command(&memory, 0, target, SYNTH_AUDIO_CMD_STATUS_START, 0);
+        publish_synth_ring_commands(&memory, 1);
+        memory.consume_audio_wallclock_samples(2, &mut samples);
+
+        assert_ne!(
+            memory.read_u32(SYNTH_AUDIO_CMD_STATUS_START) & SYNTH_AUDIO_CMD_STATUS_BAD_OFFSET,
+            0,
+            "command-ring consumer must reject records targeting command-ring control registers",
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_CMD_STATUS_START) & SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            SYNTH_AUDIO_CMD_STATUS_EMPTY,
+            "rejected command-ring records must be consumed so playback can continue",
+        );
+    }
+
+    #[test]
+    fn synth_audio_trigger_starts_and_lengths_square_channel() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let square0 = SYNTH_AUDIO_SQUARE_BASE;
+
+        memory.write_u32(SYNTH_AUDIO_CTRL_START, SYNTH_AUDIO_CTRL_ENABLE);
+        memory.write_u32(
+            square0 + SYNTH_AUDIO_CH_CTRL_OFFSET,
+            SYNTH_AUDIO_CH_LENGTH_ENABLE | (2 << 4),
+        );
+        memory.write_u32(
+            square0 + SYNTH_AUDIO_CH_TIMER_OFFSET,
+            AUDIO_TICKS_PER_SAMPLE - 1,
+        );
+        memory.write_u32(square0 + SYNTH_AUDIO_CH_VOLUME_OFFSET, 10);
+        memory.write_u32(square0 + SYNTH_AUDIO_CH_LENGTH_OFFSET, 2);
+        memory.write_u32(
+            square0 + SYNTH_AUDIO_CH_TRIGGER_OFFSET,
+            SYNTH_AUDIO_TRIGGER_START,
+        );
+
+        assert_eq!(memory.read_u32(square0 + SYNTH_AUDIO_CH_TRIGGER_OFFSET), 0);
+        assert_ne!(
+            memory.read_u32(SYNTH_AUDIO_STATUS_START) & (1 << SYNTH_AUDIO_STATUS_SQUARE_SHIFT),
+            0,
+            "triggering square0 must set its active status bit",
+        );
+        assert_eq!(
+            memory.tick_audio(),
+            Some(160),
+            "square0 volume 10 at full master volume must scale to a signed sample",
+        );
+
+        let mut sample = None;
+        for _ in 0..AUDIO_TICKS_PER_SAMPLE {
+            sample = memory.tick_audio();
+        }
+
+        assert_eq!(
+            sample,
+            Some(160),
+            "second length-counted square sample must play before the channel expires",
+        );
+        assert_eq!(
+            memory.read_u32(SYNTH_AUDIO_STATUS_START) & (1 << SYNTH_AUDIO_STATUS_SQUARE_SHIFT),
+            0,
+            "length-counted square channel must become inactive after its final sample",
+        );
+    }
+
+    #[test]
+    fn synth_audio_mixes_with_existing_pcm_device() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let square0 = SYNTH_AUDIO_SQUARE_BASE;
+
+        memory.write(AUDIO_RING_BUFFER_START, 0xE8);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x03);
+        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
+        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE);
+
+        memory.write_u32(SYNTH_AUDIO_CTRL_START, SYNTH_AUDIO_CTRL_ENABLE);
+        memory.write_u32(square0 + SYNTH_AUDIO_CH_CTRL_OFFSET, 2 << 4);
+        memory.write_u32(
+            square0 + SYNTH_AUDIO_CH_TIMER_OFFSET,
+            AUDIO_TICKS_PER_SAMPLE - 1,
+        );
+        memory.write_u32(square0 + SYNTH_AUDIO_CH_VOLUME_OFFSET, 10);
+        memory.write_u32(
+            square0 + SYNTH_AUDIO_CH_TRIGGER_OFFSET,
+            SYNTH_AUDIO_TRIGGER_START,
+        );
+
+        assert_eq!(
+            memory.tick_audio(),
+            Some(1160),
+            "host audio output must mix the existing PCM device with the new synth device",
         );
     }
 }

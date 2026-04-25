@@ -14,9 +14,50 @@ You can also pass positional files in order: `cargo run -- <ram.hex> [sd0.bin] [
 
 Use the `--vga` flag to open a window with the VGA output
 
-Use the `--audio` flag to pipe the emulated `25 kHz` mono `s16le` audio stream to `ffplay` for host playback (requires `ffplay` on `PATH`)
+Use the `--audio` flag to pipe the emulated mixed `25 kHz` mono `s16le` audio stream to `ffplay` for host playback (requires `ffplay` on `PATH`). The stream includes both the existing PCM ring-buffer device and the register-driven synth audio device.
 
-Use the `--audio-fast` flag to drive the MMIO audio device from wall-clock time instead of emulated device ticks so host playback remains intelligible when emulation is slow. This is a debugging convenience mode and intentionally changes guest-visible audio timing.
+Use the `--audio-fast` flag to drive the MMIO audio devices from wall-clock time instead of emulated device ticks so host playback remains intelligible when emulation is slow. This is a debugging convenience mode and intentionally changes guest-visible audio timing. If the host audio player falls behind, fast mode may drop host samples rather than stalling MMIO device time.
+
+### MIDI to Synth Audio
+
+Use `scripts/midi_to_dsyn.py` to convert a standard MIDI file into the DSYN v1
+command-stream format for the synth audio MMIO device:
+
+```sh
+python3 scripts/midi_to_dsyn.py song.mid song.dsyn
+```
+
+You can also open a GUI for selecting the MIDI source, assigning existing MIDI
+channels to each hardware synth channel, editing per-channel settings, saving
+configs, converting to DSYN, and previewing the rendered synth output:
+
+```sh
+python3 scripts/midi_to_dsyn.py --gui
+```
+
+The preview button renders the same DSYN register writes that the converter
+will save, then plays them through `ffplay`, `aplay`, `paplay`, or `afplay` if
+one is available on `PATH`. The GUI can also save the rendered preview as a WAV
+file.
+
+The default mapping uses MIDI channels 1-4 for `square0`-`square3`, channels
+5-6 for `triangle0`-`triangle1`, and channel 10 for `noise0`. To create an
+editable JSON config:
+
+```sh
+python3 scripts/midi_to_dsyn.py --write-default-config synth_config.json
+python3 scripts/midi_to_dsyn.py song.mid song.dsyn --config synth_config.json
+```
+
+Quick command-line overrides are also supported:
+
+```sh
+python3 scripts/midi_to_dsyn.py song.mid song.dsyn \
+  --map square0=1 \
+  --set square0.duty=1 \
+  --set triangle0.transpose=-12 \
+  --set noise0.timer=900
+```
 
 Use the `--uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
 

@@ -1,5 +1,7 @@
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -8,6 +10,7 @@ use crate::memory::AUDIO_SAMPLE_RATE_HZ;
 // Flush in larger chunks because the emulator produces bursty audio writes and
 // ffplay is more reliable when it can buffer a modest amount of PCM.
 const AUDIO_FLUSH_INTERVAL_SAMPLES: usize = 2048;
+const AUDIO_BUFFERED_BATCH_QUEUE: usize = 4;
 
 struct AudioSinkState {
     writer: BufWriter<ChildStdin>,
@@ -16,15 +19,29 @@ struct AudioSinkState {
     last_player_error: Arc<Mutex<Option<String>>>,
 }
 
-// Purpose: serialize guest PCM samples into the host audio player stdin pipe.
-// Inputs/outputs: emulator code writes signed 16-bit mono PCM samples; the sink
+struct BufferedAudioSink {
+    sender: SyncSender<Vec<i16>>,
+    failed: Arc<AtomicBool>,
+    last_player_error: Arc<Mutex<Option<String>>>,
+}
+
+enum AudioSinkInner {
+    Direct(Mutex<AudioSinkState>),
+    Buffered(BufferedAudioSink),
+}
+
+// Purpose: serialize mixed guest audio samples into the host player stdin pipe.
+// Inputs/outputs: emulator code writes signed 16-bit mono samples; the sink
 // writes little-endian bytes to the child process and periodically flushes them.
 // Invariants:
 // - writes preserve guest sample ordering
 // - each sample is emitted as exactly two little-endian bytes
+// - direct mode applies host backpressure to guest audio output
+// - buffered mode never blocks the caller; it may drop host samples if the
+//   player falls behind so audio-fast mode does not stall guest device time
 // - once the host pipe fails, subsequent writes become no-ops to avoid log spam
 pub struct AudioSink {
-    inner: Mutex<AudioSinkState>,
+    inner: AudioSinkInner,
 }
 
 impl AudioSink {
@@ -62,17 +79,52 @@ impl AudioSink {
         }
     }
 
-    pub fn write_sample(&self, sample: i16) {
-        let mut state = self.inner.lock().unwrap();
-        Self::write_samples_locked(&mut state, &[sample]);
+    fn report_buffered_audio_error(buffered: &BufferedAudioSink) {
+        if buffered.failed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(player_error) = buffered.last_player_error.lock().unwrap().clone() {
+            eprintln!(
+                "Warning: host audio stream queue disconnected (ffplay: {})",
+                player_error
+            );
+        } else {
+            eprintln!("Warning: host audio stream queue disconnected");
+        }
     }
 
-    // Purpose: serialize a contiguous batch of guest PCM samples with one sink lock.
+    pub fn write_sample(&self, sample: i16) {
+        self.write_samples(&[sample]);
+    }
+
+    // Purpose: serialize a contiguous batch of guest audio samples with one sink lock.
     // Inputs/outputs: preserves sample ordering and writes each sample as exactly
     // two little-endian bytes to the host player stdin pipe.
     pub fn write_samples(&self, samples: &[i16]) {
-        let mut state = self.inner.lock().unwrap();
-        Self::write_samples_locked(&mut state, samples);
+        match &self.inner {
+            AudioSinkInner::Direct(inner) => {
+                let mut state = inner.lock().unwrap();
+                Self::write_samples_locked(&mut state, samples);
+            }
+            AudioSinkInner::Buffered(buffered) => {
+                if buffered.failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                match buffered.sender.try_send(samples.to_vec()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        /*
+                         * Audio-fast mode is a wall-clock debugging mode. If
+                         * the host player stops draining, dropping host samples
+                         * is preferable to stalling MMIO device time.
+                         */
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        Self::report_buffered_audio_error(buffered);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -82,11 +134,12 @@ impl AudioSink {
 pub struct AudioOutput {
     sink: Option<Arc<AudioSink>>,
     child: Option<Child>,
+    writer_thread: Option<thread::JoinHandle<()>>,
     stderr_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl AudioOutput {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(buffered: bool) -> Result<Self, String> {
         let last_player_error = Arc::new(Mutex::new(None));
         let mut child = Command::new("ffplay")
             .args(ffplay_args())
@@ -107,18 +160,38 @@ impl AudioOutput {
             stderr,
             Arc::clone(&last_player_error),
         ));
-        let sink = Arc::new(AudioSink {
-            inner: Mutex::new(AudioSinkState {
-                writer: BufWriter::new(stdin),
-                samples_since_flush: 0,
-                failed: false,
-                last_player_error,
-            }),
-        });
+        let mut writer_thread = None;
+        let sink = if buffered {
+            let (sender, receiver) = sync_channel(AUDIO_BUFFERED_BATCH_QUEUE);
+            let failed = Arc::new(AtomicBool::new(false));
+            writer_thread = Some(spawn_buffered_audio_writer(
+                stdin,
+                Arc::clone(&last_player_error),
+                Arc::clone(&failed),
+                receiver,
+            ));
+            Arc::new(AudioSink {
+                inner: AudioSinkInner::Buffered(BufferedAudioSink {
+                    sender,
+                    failed,
+                    last_player_error,
+                }),
+            })
+        } else {
+            Arc::new(AudioSink {
+                inner: AudioSinkInner::Direct(Mutex::new(AudioSinkState {
+                    writer: BufWriter::new(stdin),
+                    samples_since_flush: 0,
+                    failed: false,
+                    last_player_error,
+                })),
+            })
+        };
 
         Ok(AudioOutput {
             sink: Some(sink),
             child: Some(child),
+            writer_thread,
             stderr_thread,
         })
     }
@@ -134,7 +207,16 @@ impl AudioOutput {
 
 impl Drop for AudioOutput {
     fn drop(&mut self) {
+        let buffered = self.writer_thread.is_some();
         self.sink.take();
+        if buffered {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
+        }
+        if let Some(writer_thread) = self.writer_thread.take() {
+            let _ = writer_thread.join();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
@@ -142,6 +224,31 @@ impl Drop for AudioOutput {
             let _ = stderr_thread.join();
         }
     }
+}
+
+fn spawn_buffered_audio_writer(
+    stdin: ChildStdin,
+    last_player_error: Arc<Mutex<Option<String>>>,
+    failed: Arc<AtomicBool>,
+    receiver: Receiver<Vec<i16>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut state = AudioSinkState {
+            writer: BufWriter::new(stdin),
+            samples_since_flush: 0,
+            failed: false,
+            last_player_error,
+        };
+
+        while let Ok(samples) = receiver.recv() {
+            AudioSink::write_samples_locked(&mut state, &samples);
+            if state.failed {
+                failed.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+        let _ = state.writer.flush();
+    })
 }
 
 fn spawn_ffplay_stderr_thread(

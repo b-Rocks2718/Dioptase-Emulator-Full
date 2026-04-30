@@ -490,6 +490,9 @@ struct InterruptController {
     pending: Vec<AtomicU32>,
     // Per-core IPI payload storage (copied into MBI on delivery).
     ipi_payload: Vec<AtomicU32>,
+    // One outstanding IPI payload is allowed per core. The latch stays set
+    // from a successful send until the target acknowledges the IPI ISR bit.
+    ipi_inflight: Vec<AtomicBool>,
     routes: Mutex<InterruptRouteState>,
 }
 
@@ -499,6 +502,7 @@ impl InterruptController {
             cores,
             pending: (0..cores).map(|_| AtomicU32::new(0)).collect(),
             ipi_payload: (0..cores).map(|_| AtomicU32::new(0)).collect(),
+            ipi_inflight: (0..cores).map(|_| AtomicBool::new(false)).collect(),
             routes: Mutex::new(InterruptRouteState {
                 next_kb: 0,
                 next_uart: 0,
@@ -536,23 +540,30 @@ impl InterruptController {
         if target >= self.cores {
             return false;
         }
+        if self.ipi_inflight[target]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         // MBI carries the payload, ISR bit signals delivery.
         self.write_ipi_payload(target, value);
         self.set_pending_bits(target, IPI_INTERRUPT_BIT);
         true
     }
 
-    fn send_ipi_all(&self, sender: usize, value: u32) -> u32 {
+    fn send_ipi_all(&self, value: u32) -> u32 {
         let mut mask = 0u32;
         for core in 0..self.cores {
-            if core == sender {
-                continue;
-            }
             if self.send_ipi(core, value) {
                 mask |= 1u32 << core;
             }
         }
         mask
+    }
+
+    fn ack_ipi(&self, core: usize) {
+        self.ipi_inflight[core].store(false, Ordering::Release);
     }
 
     fn dispatch_input(&self, use_uart_rx: bool, io_nonempty: bool) {
@@ -1215,10 +1226,14 @@ impl Emulator {
             self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
         }
         self.cregfile[2] = value | pending;
-        // Let the interrupt controller know when input interrupts are cleared.
+        // Let the interrupt controller know when software acknowledges
+        // controller-tracked interrupt state.
         let cleared = old & !self.cregfile[2];
         if cleared != 0 {
             self.interrupts.ack_input(self.core_id as usize, cleared);
+            if (cleared & IPI_INTERRUPT_BIT) != 0 {
+                self.interrupts.ack_ipi(self.core_id as usize);
+            }
         }
     }
 
@@ -3002,7 +3017,7 @@ impl Emulator {
         let payload = self.cregfile[11];
 
         if all {
-            let mask = self.interrupts.send_ipi_all(self.core_id as usize, payload);
+            let mask = self.interrupts.send_ipi_all(payload);
             if ra != 0 {
                 self.write_reg(ra, mask);
             }
@@ -3163,6 +3178,85 @@ mod tests {
         assert_eq!(
             cpu.cregfile[10], 0x1234_5678,
             "the queued IPI payload must remain stable after the next tick snapshots it",
+        );
+    }
+
+    #[test]
+    fn send_ipi_fails_until_target_acknowledges_ipi() {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(1);
+        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
+
+        assert!(interrupts.send_ipi(0, 0x1111_2222));
+        assert!(
+            !interrupts.send_ipi(0, 0x3333_4444),
+            "a second IPI to the same core must fail while the first payload is pending",
+        );
+
+        cpu.check_for_interrupts();
+
+        assert_eq!(
+            cpu.cregfile[2] & IPI_INTERRUPT_BIT,
+            IPI_INTERRUPT_BIT,
+            "the first IPI must remain visible in ISR until eoi 5",
+        );
+        assert_eq!(
+            cpu.cregfile[10], 0x1111_2222,
+            "a failed second IPI must not overwrite the first payload",
+        );
+        assert!(
+            !interrupts.send_ipi(0, 0x5555_6666),
+            "IPI delivery must remain busy after the target snapshots ISR but before eoi",
+        );
+
+        let eoi_ipi = (31u32 << 27) | (5u32 << 12) | 5;
+        cpu.eoi_op(eoi_ipi);
+
+        assert_eq!(
+            cpu.cregfile[2] & IPI_INTERRUPT_BIT,
+            0,
+            "eoi 5 must clear the active IPI ISR bit",
+        );
+        assert!(
+            interrupts.send_ipi(0, 0x7777_8888),
+            "IPI delivery must reopen after the target acknowledges the IPI",
+        );
+
+        cpu.check_for_interrupts();
+
+        assert_eq!(
+            cpu.cregfile[10], 0x7777_8888,
+            "the next successful IPI must deliver its own payload",
+        );
+    }
+
+    #[test]
+    fn ipi_all_reports_only_cores_without_outstanding_ipi() {
+        let interrupts = InterruptController::new(3);
+
+        assert!(interrupts.send_ipi(1, 0xAAAA_0001));
+
+        let mask = interrupts.send_ipi_all(0xBBBB_0002);
+
+        assert_eq!(
+            mask,
+            (1u32 << 0) | (1u32 << 2),
+            "ipi all must report success only for cores without an outstanding IPI",
+        );
+        assert_eq!(
+            interrupts.read_ipi_payload(1),
+            0xAAAA_0001,
+            "ipi all must not overwrite the payload for a core whose IPI is still pending",
+        );
+        assert_eq!(
+            interrupts.read_ipi_payload(0),
+            0xBBBB_0002,
+            "ipi all must deliver to available cores, including core 0",
+        );
+        assert_eq!(
+            interrupts.read_ipi_payload(2),
+            0xBBBB_0002,
+            "ipi all must deliver the payload to every other available core",
         );
     }
 

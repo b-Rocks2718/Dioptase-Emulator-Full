@@ -30,7 +30,7 @@ enum AudioSinkInner {
     Buffered(BufferedAudioSink),
 }
 
-// Purpose: serialize mixed guest audio samples into the host player stdin pipe.
+// Purpose: serialize guest PCM samples into the host player stdin pipe.
 // Inputs/outputs: emulator code writes signed 16-bit mono samples; the sink
 // writes little-endian bytes to the child process and periodically flushes them.
 // Invariants:
@@ -97,7 +97,7 @@ impl AudioSink {
         self.write_samples(&[sample]);
     }
 
-    // Purpose: serialize a contiguous batch of guest audio samples with one sink lock.
+    // Purpose: serialize a contiguous batch of guest PCM samples with one sink lock.
     // Inputs/outputs: preserves sample ordering and writes each sample as exactly
     // two little-endian bytes to the host player stdin pipe.
     pub fn write_samples(&self, samples: &[i16]) {

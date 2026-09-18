@@ -11,6 +11,10 @@ concurrency:
   group: emulator-full-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Override this repository variable only with a tested, full root commit SHA.
+  DIOPTASE_STACK_REF: ${{ vars.DIOPTASE_STACK_REF || '672754082faef6fb6d2d56d5c189d1c655197077' }}
+
 jobs:
   tests:
     name: Full emulator tests
@@ -18,9 +22,26 @@ jobs:
     # Allow dependency compilation while still detecting a stuck emulator test.
     timeout-minutes: 30
     steps:
-      - name: Check out pull request
+      - name: Require an immutable stack revision
+        run: |
+          if [[ ! "$DIOPTASE_STACK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Full emulator CI: DIOPTASE_STACK_REF must be a full root repository commit SHA; observed '$DIOPTASE_STACK_REF'." >&2
+            exit 1
+          fi
+      - name: Check out pinned Dioptase stack
         uses: actions/checkout@v7
         with:
+          repository: b-Rocks2718/Dioptase
+          ref: ${{ env.DIOPTASE_STACK_REF }}
+          persist-credentials: false
+      - name: Initialize pinned assembler dependency
+        run: |
+          git -c url."https://github.com/".insteadOf="git@github.com:" \
+            submodule update --init --depth 1 -- Dioptase-Assembler
+      - name: Check out full emulator pull request
+        uses: actions/checkout@v7
+        with:
+          path: Dioptase-Emulators/Dioptase-Emulator-Full
           persist-credentials: false
       - name: Run tests and static analysis
-        run: bash .github/scripts/ci.sh
+        run: bash Dioptase-Emulators/Dioptase-Emulator-Full/.github/scripts/ci.sh

@@ -1,5 +1,7 @@
 # Full Dioptase Emulator
 
+[![CI](https://github.com/b-Rocks2718/Dioptase-Emulator-Full/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/b-Rocks2718/Dioptase-Emulator-Full/actions/workflows/ci.yml)
+
 Emulator of both the user mode and kernel mode part of the Dioptase ISA
 
 Emulates the IO devices including the SD card DMA engine.  

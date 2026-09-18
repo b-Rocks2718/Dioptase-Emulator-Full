@@ -22,5 +22,5 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Run debug and release suites
+      - name: Run tests and static analysis
         run: bash .github/scripts/ci.sh

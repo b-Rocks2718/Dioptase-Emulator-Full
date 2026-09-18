@@ -23,11 +23,12 @@ fn locate_emulator_bin() -> (Option<PathBuf>, Vec<PathBuf>) {
         }
     }
 
-    let mut name_candidates = Vec::new();
-    name_candidates.push(name.to_string());
-    name_candidates.push(name.to_ascii_lowercase());
-    name_candidates.push(name.replace('-', "_"));
-    name_candidates.push(name.replace('-', "_").to_ascii_lowercase());
+    let name_candidates = vec![
+        name.to_string(),
+        name.to_ascii_lowercase(),
+        name.replace('-', "_"),
+        name.replace('-', "_").to_ascii_lowercase(),
+    ];
 
     let mut dirs = Vec::new();
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {

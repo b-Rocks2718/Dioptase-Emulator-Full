@@ -1324,7 +1324,7 @@ impl Emulator {
             Some("kernel_stack")
         } else if paddr >= BIOS_START && paddr < BIOS_END {
             Some("bios")
-        } else if paddr >= IVT_START && paddr < IVT_END {
+        } else if (IVT_START..IVT_END).contains(&paddr) {
             Some("ivt")
         } else {
             None

@@ -14,6 +14,7 @@ use memory::SdSlot;
 
 const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N]";
 
+// Print usage and exit.
 fn print_usage_and_exit() -> ! {
     println!("{}", USAGE);
     process::exit(1);
@@ -36,6 +37,7 @@ where
     }
 }
 
+// Configure devices and scheduling from command-line options, then run the emulator.
 fn main() {
     let args = env::args().collect::<Vec<_>>();
 

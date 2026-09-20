@@ -5,22 +5,27 @@ fn sign_extend(value: u32, bits: u8) -> i32 {
     ((value << shift) as i32) >> shift
 }
 
+// Format a general-purpose register number as its assembly name.
 fn reg_name(reg: u32) -> String {
     format!("r{}", reg)
 }
 
+// Format a control-register number as its assembly name.
 fn creg_name(reg: u32) -> String {
     format!("cr{}", reg)
 }
 
+// Format an immediate as the assembler's eight-digit hexadecimal form.
 fn fmt_imm_hex(value: u32) -> String {
     format!("0x{:08X}", value)
 }
 
+// Format a decoded immediate as a signed decimal value.
 fn fmt_imm_signed(value: i32) -> String {
     format!("{}", value)
 }
 
+// Map the encoded ALU operation index to its mnemonic.
 fn alu_op_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
         "and", "nand", "or", "nor", "xor", "xnor", "not", "lsl", "lsr", "asr", "rotl", "rotr",
@@ -29,6 +34,7 @@ fn alu_op_name(op: u32) -> Option<&'static str> {
     OPS.get(op as usize).copied()
 }
 
+// Map the encoded relative-branch condition to its mnemonic.
 fn branch_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
         "br", "bz", "bnz", "bs", "bns", "bc", "bnc", "bo", "bno", "bps", "bnps", "bg", "bge", "bl",
@@ -37,6 +43,7 @@ fn branch_name(op: u32) -> Option<&'static str> {
     OPS.get(op as usize).copied()
 }
 
+// Map the encoded absolute-branch condition to its mnemonic.
 fn branch_abs_name(op: u32) -> Option<&'static str> {
     const OPS: [&str; 19] = [
         "bra", "bza", "bnza", "bsa", "bnsa", "bca", "bnca", "boa", "bnoa", "bpa", "bnpa", "bga",
@@ -45,6 +52,7 @@ fn branch_abs_name(op: u32) -> Option<&'static str> {
     OPS.get(op as usize).copied()
 }
 
+// Decode the ALU immediate, including the packed shift-immediate forms.
 fn decode_alu_imm(op: u32, imm: u32) -> (String, bool) {
     if op <= 6 {
         let shift = 8 * ((imm >> 8) & 3);
@@ -58,6 +66,7 @@ fn decode_alu_imm(op: u32, imm: u32) -> (String, bool) {
     (fmt_imm_signed(value), false)
 }
 
+// Disassemble an ALU instruction whose operands are registers.
 fn disassemble_alu_reg(instr: u32) -> String {
     let r_a = (instr >> 22) & 0x1F;
     let r_b = (instr >> 17) & 0x1F;
@@ -85,6 +94,7 @@ fn disassemble_alu_reg(instr: u32) -> String {
     )
 }
 
+// Disassemble an ALU instruction with an immediate operand.
 fn disassemble_alu_imm(instr: u32) -> String {
     let r_a = (instr >> 22) & 0x1F;
     let r_b = (instr >> 17) & 0x1F;
@@ -108,12 +118,14 @@ fn disassemble_alu_imm(instr: u32) -> String {
     format!("{} {}, {}, {}", name, reg_name(r_a), reg_name(r_b), imm_str)
 }
 
+// Disassemble a load-upper-immediate instruction.
 fn disassemble_lui(instr: u32) -> String {
     let r_a = (instr >> 22) & 0x1F;
     let imm = (instr & 0x3FFFFF) << 10;
     format!("lui {}, {}", reg_name(r_a), fmt_imm_hex(imm))
 }
 
+// Disassemble a load or store instruction and select its addressing form.
 fn disassemble_mem(opcode: u32, instr: u32) -> String {
     let group = opcode - 3;
     let width_type = group / 3;
@@ -189,6 +201,7 @@ fn disassemble_mem(opcode: u32, instr: u32) -> String {
     }
 }
 
+// Disassemble a PC-relative branch with an encoded displacement.
 fn disassemble_branch_imm(instr: u32) -> String {
     let op = (instr >> 22) & 0x1F;
     let imm = sign_extend((instr & 0x3FFFFF) << 2, 22);
@@ -198,6 +211,7 @@ fn disassemble_branch_imm(instr: u32) -> String {
     format!("{} {}", name, fmt_imm_signed(imm))
 }
 
+// Disassemble a branch whose target is formed from two registers.
 fn disassemble_branch_abs(instr: u32) -> String {
     let op = (instr >> 22) & 0x1F;
     let r_a = (instr >> 5) & 0x1F;
@@ -208,6 +222,7 @@ fn disassemble_branch_abs(instr: u32) -> String {
     format!("{} {}, {}", name, reg_name(r_a), reg_name(r_b))
 }
 
+// Disassemble a register-relative branch with its base and offset registers.
 fn disassemble_branch_rel(instr: u32) -> String {
     let op = (instr >> 22) & 0x1F;
     let r_a = (instr >> 5) & 0x1F;
@@ -218,6 +233,7 @@ fn disassemble_branch_rel(instr: u32) -> String {
     format!("{} {}, {}", name, reg_name(r_a), reg_name(r_b))
 }
 
+// Disassemble a trap, preserving nonzero trap payloads as data.
 fn disassemble_trap(instr: u32) -> String {
     if (instr & 0x07FF_FFFF) == 0 {
         "trap".to_string()
@@ -226,6 +242,7 @@ fn disassemble_trap(instr: u32) -> String {
     }
 }
 
+// Disassemble an atomic arithmetic or swap instruction.
 fn disassemble_atomic(opcode: u32, instr: u32) -> String {
     let is_fadd = opcode <= 18;
     let is_absolute = opcode == 16 || opcode == 19;
@@ -265,12 +282,14 @@ fn disassemble_atomic(opcode: u32, instr: u32) -> String {
     )
 }
 
+// Disassemble an add-PC instruction and its signed displacement.
 fn disassemble_adpc(instr: u32) -> String {
     let r_a = (instr >> 22) & 0x1F;
     let imm = sign_extend(instr & 0x3FFFFF, 22);
     format!("adpc {}, {}", reg_name(r_a), fmt_imm_signed(imm))
 }
 
+// Disassemble privileged kernel instructions, including their sub-opcodes.
 fn disassemble_kernel(instr: u32) -> String {
     let major = (instr >> 12) & 0x1F;
     match major {
@@ -332,6 +351,7 @@ fn disassemble_kernel(instr: u32) -> String {
     }
 }
 
+// Decode the top-level opcode and format the corresponding instruction.
 pub fn disassemble(instr: u32) -> String {
     let opcode = instr >> 27;
     match opcode {
@@ -354,18 +374,21 @@ pub fn disassemble(instr: u32) -> String {
 mod tests {
     use super::disassemble;
 
+    // Test disassembles EOI specific.
     #[test]
     fn disassembles_eoi_specific() {
         let instr = (31u32 << 27) | (5u32 << 12) | 6u32;
         assert_eq!(disassemble(instr), "eoi 6");
     }
 
+    // Test disassembles EOI all.
     #[test]
     fn disassembles_eoi_all() {
         let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
         assert_eq!(disassemble(instr), "eoi all");
     }
 
+    // Test disassembles reserved alt rfe encoding as data.
     #[test]
     fn disassembles_reserved_alt_rfe_encoding_as_data() {
         let instr = (31u32 << 27) | (3u32 << 12) | (1u32 << 11);

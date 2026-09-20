@@ -118,6 +118,7 @@ const TILE_MAP_SIZE: u32 = 0x8000;
 const SPRITE_MAP_START: u32 = 0x7FF0000;
 const SPRITE_MAP_SIZE: u32 = 0x8000;
 
+// Models guest RAM, MMIO devices, and their architecturally visible state.
 pub struct Memory {
     // Ordinary RAM is sharded by 4KB page so unrelated cores can access
     // different pages concurrently. Each page lock also guards lazy allocation.
@@ -150,12 +151,13 @@ pub struct Memory {
     use_uart_rx: bool,
 }
 
+// Stores one lazily allocated page of guest RAM.
 struct RamPage {
     bytes: [u8; RAM_PAGE_SIZE],
 }
 
-// Purpose: fixed-format PCM sink exposed through MMIO registers plus a byte ring buffer.
-// Inputs/outputs: software writes PCM bytes + producer index; the device advances the
+// Fixed-format PCM sink exposed through MMIO registers plus a byte ring buffer.
+// Software writes PCM bytes + producer index; the device advances the
 // consumer index at the fixed sample rate and raises an interrupt only when
 // LOW_WATER transitions from false to true while IRQ delivery is enabled.
 // Invariants:
@@ -173,37 +175,37 @@ struct AudioDevice {
     sample_tick_countdown: u32,
 }
 
-// Purpose: tile layer for the VGA output (two bytes per tile entry).
-// Inputs/outputs: MMIO reads/writes map to raw bytes; rendering uses tile index + color.
-// Invariants: entries length matches the MMIO-mapped byte size; width/height in tiles.
+// Tile layer for the VGA output (two bytes per tile entry).
 pub struct TileFrameBuffer {
     pub width_tiles: u32,  // number of tiles in the x direction
     pub height_tiles: u32, // number of tiles in the y direction
     entries: Vec<u8>,
 }
 
-// Purpose: pixel layer for the VGA output (16-bit little-endian pixels).
-// Inputs/outputs: MMIO reads/writes map to raw bytes; rendering reads u16 pixels.
-// Invariants: byte length == width_pixels * height_pixels * 2.
+// Pixel layer for the VGA output (16-bit little-endian pixels).
 pub struct PixelFrameBuffer {
     pub width_pixels: u32,
     pub height_pixels: u32,
     bytes: Vec<u8>,
 }
 
+// Stores the tile-layer bytes exposed through VGA MMIO.
 pub struct TileMap {
     pub tiles: Vec<Tile>,
 }
 
+// Describes one tile entry's index and palette color.
 #[derive(Clone)]
 pub struct Tile {
     pub pixels: Vec<u8>, // an 8x8 tile of pixels
 }
 
+// Stores the sprite-layer bytes exposed through VGA MMIO.
 pub struct SpriteMap {
     pub sprites: Vec<Sprite>,
 }
 
+// Describes one sprite entry in the guest sprite map.
 #[derive(Clone)]
 pub struct Sprite {
     pub x: (u8, u8),
@@ -212,24 +214,29 @@ pub struct Sprite {
 }
 
 impl RamPage {
+    // Allocate a zero-filled guest RAM page.
     fn new() -> Self {
         RamPage {
             bytes: [0; RAM_PAGE_SIZE],
         }
     }
 
+    // Read one byte from this lazily allocated RAM page.
     fn read_byte(&self, offset: usize) -> u8 {
         self.bytes[offset]
     }
 
+    // Store one byte in this RAM page.
     fn write_byte(&mut self, offset: usize, value: u8) {
         self.bytes[offset] = value;
     }
 
+    // Read an unaligned little-endian halfword from the page.
     fn read_u16_le(&self, offset: usize) -> u16 {
         u16::from_le_bytes([self.bytes[offset], self.bytes[offset + 1]])
     }
 
+    // Read an unaligned little-endian word from the page.
     fn read_u32_le(&self, offset: usize) -> u32 {
         u32::from_le_bytes([
             self.bytes[offset],
@@ -239,27 +246,28 @@ impl RamPage {
         ])
     }
 
+    // Store a little-endian halfword in the page.
     fn write_u16_le(&mut self, offset: usize, value: u16) {
         let bytes = value.to_le_bytes();
         self.bytes[offset..offset + 2].copy_from_slice(&bytes);
     }
 
+    // Store a little-endian word in the page.
     fn write_u32_le(&mut self, offset: usize, value: u32) {
         let bytes = value.to_le_bytes();
         self.bytes[offset..offset + 4].copy_from_slice(&bytes);
     }
 }
 
-// Purpose: identify which SD card device should receive a host image.
+// Identify which SD card device should receive a host image.
 #[derive(Clone, Copy)]
 pub enum SdSlot {
     Sd0,
     Sd1,
 }
 
-// Purpose: SD card storage indexed by block address, plus DMA register state.
-// Inputs/outputs: storage is read/written by DMA; registers mirror MMIO state.
-// Invariants: dma_remaining > 0 while dma_active is true; dma_status BUSY implies dma_active;
+// SD card storage indexed by block address, plus DMA register state.
+// Dma_remaining > 0 while dma_active is true; dma_status BUSY implies dma_active;
 // image_len tracks the exported raw image length and grows on writes.
 struct SdCard {
     storage: HashMap<u32, Vec<u8>>,
@@ -282,6 +290,7 @@ struct SdCard {
 }
 
 impl SdCard {
+    // Create an empty SD device with reset DMA state.
     fn new(dma_ticks_per_word: u32) -> Self {
         let ticks_per_word = dma_ticks_per_word.max(1);
         SdCard {
@@ -305,9 +314,8 @@ impl SdCard {
         }
     }
 
-    // Purpose: start an SD initialization sequence using DMA status/error registers.
-    // Inputs: SD_DMA_CTRL already written by MMIO.
-    // Outputs: updates BUSY/DONE/ERR state and returns true for immediate IRQ.
+    // Start an SD initialization sequence using DMA status/error registers.
+    // Updates BUSY/DONE/ERR state and returns true for immediate IRQ.
     fn start_init(&mut self) -> bool {
         let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
         if is_busy {
@@ -327,9 +335,8 @@ impl SdCard {
         false
     }
 
-    // Purpose: start a DMA transfer using the current register values.
-    // Inputs: DMA registers already written by MMIO.
-    // Outputs: updates DMA state and returns true if an immediate interrupt is needed.
+    // Start a DMA transfer using the current register values.
+    // Updates DMA state and returns true if an immediate interrupt is needed.
     fn start_dma(&mut self) -> bool {
         let irq_enable = (self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0;
         let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
@@ -367,17 +374,15 @@ impl SdCard {
         false
     }
 
-    // Purpose: clear DONE/ERR status and reset the error code.
-    // Inputs/outputs: updates status bits and dma_err in-place.
+    // Clear DONE/ERR status and reset the error code.
     fn clear_status(&mut self) {
         self.dma_status &= !SD_DMA_STATUS_DONE;
         self.dma_status &= !SD_DMA_STATUS_ERR;
         self.dma_err = SD_DMA_ERR_NONE;
     }
 
-    // Purpose: read a byte from SD storage without allocating missing blocks.
-    // Inputs: byte_offset in SD address space.
-    // Outputs: stored byte value or 0 if unmapped.
+    // Read a byte from SD storage without allocating missing blocks.
+    // Returns stored byte value or 0 if unmapped.
     fn read_storage_byte(&self, byte_offset: u64) -> u8 {
         let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
         let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
@@ -388,9 +393,7 @@ impl SdCard {
             .unwrap_or(0)
     }
 
-    // Purpose: write a byte to SD storage, allocating blocks as needed.
-    // Inputs: byte_offset in SD address space and value to store.
-    // Outputs: updates storage contents.
+    // Write a byte to SD storage, allocating blocks as needed.
     fn write_storage_byte(&mut self, byte_offset: u64, value: u8) {
         let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
         let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
@@ -402,9 +405,8 @@ impl SdCard {
         self.image_len = self.image_len.max(byte_offset + 1);
     }
 
-    // Purpose: load a raw SD image into storage starting at block 0.
-    // Inputs: image bytes, where offset 0 corresponds to block 0 byte 0.
-    // Outputs: storage is cleared and replaced with the provided image.
+    // Load a raw SD image into storage starting at block 0.
+    // Storage is cleared and replaced with the provided image.
     fn load_image(&mut self, image: &[u8]) {
         self.storage.clear();
         self.image_len = image.len() as u64;
@@ -415,9 +417,8 @@ impl SdCard {
         }
     }
 
-    // Purpose: serialize the SD card back into the raw host image format.
-    // Inputs: none.
-    // Outputs: contiguous bytes covering [0, image_len), with gaps zero-filled.
+    // Serialize the SD card back into the raw host image format.
+    // Returns contiguous bytes covering [0, image_len), with gaps zero-filled.
     fn dump_image(&self) -> Vec<u8> {
         let len =
             usize::try_from(self.image_len).expect("sd image length exceeds host address space");
@@ -435,6 +436,7 @@ impl SdCard {
 }
 
 impl AudioDevice {
+    // Create an audio device with empty ring-buffer state.
     fn new() -> Self {
         AudioDevice {
             ring: vec![0; AUDIO_RING_BUFFER_SIZE as usize],
@@ -447,10 +449,12 @@ impl AudioDevice {
         }
     }
 
+    // Normalize a ring-buffer index into the device's fixed-size ring.
     fn normalized_idx(idx: u32) -> u32 {
         idx % AUDIO_RING_BUFFER_SIZE
     }
 
+    // Return the number of unread PCM bytes between producer and consumer.
     fn buffered_bytes(&self) -> u32 {
         let write = Self::normalized_idx(self.write_idx);
         let read = self.read_idx;
@@ -461,14 +465,17 @@ impl AudioDevice {
         }
     }
 
+    // Determine whether the unread audio data is below the watermark.
     fn low_water(&self) -> bool {
         self.buffered_bytes() <= self.watermark
     }
 
+    // Return whether the audio device currently requests an interrupt.
     fn irq_pending(&self) -> bool {
         self.low_water()
     }
 
+    // Assemble the guest-visible audio status register value.
     fn status(&self) -> u32 {
         let mut status = 0u32;
         if (self.ctrl & AUDIO_CTRL_ENABLE) != 0 {
@@ -486,10 +493,12 @@ impl AudioDevice {
         status
     }
 
+    // Return whether audio playback is enabled in the control register.
     fn enabled(&self) -> bool {
         (self.ctrl & AUDIO_CTRL_ENABLE) != 0
     }
 
+    // Read one byte from the audio ring at a guest-visible index.
     fn read_ring_byte(&self, addr: u32) -> Option<u8> {
         if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
             .contains(&addr)
@@ -499,6 +508,7 @@ impl AudioDevice {
         Some(self.ring[(addr - AUDIO_RING_BUFFER_START) as usize])
     }
 
+    // Store one byte into the audio ring at a guest-visible index.
     fn write_ring_byte(&mut self, addr: u32, value: u8) -> bool {
         if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
             .contains(&addr)
@@ -509,6 +519,7 @@ impl AudioDevice {
         true
     }
 
+    // Read one byte from the audio device's register window.
     fn read_reg_byte(&self, addr: u32) -> Option<u8> {
         if addr >= AUDIO_CTRL_START && addr < AUDIO_CTRL_START + 4 {
             return Some(read_reg_byte(self.ctrl, addr, AUDIO_CTRL_START));
@@ -528,6 +539,7 @@ impl AudioDevice {
         None
     }
 
+    // Update one byte of the audio control register.
     fn write_ctrl_byte(&mut self, addr: u32, value: u8) -> bool {
         if !(AUDIO_CTRL_START..AUDIO_CTRL_START + 4).contains(&addr) {
             return false;
@@ -541,6 +553,7 @@ impl AudioDevice {
         true
     }
 
+    // Update one byte of the guest audio producer index.
     fn write_write_idx_byte(&mut self, addr: u32, value: u8) -> bool {
         if !(AUDIO_WRITE_IDX_START..AUDIO_WRITE_IDX_START + 4).contains(&addr) {
             return false;
@@ -549,6 +562,7 @@ impl AudioDevice {
         true
     }
 
+    // Update one byte of the low-watermark register.
     fn write_watermark_byte(&mut self, addr: u32, value: u8) -> bool {
         if !(AUDIO_WATERMARK_START..AUDIO_WATERMARK_START + 4).contains(&addr) {
             return false;
@@ -557,22 +571,24 @@ impl AudioDevice {
         true
     }
 
+    // Clear an underrun once playback has recovered after a refill.
     fn clear_underrun_if_recovered(&mut self) {
         if self.buffered_bytes() >= AUDIO_SAMPLE_BYTES {
             self.underrun = false;
         }
     }
 
+    // Read the queued sample at a ring-buffer position.
     fn sample_at(&self, idx: u32) -> i16 {
         let lo = self.ring[idx as usize];
         let hi = self.ring[((idx + 1) % AUDIO_RING_BUFFER_SIZE) as usize];
         i16::from_le_bytes([lo, hi])
     }
 
-    // Purpose: consume one sample immediately from the MMIO audio device.
-    // Inputs: none; this bypasses the 100 MHz device-tick countdown and is
+    // Consume one sample immediately from the MMIO audio device.
+    // This bypasses the 100 MHz device-tick countdown and is
     // only used by the optional wall-clock host-audio mode.
-    // Outputs: the exact sample the hardware would output right now, including
+    // Returns the exact sample the hardware would output right now, including
     // signed-zero underrun output while enabled and the buffer is empty.
     // Invariants:
     // - READ_IDX advances by exactly one sample when buffered PCM exists
@@ -593,6 +609,7 @@ impl AudioDevice {
         sample
     }
 
+    // Advance the sample-rate countdown and consume audio when it expires.
     fn tick_sample_clock(&mut self) -> bool {
         if self.sample_tick_countdown > 0 {
             self.sample_tick_countdown -= 1;
@@ -603,26 +620,22 @@ impl AudioDevice {
     }
 }
 
-// Purpose: extract a little-endian register byte from a 32-bit value.
-// Inputs: full register value, byte address, base register address.
-// Outputs: the addressed byte.
+// Extract a little-endian register byte from a 32-bit value.
+// Returns the addressed byte.
 fn read_reg_byte(value: u32, addr: u32, base: u32) -> u8 {
     let shift = ((addr - base) * 8) as u32;
     ((value >> shift) & 0xFF) as u8
 }
 
-// Purpose: update one byte of a 32-bit MMIO register in little-endian order.
-// Inputs: register, byte address, base register address, and the new byte value.
-// Outputs: updates the register in-place.
+// Update one byte of a 32-bit MMIO register in little-endian order.
 fn write_reg_byte(reg: &mut u32, addr: u32, base: u32, value: u8) {
     let shift = ((addr - base) * 8) as u32;
     let mask = 0xFFu32 << shift;
     *reg = (*reg & !mask) | ((value as u32) << shift);
 }
 
-// Purpose: read a byte from an SD DMA MMIO block.
-// Inputs: address, base address, and SD card state.
-// Outputs: Some(byte) if within the SD block, else None.
+// Read a byte from an SD DMA MMIO block.
+// Returns Some(byte) if within the SD block, else None.
 fn read_sd_dma_mmio(addr: u32, base: u32, sd: &SdCard) -> Option<u8> {
     if addr < base || addr >= base + SD_DMA_RANGE_SIZE {
         return None;
@@ -660,6 +673,7 @@ fn read_sd_dma_mmio(addr: u32, base: u32, sd: &SdCard) -> Option<u8> {
 }
 
 impl Memory {
+    // Create guest memory and reset all mapped devices.
     pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool, sd_dma_ticks_per_word: u32) -> Memory {
         let ticks_per_word = sd_dma_ticks_per_word.max(1);
 
@@ -700,6 +714,7 @@ impl Memory {
         }
     }
 
+    // Allocate the fixed page table used for lazily backed guest RAM.
     fn build_ram_pages(image: HashMap<u32, u8>) -> Box<[RwLock<RamPage>]> {
         // The kernel's physical frame allocator first-touches nearly every RAM
         // page during boot, so sparse per-page host allocations make early boot
@@ -718,14 +733,17 @@ impl Memory {
         pages.into_boxed_slice()
     }
 
+    // Map a guest physical address to its lazily allocated RAM page index.
     fn ram_page_index(addr: u32) -> usize {
         (addr >> RAM_PAGE_SHIFT) as usize
     }
 
+    // Convert a guest address into its offset within a RAM page.
     fn ram_page_offset(addr: u32) -> usize {
         (addr as usize) & RAM_PAGE_MASK
     }
 
+    // Collect RAM page indices.
     fn collect_ram_page_indices(addrs: &[u32]) -> Vec<usize> {
         let mut pages = Vec::new();
         for addr in addrs {
@@ -739,14 +757,17 @@ impl Memory {
         pages
     }
 
+    // Return whether any byte in the range overlaps an MMIO device.
     fn addr_touches_mmio(addr: u32) -> bool {
         addr >= IO_START
     }
 
+    // Test whether an address range overlaps a mapped MMIO region.
     fn addrs_touch_mmio(addrs: &[u32]) -> bool {
         addrs.iter().any(|addr| Self::addr_touches_mmio(*addr))
     }
 
+    // Read or write a range that remains within one RAM page.
     fn single_ram_page(addrs: &[u32]) -> Option<usize> {
         let first = *addrs.first()?;
         if first >= IO_START {
@@ -763,6 +784,7 @@ impl Memory {
         }
     }
 
+    // Access a RAM range without crossing a page boundary.
     fn ram_range_within_single_page(addr: u32, width: u32) -> Option<usize> {
         if width == 0 || addr >= IO_START {
             return None;
@@ -779,6 +801,7 @@ impl Memory {
         }
     }
 
+    // Return whether the range covers the contiguous PIT registers.
     fn addrs_are_contiguous_pit_bytes(addrs: &[u32]) -> bool {
         let Some(&first) = addrs.first() else {
             return false;
@@ -792,12 +815,14 @@ impl Memory {
             .all(|(index, addr)| *addr == first + index as u32 && *addr < PIT_START + 4)
     }
 
+    // Conditionally handle warn null read.
     fn maybe_warn_null_read(addr: u32) {
         if addr == 0 {
             println!("Warning: reading from physical address 0x00000000");
         }
     }
 
+    // Conditionally handle warn null write.
     fn maybe_warn_null_write(addr: u32, data: u8) {
         if addr == 0 {
             println!(
@@ -807,6 +832,7 @@ impl Memory {
         }
     }
 
+    // Read a byte from guest RAM, returning zero for an unallocated page.
     fn read_ram_byte(&self, addr: u32) -> u8 {
         debug_assert!(addr < IO_START);
         Self::maybe_warn_null_read(addr);
@@ -814,6 +840,7 @@ impl Memory {
         page.read_byte(Self::ram_page_offset(addr))
     }
 
+    // Write a byte to guest RAM, allocating its page on demand.
     fn write_ram_byte(&self, addr: u32, data: u8) {
         debug_assert!(addr < IO_START);
         Self::maybe_warn_null_write(addr, data);
@@ -821,16 +848,19 @@ impl Memory {
         page.write_byte(Self::ram_page_offset(addr), data);
     }
 
+    // Read one byte of the PIT reload register.
     fn read_pit_reload(&self) -> u32 {
         self.pit_reload.load(Ordering::SeqCst)
     }
 
+    // Update one byte of the PIT reload register.
     fn write_pit_reload_byte(&self, addr: u32, data: u8) {
         let mut reload = self.read_pit_reload();
         write_reg_byte(&mut reload, addr, PIT_START, data);
         self.pit_reload.store(reload, Ordering::SeqCst);
     }
 
+    // Update the PIT reload register across a byte range.
     fn write_pit_reload_bytes(&self, addrs: &[u32], data: &[u8]) {
         let mut reload = self.read_pit_reload();
         for (addr, byte) in addrs.iter().zip(data.iter()) {
@@ -839,11 +869,13 @@ impl Memory {
         self.pit_reload.store(reload, Ordering::SeqCst);
     }
 
+    // Raise pending interrupt.
     fn raise_pending_interrupt(&self, interrupt_bit: u32) {
         self.pending_interrupt
             .fetch_or(interrupt_bit, Ordering::SeqCst);
     }
 
+    // Read a physical range without acquiring the outer MMIO lock.
     fn read_phys_bytes_inner(&self, addrs: &[u32], out: &mut [u8]) {
         if let Some(page_index) = Self::single_ram_page(addrs) {
             let page = self.ram_pages[page_index].read().unwrap();
@@ -871,6 +903,7 @@ impl Memory {
         }
     }
 
+    // Write a physical range without acquiring the outer MMIO lock.
     fn write_phys_bytes_inner(&self, addrs: &[u32], data: &[u8]) {
         if Self::addrs_are_contiguous_pit_bytes(addrs) {
             self.write_pit_reload_bytes(addrs, data);
@@ -903,59 +936,77 @@ impl Memory {
         }
     }
 
+    // Expose the shared pixel framebuffer backing the VGA device.
     pub fn get_pixel_frame_buffer(&self) -> Arc<RwLock<PixelFrameBuffer>> {
         Arc::clone(&self.pixel_frame_buffer)
     }
+    // Expose the shared tile framebuffer backing the VGA device.
     pub fn get_tile_frame_buffer(&self) -> Arc<RwLock<TileFrameBuffer>> {
         Arc::clone(&self.tile_frame_buffer)
     }
+    // Expose the shared tile-entry map used by graphics rendering.
     pub fn get_tile_map(&self) -> Arc<RwLock<TileMap>> {
         return Arc::clone(&self.tile_map);
     }
+    // Expose the shared input/MMIO buffer used by the graphics frontend.
     pub fn get_io_buffer(&self) -> Arc<RwLock<VecDeque<u16>>> {
         return Arc::clone(&self.io_buffer);
     }
+    // Expose the flag indicating queued guest input.
     pub fn get_input_pending(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.input_pending)
     }
+    // Expose the tile-layer vertical-scroll register.
     pub fn get_tile_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
         Arc::clone(&self.tile_vscroll_register)
     }
+    // Expose the tile-layer horizontal-scroll register.
     pub fn get_tile_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
         Arc::clone(&self.tile_hscroll_register)
     }
+    // Expose the pixel-layer vertical-scroll register.
     pub fn get_pixel_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
         Arc::clone(&self.pixel_vscroll_register)
     }
+    // Expose the pixel-layer horizontal-scroll register.
     pub fn get_pixel_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
         Arc::clone(&self.pixel_hscroll_register)
     }
+    // Expose the tile-layer scale register.
     pub fn get_tile_scale_register(&self) -> Arc<RwLock<u8>> {
         Arc::clone(&self.tile_scale_register)
     }
+    // Expose the pixel-layer scale register.
     pub fn get_pixel_scale_register(&self) -> Arc<RwLock<u8>> {
         Arc::clone(&self.pixel_scale_register)
     }
+    // Expose the sprite scale registers used by the renderer.
     pub fn get_sprite_scale_registers(&self) -> Arc<RwLock<Vec<u8>>> {
         Arc::clone(&self.sprite_scale_registers)
     }
+    // Expose the shared sprite map used by graphics rendering.
     pub fn get_sprite_map(&self) -> Arc<RwLock<SpriteMap>> {
         return Arc::clone(&self.sprite_map);
     }
+    // Expose the VGA status register shared with the renderer.
     pub fn get_vga_status_register(&self) -> Arc<RwLock<u8>> {
         return Arc::clone(&self.vga_status_register);
     }
+    // Expose the VGA frame counter register shared with the renderer.
     pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> {
         return Arc::clone(&self.vga_frame_register);
     }
+    // Expose the pending-device-interrupt flag for the renderer.
     pub fn get_pending_interrupt(&self) -> Arc<AtomicU32> {
         return Arc::clone(&self.pending_interrupt);
     }
 
+    // Return whether keyboard or other input is waiting in the MMIO queue.
     pub fn has_pending_input(&self) -> bool {
         self.input_pending.load(Ordering::SeqCst)
     }
 
+    // Read one byte from RAM or the MMIO device map.
     pub fn read(&self, addr: u32) -> u8 {
         if Self::addr_touches_mmio(addr) {
             let _mmio = self.mmio_lock.lock().unwrap();
@@ -965,6 +1016,7 @@ impl Memory {
         }
     }
 
+    // Read an aligned little-endian halfword from RAM or MMIO.
     pub fn read_u16(&self, addr: u32) -> u16 {
         let addr = addr & 0xFFFFFFFE;
         if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
@@ -978,6 +1030,7 @@ impl Memory {
         u16::from_le_bytes(bytes)
     }
 
+    // Read an aligned little-endian word from RAM or MMIO.
     pub fn read_u32(&self, addr: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
         if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
@@ -1002,6 +1055,7 @@ impl Memory {
         }
     }
 
+    // Execute a 32-bit atomic swap through the memory interface.
     pub fn atomic_swap_u32(&self, addr: u32, value: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
         let bytes = value.to_le_bytes();
@@ -1028,6 +1082,7 @@ impl Memory {
         }
     }
 
+    // Execute a 32-bit atomic add through the memory interface.
     pub fn atomic_add_u32(&self, addr: u32, value: u32) -> u32 {
         let addr = addr & 0xFFFFFFFC;
         if Self::addr_touches_mmio(addr) {
@@ -1057,9 +1112,7 @@ impl Memory {
         }
     }
 
-    // Purpose: load a raw SD image into the selected SD device.
-    // Inputs: slot selector and image bytes.
-    // Outputs: replaces the SD storage contents for the chosen device.
+    // Load a raw SD image into the selected SD device.
     pub fn load_sd_image(&self, slot: SdSlot, image: &[u8]) {
         match slot {
             SdSlot::Sd0 => {
@@ -1073,9 +1126,8 @@ impl Memory {
         }
     }
 
-    // Purpose: export the selected SD device as a raw host image.
-    // Inputs: slot selector.
-    // Outputs: contiguous bytes covering the device's tracked image length.
+    // Export the selected SD device as a raw host image.
+    // Returns contiguous bytes covering the device's tracked image length.
     pub fn dump_sd_image(&self, slot: SdSlot) -> Vec<u8> {
         match slot {
             SdSlot::Sd0 => self.sd_card.read().unwrap().dump_image(),
@@ -1083,9 +1135,8 @@ impl Memory {
         }
     }
 
-    // Purpose: handle SD DMA MMIO writes for a specific SD device.
-    // Inputs: target address/data, base address, device handle, and interrupt bit.
-    // Outputs: true if the address was handled, false otherwise.
+    // Apply an MMIO write to one SD device's DMA register block.
+    // Returns true if the address was handled, false otherwise.
     fn write_sd_dma_mmio(
         &self,
         addr: u32,
@@ -1153,6 +1204,7 @@ impl Memory {
         true
     }
 
+    // Decode one byte from the mapped MMIO device registers.
     fn read_mmio_byte(&self, addr: u32) -> u8 {
         assert!(
             addr <= PHYSMEM_MAX,
@@ -1298,6 +1350,7 @@ impl Memory {
         self.read_ram_byte(addr)
     }
 
+    // Write one byte to RAM or the MMIO device map.
     pub fn write(&self, addr: u32, data: u8) {
         if Self::addr_touches_mmio(addr) {
             let _mmio = self.mmio_lock.lock().unwrap();
@@ -1307,6 +1360,7 @@ impl Memory {
         }
     }
 
+    // Write an aligned little-endian halfword to RAM or MMIO.
     pub fn write_u16(&self, addr: u32, data: u16) {
         let addr = addr & 0xFFFFFFFE;
         if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
@@ -1320,6 +1374,7 @@ impl Memory {
         self.write_phys_bytes(&addrs, &bytes);
     }
 
+    // Write an aligned little-endian word to RAM or MMIO.
     pub fn write_u32(&self, addr: u32, data: u32) {
         let addr = addr & 0xFFFFFFFC;
         if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
@@ -1350,6 +1405,7 @@ impl Memory {
         }
     }
 
+    // Dispatch one byte write to the mapped MMIO device registers.
     fn write_mmio_byte(&self, addr: u32, data: u8) {
         assert!(
             addr <= PHYSMEM_MAX,
@@ -1520,17 +1576,14 @@ impl Memory {
         }
     }
 
-    // Purpose: advance the SD DMA engines by one device tick.
-    // Inputs: none (uses DMA register state and SD storage).
-    // Outputs: updates RAM/storage and may raise SD interrupts.
+    // Advance the SD DMA engines by one device tick.
     pub fn tick_sd_dma(&self) {
         self.tick_sd_dma_device(&self.sd_card, SD_INTERRUPT_BIT);
         self.tick_sd_dma_device(&self.sd_card2, SD2_INTERRUPT_BIT);
     }
 
-    // Purpose: advance one SD DMA engine by one device tick.
-    // Inputs: SD device handle and interrupt bit.
-    // Outputs: updates RAM/storage and may raise the device interrupt.
+    // Advance one SD DMA engine by one device tick.
+    // Updates RAM/storage and may raise the device interrupt.
     fn tick_sd_dma_device(&self, sd: &Arc<RwLock<SdCard>>, interrupt_bit: u32) {
         let init_irq = {
             let mut sd = sd.write().unwrap();
@@ -1638,9 +1691,8 @@ impl Memory {
         }
     }
 
-    // Purpose: advance the shared PIT countdown by one core-0 tick.
-    // Inputs: none.
-    // Outputs: true if a timer interrupt should be raised this tick.
+    // Advance the shared PIT countdown by one core-0 tick.
+    // Returns true if a timer interrupt should be raised this tick.
     pub fn tick_pit(&self) -> bool {
         let mut countdown = self.pit_countdown.lock().unwrap();
         if *countdown == 0 {
@@ -1655,9 +1707,8 @@ impl Memory {
         false
     }
 
-    // Purpose: advance the fixed-rate PCM audio consumer by one 100 MHz device tick.
-    // Inputs: none.
-    // Outputs: may advance AUDIO_READ_IDX, latch UNDERRUN, and return the exact
+    // Advance the fixed-rate PCM audio consumer by one 100 MHz device tick.
+    // May advance AUDIO_READ_IDX, latch UNDERRUN, and return the exact
     // 16-bit PCM sample for the optional host backend.
     pub fn tick_audio(&self) -> Option<i16> {
         let _mmio = self.mmio_lock.lock().unwrap();
@@ -1676,10 +1727,10 @@ impl Memory {
         Some(sample)
     }
 
-    // Purpose: drive the optional wall-clock host-audio mode.
-    // Inputs: number of 25 kHz samples to emit immediately and a caller-owned
+    // Drive the optional wall-clock host-audio mode.
+    // Number of 25 kHz samples to emit immediately and a caller-owned
     // buffer that is reused across batches.
-    // Outputs: fills `out` with the PCM samples the MMIO audio device would
+    // Fills `out` with the PCM samples the MMIO audio device would
     // output over that wall-clock slice while updating READ_IDX/UNDERRUN state.
     pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
         let _mmio = self.mmio_lock.lock().unwrap();
@@ -1697,10 +1748,12 @@ impl Memory {
         }
     }
 
+    // Advance PIT, SD, audio, and input timing by one device tick.
     pub fn clock() {
         // do stuff that should happen every clock cycle
     }
 
+    // Collect interrupt requests currently asserted by the emulated devices.
     pub fn check_interrupts(&self) -> u32 {
         self.pending_interrupt.swap(0, Ordering::SeqCst)
     }
@@ -1716,6 +1769,7 @@ Summary:
 mod tests {
     use super::*;
 
+    // Test SD dump preserves loaded image length.
     #[test]
     fn sd_dump_preserves_loaded_image_length() {
         let mut sd = SdCard::new(1);
@@ -1724,6 +1778,7 @@ mod tests {
         assert_eq!(sd.dump_image(), image);
     }
 
+    // Test SD dump grows to cover written bytes.
     #[test]
     fn sd_dump_grows_to_cover_written_bytes() {
         let mut sd = SdCard::new(1);
@@ -1736,6 +1791,7 @@ mod tests {
         assert_eq!(image[511], 0xCC);
     }
 
+    // Test SD dump zero fills sparse gaps.
     #[test]
     fn sd_dump_zero_fills_sparse_gaps() {
         let mut sd = SdCard::new(1);
@@ -1748,6 +1804,7 @@ mod tests {
         assert_eq!(image[600], 0x5A);
     }
 
+    // Test RAM reads zero from unallocated pages.
     #[test]
     fn ram_reads_zero_from_unallocated_pages() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1756,6 +1813,7 @@ mod tests {
         assert_eq!(memory.read_u32(0x0000_1FFC), 0);
     }
 
+    // Test RAM image initializes multiple pages.
     #[test]
     fn ram_image_initializes_multiple_pages() {
         let mut image = HashMap::new();
@@ -1769,6 +1827,7 @@ mod tests {
         assert_eq!(memory.read(0x0000_1002), 0);
     }
 
+    // Test RAM phys byte helpers span page boundaries.
     #[test]
     fn ram_phys_byte_helpers_span_page_boundaries() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1782,6 +1841,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    // Test pit tick uses latest written reload.
     #[test]
     fn pit_tick_uses_latest_written_reload() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1793,6 +1853,7 @@ mod tests {
         assert_eq!(memory.read_u32(PIT_START), 3);
     }
 
+    // Test pending interrupts swap and clear.
     #[test]
     fn pending_interrupts_swap_and_clear() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1806,6 +1867,7 @@ mod tests {
         assert_eq!(memory.check_interrupts(), 0);
     }
 
+    // Test audio ring extends MMIO downward.
     #[test]
     fn audio_ring_extends_mmio_downward() {
         let mut image = HashMap::new();
@@ -1825,6 +1887,7 @@ mod tests {
         assert_eq!(memory.read(AUDIO_RING_BUFFER_START), 0x33);
     }
 
+    // Test audio tick advances read idx and recovers underrun after refill.
     #[test]
     fn audio_tick_advances_read_idx_and_recovers_underrun_after_refill() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1876,6 +1939,7 @@ mod tests {
         );
     }
 
+    // Test audio IRQ fires once on low water rising edge.
     #[test]
     fn audio_irq_fires_once_on_low_water_rising_edge() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1902,6 +1966,7 @@ mod tests {
         );
     }
 
+    // Test audio enabling IRQ while low water is already true does not backfill interrupt.
     #[test]
     fn audio_enabling_irq_while_low_water_is_already_true_does_not_backfill_interrupt() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1916,6 +1981,7 @@ mod tests {
         );
     }
 
+    // Test audio underrun does not raise a separate interrupt.
     #[test]
     fn audio_underrun_does_not_raise_a_separate_interrupt() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1940,6 +2006,7 @@ mod tests {
         );
     }
 
+    // Test wallclock audio consumption advances without waiting for device ticks.
     #[test]
     fn wallclock_audio_consumption_advances_without_waiting_for_device_ticks() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1966,9 +2033,8 @@ mod tests {
 }
 
 impl TileFrameBuffer {
-    // Purpose: initialize the tile framebuffer with a fixed MMIO byte size.
-    // Inputs: screen dimensions in pixels and the total MMIO byte size.
-    // Outputs: a zeroed tile buffer; panics if the buffer is too small.
+    // Initialize the tile framebuffer with a fixed MMIO byte size.
+    // Returns a zeroed tile buffer; panics if the buffer is too small.
     pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
         let width_tiles = width_pixels / TILE_WIDTH;
         let height_tiles = height_pixels / TILE_WIDTH;
@@ -1987,9 +2053,7 @@ impl TileFrameBuffer {
         }
     }
 
-    // Purpose: store one MMIO byte into the tile framebuffer backing store.
-    // Inputs: byte offset and value.
-    // Outputs: updates tile_indices at the given offset.
+    // Store one MMIO byte into the tile framebuffer backing store.
     pub fn set_byte(&mut self, offset: u32, value: u8) {
         if offset < self.entries.len() as u32 {
             self.entries[offset as usize] = value;
@@ -1998,9 +2062,8 @@ impl TileFrameBuffer {
         }
     }
 
-    // Purpose: read one MMIO byte from the tile framebuffer backing store.
-    // Inputs: byte offset.
-    // Outputs: stored byte value at the given offset.
+    // Read one MMIO byte from the tile framebuffer backing store.
+    // Returns stored byte value at the given offset.
     pub fn get_byte(&self, offset: u32) -> u8 {
         if offset < self.entries.len() as u32 {
             self.entries[offset as usize]
@@ -2009,12 +2072,8 @@ impl TileFrameBuffer {
         }
     }
 
-    // Purpose: fetch the tile index at a tile coordinate.
-    // Inputs: tile-space coordinates.
-    // Outputs: 8-bit tile index for the tilemap lookup.
-    // Purpose: fetch the tile entry (index + color) at a tile coordinate.
-    // Inputs: tile-space coordinates.
-    // Outputs: (tile index, color byte).
+    // Fetch the tile entry (index + color) at a tile coordinate.
+    // Returns (tile index, color byte).
     pub fn get_tile_entry(&self, x: u32, y: u32) -> (u8, u8) {
         if x < self.width_tiles && y < self.height_tiles {
             let idx: usize = (x + y * self.width_tiles) as usize;
@@ -2029,9 +2088,8 @@ impl TileFrameBuffer {
 }
 
 impl PixelFrameBuffer {
-    // Purpose: initialize the pixel framebuffer with a fixed MMIO byte size.
-    // Inputs: logical pixel dimensions and the total MMIO byte size.
-    // Outputs: a zeroed pixel buffer; panics if the size doesn't match.
+    // Initialize the pixel framebuffer with a fixed MMIO byte size.
+    // Returns a zeroed pixel buffer; panics if the size doesn't match.
     pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
         let expected = width_pixels * height_pixels * 2;
         assert!(
@@ -2047,9 +2105,7 @@ impl PixelFrameBuffer {
         }
     }
 
-    // Purpose: store one MMIO byte into the pixel framebuffer backing store.
-    // Inputs: byte offset and value.
-    // Outputs: updates bytes at the given offset.
+    // Store one MMIO byte into the pixel framebuffer backing store.
     pub fn set_byte(&mut self, offset: u32, value: u8) {
         if offset < self.bytes.len() as u32 {
             self.bytes[offset as usize] = value;
@@ -2058,9 +2114,8 @@ impl PixelFrameBuffer {
         }
     }
 
-    // Purpose: read one MMIO byte from the pixel framebuffer backing store.
-    // Inputs: byte offset.
-    // Outputs: stored byte value at the given offset.
+    // Read one MMIO byte from the pixel framebuffer backing store.
+    // Returns stored byte value at the given offset.
     pub fn get_byte(&self, offset: u32) -> u8 {
         if offset < self.bytes.len() as u32 {
             self.bytes[offset as usize]
@@ -2069,9 +2124,8 @@ impl PixelFrameBuffer {
         }
     }
 
-    // Purpose: fetch the 16-bit pixel at a logical pixel coordinate.
-    // Inputs: pixel-space coordinates.
-    // Outputs: packed 12-bit RGB value stored in 16 bits (little-endian).
+    // Fetch the 16-bit pixel at a logical pixel coordinate.
+    // Returns packed 12-bit RGB value stored in 16 bits (little-endian).
     pub fn get_pixel(&self, x: u32, y: u32) -> u16 {
         if x < self.width_pixels && y < self.height_pixels {
             let idx: usize = (x + y * self.width_pixels) as usize;
@@ -2083,11 +2137,13 @@ impl PixelFrameBuffer {
 }
 
 impl Tile {
+    // Return the palette entry used for black pixels.
     pub fn black() -> Tile {
         Tile {
             pixels: vec![0; TILE_SIZE as usize],
         }
     }
+    // Return the palette entry used for white pixels.
     pub fn white() -> Tile {
         Tile {
             pixels: vec![0xff; TILE_SIZE as usize],
@@ -2096,21 +2152,25 @@ impl Tile {
 }
 
 impl TileMap {
+    // Create an empty tile map of the guest display dimensions.
     pub fn new(size: u32) -> TileMap {
         let tiles = vec![Tile::black(); (size / TILE_SIZE) as usize];
         TileMap { tiles }
     }
 
+    // Read a byte from the tile-map backing storage.
     pub fn get_tile_byte(&self, addr: u32) -> u8 {
         return self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize];
     }
 
+    // Set tile byte.
     pub fn set_tile_byte(&mut self, addr: u32, data: u8) {
         self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize] = data;
     }
 }
 
 impl Sprite {
+    // Return the palette entry used for transparent or invisible pixels.
     pub fn invisible() -> Sprite {
         Sprite {
             x: (0, 0),
@@ -2121,6 +2181,7 @@ impl Sprite {
 }
 
 impl SpriteMap {
+    // Create an empty sprite map of the guest display dimensions.
     pub fn new(size: u32) -> SpriteMap {
         let sprites = vec![Sprite::invisible(); size as usize];
         SpriteMap { sprites }
@@ -2131,6 +2192,7 @@ impl SpriteMap {
         return self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize];
     }
 
+    // Set sprite byte.
     pub fn set_sprite_byte(&mut self, addr: u32, data: u8) {
         self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize] = data;
     }

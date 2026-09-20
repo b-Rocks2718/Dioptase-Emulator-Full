@@ -63,10 +63,12 @@ const CREG_TLBF: usize = 12;
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
+// Set trace interrupts.
 pub fn set_trace_interrupts(enabled: bool) {
     TRACE_INTERRUPTS.store(enabled, Ordering::Relaxed);
 }
 
+// Models the randomized replacement cache used by the full emulator.
 #[derive(Debug)]
 pub struct RandomCache {
     private_table: HashMap<(u32, u32), u32>,
@@ -74,6 +76,7 @@ pub struct RandomCache {
     total_capacity: usize,
 }
 
+// Returns either the translated physical address or the faulting virtual address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TlbAccess {
     Hit(u32),
@@ -81,10 +84,12 @@ enum TlbAccess {
 }
 
 impl RandomCache {
+    // Count private and global entries currently resident in the TLB.
     fn total_size(&self) -> usize {
         self.private_table.len() + self.global_table.len()
     }
 
+    // Evict one cache entry selected by the replacement policy.
     fn evict_one(&mut self, prefer_global: bool) {
         // Replacement policy is implementation-defined; this emulator uses a
         // deterministic first-key eviction and prefers evicting from the same
@@ -108,6 +113,7 @@ impl RandomCache {
         }
     }
 
+    // Create an empty cache with the requested capacity and replacement seed.
     pub fn new(capacity: usize) -> RandomCache {
         RandomCache {
             private_table: HashMap::new(),
@@ -116,6 +122,7 @@ impl RandomCache {
         }
     }
 
+    // Record the access-fault flags associated with this cache entry.
     fn fault_flags(entry: u32, operation: u32, kmode: bool) -> u32 {
         let mut flags = 0;
         match operation {
@@ -144,6 +151,7 @@ impl RandomCache {
         flags
     }
 
+    // Validate permissions and return either the mapped page or fault flags.
     fn classify_entry(entry: u32, operation: u32, kmode: bool) -> TlbAccess {
         let flags = Self::fault_flags(entry, operation, kmode);
         if flags == 0 {
@@ -153,6 +161,7 @@ impl RandomCache {
         }
     }
 
+    // Resolve a virtual page for a read, write, or execute access.
     fn access(&self, pid: u32, vpn: u32, operation: u32, kmode: bool) -> TlbAccess {
         // Memory access keeps the existing private-then-global lookup order so
         // emulator behavior does not change for duplicate private/global entries.
@@ -174,6 +183,7 @@ impl RandomCache {
         TlbAccess::Fault(private_fault.unwrap_or(TLB_FAULT_ABSENT))
     }
 
+    // Look up a TLB entry for tlbr, preferring the core-private mapping.
     pub fn read(&self, pid: u32, vpn: u32) -> Option<u32> {
         // used by tlbr instruction
 
@@ -188,6 +198,7 @@ impl RandomCache {
         }
     }
 
+    // Insert or replace a private/global TLB mapping, evicting at capacity.
     pub fn write(&mut self, pid: u32, vpn: u32, ppn: u32) {
         if ppn & 0x00000010 != 0 {
             // global entry
@@ -213,16 +224,19 @@ impl RandomCache {
         }
     }
 
+    // Remove both private and global mappings for the virtual page.
     pub fn invalidate(&mut self, pid: u32, vpn: u32) {
         self.private_table.remove(&(pid, vpn));
         self.global_table.remove(&vpn);
     }
 
+    // Clear the stored state.
     pub fn clear(&mut self) {
         self.private_table.drain();
         self.global_table.drain();
     }
 
+    // Dump cache state for debugging and fault diagnosis.
     fn debug_dump(&self) {
         println!("TLB private: {} entries", self.private_table.len());
         if self.private_table.is_empty() {
@@ -257,6 +271,7 @@ pub enum ScheduleMode {
 }
 
 impl ScheduleMode {
+    // Parse a scheduler-mode command-line token.
     pub fn parse(token: &str) -> Option<Self> {
         match token.to_ascii_lowercase().as_str() {
             "free" => Some(ScheduleMode::Free),
@@ -282,6 +297,7 @@ pub enum AudioMode {
     Fast,
 }
 
+// Coordinates core turn-taking and records scheduler shutdown state.
 struct SchedulerState {
     // Next core allowed to execute in non-free scheduling modes.
     next_core: usize,
@@ -293,6 +309,7 @@ struct SchedulerState {
     seed: u64,
 }
 
+// Coordinates turn-taking and shutdown across emulator cores.
 struct Scheduler {
     mode: ScheduleMode,
     cores: usize,
@@ -301,6 +318,7 @@ struct Scheduler {
 }
 
 impl Scheduler {
+    // Create scheduler state for the configured core count.
     fn new(mode: ScheduleMode, cores: usize) -> Arc<Scheduler> {
         let mut seed = seed_from_time();
         let halted = vec![false; cores];
@@ -322,6 +340,7 @@ impl Scheduler {
         })
     }
 
+    // Wait for turn.
     fn wait_turn(&self, core_id: usize) -> bool {
         let mut state = self.state.lock().unwrap();
         loop {
@@ -336,6 +355,7 @@ impl Scheduler {
         }
     }
 
+    // Release the scheduler turn and wake the next eligible core.
     fn finish_turn(&self, core_id: usize) {
         let mut state = self.state.lock().unwrap();
         if state.done {
@@ -350,6 +370,7 @@ impl Scheduler {
         self.cv.notify_all();
     }
 
+    // Record that this core has halted and notify the shared run state.
     fn mark_halted(&self, core_id: usize) {
         let mut state = self.state.lock().unwrap();
         state.halted[core_id] = true;
@@ -368,6 +389,7 @@ impl Scheduler {
         self.cv.notify_all();
     }
 
+    // Request scheduler shutdown and wake any cores waiting for a turn.
     fn stop(&self) {
         let mut state = self.state.lock().unwrap();
         state.done = true;
@@ -375,6 +397,7 @@ impl Scheduler {
     }
 }
 
+// Seed from time.
 fn seed_from_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -382,11 +405,13 @@ fn seed_from_time() -> u64 {
         .unwrap_or(0)
 }
 
+// Advance the pseudo-random generator and return its next 32-bit value.
 fn next_rand_u32(seed: &mut u64) -> u32 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (*seed >> 32) as u32
 }
 
+// Choose random core.
 fn choose_random_core(seed: &mut u64, halted: &[bool]) -> Option<usize> {
     let active = halted.iter().filter(|h| !**h).count();
     if active == 0 {
@@ -405,6 +430,7 @@ fn choose_random_core(seed: &mut u64, halted: &[bool]) -> Option<usize> {
     None
 }
 
+// Choose next core.
 fn pick_next_core(
     mode: ScheduleMode,
     cores: usize,
@@ -438,6 +464,7 @@ const KB_INTERRUPT_BIT: u32 = 1 << 1;
 const UART_INTERRUPT_BIT: u32 = 1 << 2;
 const IPI_INTERRUPT_BIT: u32 = 1 << 5;
 
+// Format pending interrupt bits as stable names for trace output.
 fn format_interrupts(bits: u32) -> String {
     let mut parts = Vec::new();
     if (bits & TIMER_INTERRUPT_BIT) != 0 {
@@ -471,6 +498,7 @@ fn format_interrupts(bits: u32) -> String {
     }
 }
 
+// Stores per-core pending interrupt bits and routed device sources.
 struct InterruptRouteState {
     // Round-robin pointers for device interrupts routed to a single core.
     next_kb: usize,
@@ -484,6 +512,7 @@ struct InterruptRouteState {
     uart_inflight: Option<usize>,
 }
 
+// Models per-core interrupt-pending state and inter-processor interrupt payloads.
 struct InterruptController {
     cores: usize,
     // Per-core pending interrupt bits delivered on the next tick.
@@ -497,6 +526,7 @@ struct InterruptController {
 }
 
 impl InterruptController {
+    // Create an interrupt controller with no pending sources.
     fn new(cores: usize) -> Arc<InterruptController> {
         Arc::new(InterruptController {
             cores,
@@ -516,26 +546,32 @@ impl InterruptController {
         })
     }
 
+    // Set pending bits.
     fn set_pending_bits(&self, core: usize, bits: u32) {
         self.pending[core].fetch_or(bits, Ordering::Release);
     }
 
+    // Return pending interrupt bits without consuming them.
     fn peek_pending(&self, core: usize) -> u32 {
         self.pending[core].load(Ordering::Acquire)
     }
 
+    // Atomically consume and return one core's pending interrupt bits.
     fn take_pending(&self, core: usize) -> u32 {
         self.pending[core].swap(0, Ordering::AcqRel)
     }
 
+    // Read and clear the payload queued for an inter-processor interrupt.
     fn read_ipi_payload(&self, core: usize) -> u32 {
         self.ipi_payload[core].load(Ordering::Acquire)
     }
 
+    // Store the payload that will accompany the next inter-processor interrupt.
     fn write_ipi_payload(&self, core: usize, value: u32) {
         self.ipi_payload[core].store(value, Ordering::Release);
     }
 
+    // Queue an IPI payload for one target core if it has no outstanding IPI.
     fn send_ipi(&self, target: usize, value: u32) -> bool {
         if target >= self.cores {
             return false;
@@ -552,6 +588,7 @@ impl InterruptController {
         true
     }
 
+    // Queue an IPI payload for every eligible core and return the delivery mask.
     fn send_ipi_all(&self, value: u32) -> u32 {
         let mut mask = 0u32;
         for core in 0..self.cores {
@@ -562,10 +599,12 @@ impl InterruptController {
         mask
     }
 
+    // Clear the target core's outstanding IPI delivery state.
     fn ack_ipi(&self, core: usize) {
         self.ipi_inflight[core].store(false, Ordering::Release);
     }
 
+    // Route the current input-pending level to the configured interrupt source.
     fn dispatch_input(&self, use_uart_rx: bool, io_nonempty: bool) {
         let mut routes = self.routes.lock().unwrap();
         if use_uart_rx {
@@ -589,6 +628,7 @@ impl InterruptController {
         }
     }
 
+    // Dispatch device interrupts.
     fn dispatch_device_interrupts(&self, pending: u32) {
         if pending == 0 {
             return;
@@ -620,12 +660,14 @@ impl InterruptController {
         }
     }
 
+    // Raise the timer interrupt bit on every core.
     fn broadcast_timer(&self) {
         for core in 0..self.cores {
             self.set_pending_bits(core, TIMER_INTERRUPT_BIT);
         }
     }
 
+    // Clear the input interrupt after the guest consumes its queued input.
     fn ack_input(&self, core: usize, cleared_bits: u32) {
         if cleared_bits == 0 {
             return;
@@ -644,6 +686,7 @@ impl InterruptController {
     }
 }
 
+// Holds stop and exit state shared by all emulator cores.
 struct RunShared {
     // Global stop signal shared by all cores.
     stop: AtomicBool,
@@ -657,6 +700,7 @@ struct RunShared {
 }
 
 impl RunShared {
+    // Create shared run state with no stop request or exit result.
     fn new(cores: usize, finished: Arc<Mutex<bool>>) -> RunShared {
         RunShared {
             stop: AtomicBool::new(false),
@@ -667,15 +711,18 @@ impl RunShared {
         }
     }
 
+    // Return whether any core has requested that execution stop.
     fn should_stop(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
+    // Publish a stop request and wake all cores waiting on run completion.
     fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         *self.finished.lock().unwrap() = true;
     }
 
+    // Store one core's exit value and mark the core finished.
     fn record_exit(&self, core_id: usize, value: u32) {
         self.results.lock().unwrap()[core_id] = Some(value);
         let halted = self.halted.fetch_add(1, Ordering::Relaxed) + 1;
@@ -685,6 +732,7 @@ impl RunShared {
     }
 }
 
+// Owns one core's CPU state while sharing memory and devices with other cores.
 pub struct Emulator {
     regfile: [u32; 32],  // r0 - r31
     cregfile: [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, TLBF
@@ -710,6 +758,7 @@ pub struct Emulator {
 const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
 const FAST_AUDIO_MAX_CATCH_UP_BATCHES: usize = 8;
 
+// Owns the optional host-audio worker associated with the emulator.
 struct AudioPlayback {
     output: Option<AudioOutput>,
     worker_stop: Option<Arc<AtomicBool>>,
@@ -717,6 +766,7 @@ struct AudioPlayback {
 }
 
 impl AudioPlayback {
+    // Start host-audio playback and return the optional worker handle.
     fn start(requested_mode: AudioMode, memory: Arc<Memory>) -> (AudioMode, Option<Self>) {
         if requested_mode == AudioMode::Disabled {
             return (AudioMode::Disabled, None);
@@ -754,6 +804,7 @@ impl AudioPlayback {
         )
     }
 
+    // Connect this emulator to the guest audio sink implementation.
     fn emulated_sink(&self) -> Option<Arc<AudioSink>> {
         if self.worker.is_some() {
             return None;
@@ -763,6 +814,7 @@ impl AudioPlayback {
 }
 
 impl Drop for AudioPlayback {
+    // Stop and join the audio worker before dropping its output connection.
     fn drop(&mut self) {
         if let Some(stop) = self.worker_stop.take() {
             stop.store(true, Ordering::SeqCst);
@@ -774,6 +826,7 @@ impl Drop for AudioPlayback {
     }
 }
 
+// Convert a PCM batch length into its guest sample-duration in milliseconds.
 fn audio_batch_duration(batch_count: usize) -> Duration {
     Duration::from_nanos(
         ((FAST_AUDIO_BATCH_SAMPLES as u64) * (batch_count as u64) * 1_000_000_000u64)
@@ -781,9 +834,8 @@ fn audio_batch_duration(batch_count: usize) -> Duration {
     )
 }
 
-// Purpose: keep the optional fast host-audio mode close to real-time wall clock.
-// Inputs: shared memory, host audio sink, and a stop flag owned by the run loop.
-// Outputs: consumes PCM MMIO audio samples in 10 ms wall-clock batches until stop.
+// Keep the optional fast host-audio mode close to real-time wall clock.
+// Consumes PCM MMIO audio samples in 10 ms wall-clock batches until stop.
 // Invariants:
 // - only this helper thread advances the audio MMIO consumer in fast mode
 // - batches are capped so a stalled host does not build unbounded catch-up work
@@ -881,6 +933,7 @@ struct ProgramImage {
     debug: DebugInfo,
 }
 
+// Selects which kinds of access cause a watchpoint to fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatchKind {
     Read,
@@ -888,6 +941,7 @@ enum WatchKind {
     ReadWrite,
 }
 
+// Records whether a watchpoint was triggered by a read or write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatchAccess {
     Read,
@@ -901,6 +955,7 @@ struct Watchpoint {
     kind: WatchKind,
 }
 
+// Describes the memory access that triggered a watchpoint.
 #[derive(Clone, Copy, Debug)]
 struct WatchpointHit {
     addr: u32,
@@ -908,6 +963,7 @@ struct WatchpointHit {
     value: u8,
 }
 
+// Parse a hexadecimal 32-bit word from debugger/program-image input.
 fn parse_hex_u32(token: &str) -> Option<u32> {
     let s = token.trim();
     let s = s
@@ -920,6 +976,7 @@ fn parse_hex_u32(token: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
+// Index a debug symbol by address for source and debugger lookup.
 fn add_label(labels: &mut LabelMap, name: &str, addr: u32) {
     let entry = labels.entry(name.to_string()).or_default();
     if !entry.contains(&addr) {
@@ -1109,6 +1166,7 @@ fn load_program(path: &str) -> ProgramImage {
 }
 
 impl Emulator {
+    // Create an emulator from a program image and full-device shared state.
     pub fn new(
         path: String,
         use_uart_rx: bool,
@@ -1126,6 +1184,7 @@ impl Emulator {
         )
     }
 
+    // Build an emulator image from raw instruction words.
     pub fn from_instructions(
         instructions: HashMap<u32, u8>,
         use_uart_rx: bool,
@@ -1148,20 +1207,19 @@ impl Emulator {
         Emulator::from_shared(memory, interrupts, use_uart_rx, 0)
     }
 
-    // Purpose: export one SD device from this emulator instance as a raw host image.
-    // Inputs: slot selector.
-    // Outputs: contiguous bytes representing the tracked SD image contents.
+    // Export one SD device from this emulator instance as a raw host image.
+    // Returns contiguous bytes representing the tracked SD image contents.
     pub fn dump_sd_image(&self, slot: SdSlot) -> Vec<u8> {
         self.memory.dump_sd_image(slot)
     }
 
-    // Purpose: expose the shared memory backing this emulator instance.
-    // Inputs: none.
-    // Outputs: an Arc clone so callers can inspect memory after `run(self, ...)`.
+    // Expose the shared memory backing this emulator instance.
+    // Returns an Arc clone so callers can inspect memory after `run(self, ...)`.
     pub fn shared_memory(&self) -> Arc<Memory> {
         Arc::clone(&self.memory)
     }
 
+    // Attach a core to existing shared memory and device state.
     fn from_shared(
         memory: Arc<Memory>,
         interrupts: Arc<InterruptController>,
@@ -1200,15 +1258,18 @@ impl Emulator {
         }
     }
 
+    // Connect the core to the selected guest/host audio mode and sink.
     fn configure_audio(&mut self, audio_mode: AudioMode, sink: Option<Arc<AudioSink>>) {
         self.audio_mode = audio_mode;
         self.audio_sink = sink;
     }
 
+    // Return the interrupt-service bits currently latched in the ISR register.
     fn read_isr(&self) -> u32 {
         self.cregfile[2]
     }
 
+    // Update ISR bits while preserving pending sources owned by the controller.
     fn write_isr(&mut self, value: u32) {
         let old = self.cregfile[2];
         // Match the hardware cregfile semantics: software ISR writes must not
@@ -1229,14 +1290,17 @@ impl Emulator {
         }
     }
 
+    // Retrieve and clear the payload associated with this core's pending IPI.
     fn read_mbi(&self) -> u32 {
         self.cregfile[10]
     }
 
+    // Publish the payload that will be delivered with the next IPI.
     fn write_mbi(&mut self, value: u32) {
         self.cregfile[10] = value;
     }
 
+    // Retrieve one control-register value using the architectural index.
     fn read_creg(&self, idx: usize) -> u32 {
         match idx {
             // ISR and MBI are core-local control registers.
@@ -1246,6 +1310,7 @@ impl Emulator {
         }
     }
 
+    // Write one architectural control register with its defined masking rules.
     fn write_creg(&mut self, idx: usize, value: u32) {
         match idx {
             // Route ISR/MBI through helpers so we can track clears and core-local state.
@@ -1267,14 +1332,17 @@ impl Emulator {
         }
     }
 
+    // Clear the deferred TLB fault recorded for the current core.
     fn clear_pending_tlb_fault(&mut self) {
         self.pending_tlb_fault = None;
     }
 
+    // Record pending TLB fault.
     fn record_pending_tlb_fault(&mut self, flags: u32) {
         self.pending_tlb_fault = Some(flags);
     }
 
+    // Take pending TLB fault.
     fn take_pending_tlb_fault(&mut self) -> u32 {
         self.pending_tlb_fault.take().unwrap_or(TLB_FAULT_ABSENT)
     }
@@ -1284,6 +1352,7 @@ impl Emulator {
         self.cregfile[0] != 0
     }
 
+    // Increment PSR while applying the architectural privilege checks.
     fn psr_inc_checked(&mut self, reason: &str) {
         if self.cregfile[0] == u32::MAX {
             panic!("too many nested exceptions!");
@@ -1298,6 +1367,7 @@ impl Emulator {
         }
     }
 
+    // Decrement PSR while preserving the defined status bits.
     fn psr_dec(&mut self, reason: &str) {
         let old = self.cregfile[0];
         self.cregfile[0] = self.cregfile[0].wrapping_sub(1);
@@ -1309,6 +1379,7 @@ impl Emulator {
         }
     }
 
+    // Resolve the MMIO region containing an address, if any.
     fn memmap_region(paddr: u32) -> Option<&'static str> {
         if paddr >= KERNEL_TEXT_START && paddr < KERNEL_TEXT_END {
             Some("kernel_text")
@@ -1331,10 +1402,12 @@ impl Emulator {
         }
     }
 
+    // Warn about on write.
     fn warn_on_write(region: &str) -> bool {
         matches!(region, "kernel_text" | "kernel_rodata" | "bios" | "ivt")
     }
 
+    // Conditionally handle log memmap write.
     fn maybe_log_memmap_write(&self, vaddr: u32, paddr: u32, size: u8) {
         if !TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             return;
@@ -1374,6 +1447,7 @@ impl Emulator {
         }
     }
 
+    // Convert mem address.
     fn convert_mem_address(&mut self, addr: u32, operation: u32) -> Option<u32> {
         let kmode = self.get_kmode();
         if kmode {
@@ -1405,6 +1479,7 @@ impl Emulator {
         }
     }
 
+    // Save the interrupted PC and processor status for exception return.
     fn save_state(&mut self) {
         // save state as an interrupt happens
 
@@ -1418,6 +1493,7 @@ impl Emulator {
         self.cregfile[CREG_IMR] &= 0x7FFFFFFF;
     }
 
+    // Redirect execution to the TLB-miss handler with the fault address recorded.
     fn raise_tlb_miss(&mut self, addr: u32, flags: u32) {
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             println!(
@@ -1443,11 +1519,13 @@ impl Emulator {
             .expect("shouldnt fail");
     }
 
+    // Raise pending TLB miss.
     fn raise_pending_tlb_miss(&mut self, addr: u32) {
         let flags = self.take_pending_tlb_fault();
         self.raise_tlb_miss(addr, flags);
     }
 
+    // Raise misaligned PC.
     fn raise_misaligned_pc(&mut self, pc: u32) {
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             println!(
@@ -1486,6 +1564,7 @@ impl Emulator {
         }
     }
 
+    // Execute a 16-bit memory store.
     fn mem_write16(&mut self, addr: u32, data: u16) -> bool {
         self.clear_pending_tlb_fault();
         if (addr & 1) != 0 {
@@ -1521,6 +1600,7 @@ impl Emulator {
         true
     }
 
+    // Execute a 32-bit memory store.
     fn mem_write32(&mut self, addr: u32, data: u32) -> bool {
         self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
@@ -1557,6 +1637,7 @@ impl Emulator {
         true
     }
 
+    // Execute an 8-bit memory load.
     fn mem_read8(&mut self, addr: u32) -> Option<u8> {
         self.clear_pending_tlb_fault();
         if addr == 0 {
@@ -1578,6 +1659,7 @@ impl Emulator {
         }
     }
 
+    // Execute a 16-bit memory load.
     fn mem_read16(&mut self, addr: u32) -> Option<u16> {
         self.clear_pending_tlb_fault();
         if (addr & 1) != 0 {
@@ -1601,6 +1683,7 @@ impl Emulator {
         Some(u16::from_le_bytes(bytes))
     }
 
+    // Execute a 32-bit memory load.
     fn mem_read32(&mut self, addr: u32) -> Option<u32> {
         self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
@@ -1625,6 +1708,7 @@ impl Emulator {
         Some(u32::from_le_bytes(bytes))
     }
 
+    // Execute a 32-bit atomic swap through the memory interface.
     fn mem_atomic_swap32(&mut self, addr: u32, value: u32) -> Option<u32> {
         self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
@@ -1648,6 +1732,7 @@ impl Emulator {
         Some(prev)
     }
 
+    // Execute a 32-bit atomic add through the memory interface.
     fn mem_atomic_add32(&mut self, addr: u32, value: u32) -> Option<u32> {
         self.clear_pending_tlb_fault();
         if (addr & 3) != 0 {
@@ -1672,6 +1757,7 @@ impl Emulator {
         Some(prev)
     }
 
+    // Read an aligned physical word without triggering debugger watchpoints.
     fn read_phys32(&mut self, addr: u32) -> Option<u32> {
         if addr > PHYSMEM_MAX || addr + 3 > PHYSMEM_MAX {
             return None;
@@ -1693,6 +1779,7 @@ impl Emulator {
             .map(|paddr| self.memory.read(paddr))
     }
 
+    // Fetch and translate the next aligned instruction word.
     fn fetch(&mut self, vaddr: u32) -> Option<u32> {
         self.clear_pending_tlb_fault();
         if (vaddr & 3) != 0 {
@@ -1712,6 +1799,7 @@ impl Emulator {
         }
     }
 
+    // Advance the core and its visible device timing by one tick.
     fn tick(&mut self) {
         self.check_for_interrupts();
         self.handle_interrupts();
@@ -1735,6 +1823,7 @@ impl Emulator {
         self.count = self.count.wrapping_add(1);
     }
 
+    // Run this core until it halts or the shared run state requests a stop.
     pub fn run(
         mut self,
         max_iters: u32,
@@ -1768,7 +1857,7 @@ impl Emulator {
             .and_then(|output| output.emulated_sink());
         self.configure_audio(audio_mode, emulated_sink);
 
-        // Return value and termination signal
+        // Share the result slot and completion flag with the graphics thread.
         let ret: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
         let finished: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -1804,9 +1893,8 @@ impl Emulator {
         return *ret.lock().unwrap();
     }
 
-    // Purpose: run the multicore emulator and keep the shared memory alive for inspection.
-    // Inputs: program path, runtime configuration, and optional SD preload images.
-    // Outputs: core-0 r1 plus the shared memory state after all cores exit.
+    // Run the multicore emulator and keep the shared memory alive for inspection.
+    // Returns core-0 r1 plus the shared memory state after all cores exit.
     pub fn run_multicore_with_memory(
         path: String,
         cores: usize,
@@ -1902,9 +1990,8 @@ impl Emulator {
         (results.get(0).copied().unwrap_or(None), memory)
     }
 
-    // Purpose: run the multicore emulator to completion and return core 0's result.
-    // Inputs: program path, runtime configuration, and optional SD preload images.
-    // Outputs: core-0 r1, or None if the program failed to terminate.
+    // Run the multicore emulator to completion and return core 0's result.
+    // Returns core-0 r1, or None if the program failed to terminate.
     pub fn run_multicore(
         path: String,
         cores: usize,
@@ -1932,6 +2019,7 @@ impl Emulator {
         result
     }
 
+    // Check for interrupts.
     fn check_for_interrupts(&mut self) {
         // Input routing only needs a queue-empty check, not the full queue lock.
         let io_nonempty = self.memory.has_pending_input();
@@ -1969,6 +2057,7 @@ impl Emulator {
         }
     }
 
+    // Select and enter any interrupt currently enabled for this core.
     fn handle_interrupts(&mut self) {
         if self.cregfile[3] >> 31 != 0 {
             // top bit activates/disables all interrupts
@@ -2074,6 +2163,7 @@ impl Emulator {
         }
     }
 
+    // Raise exc instr.
     fn raise_exc_instr(&mut self) {
         // exec_instr
 
@@ -2092,6 +2182,7 @@ impl Emulator {
         return;
     }
 
+    // Decode the opcode and execute one guest instruction.
     fn execute(&mut self, instr: u32) {
         let opcode = instr >> 27; // opcode is top 5 bits of instruction
 
@@ -2138,6 +2229,7 @@ impl Emulator {
         }
     }
 
+    // Read a general-purpose register, preserving the architectural r0 value.
     fn get_reg(&self, regnum: u32) -> u32 {
         if self.get_kmode() && regnum == 31 {
             // use ISP while handling exceptions or interrupts in kernel mode
@@ -2148,6 +2240,7 @@ impl Emulator {
         }
     }
 
+    // Add the signed displacement to the current PC and write the result.
     fn adpc(&mut self, instr: u32) {
         // adpc rA, i
         // rA <- pc + 4 + sign-extended 22-bit immediate (pc-relative to next instruction).
@@ -2160,6 +2253,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Write a general-purpose register while ignoring writes to r0.
     fn write_reg(&mut self, regnum: u32, value: u32) {
         if self.get_kmode() && regnum == 31 {
             // use ISP while handling exceptions or interrupts in kernel mode
@@ -2173,6 +2267,7 @@ impl Emulator {
         }
     }
 
+    // Decode the immediate ALU encoding, including packed shift forms.
     fn decode_alu_imm(&mut self, op: u32, imm: u32) -> Option<u32> {
         match op {
             0..=6 => {
@@ -2380,6 +2475,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Load upper immediate.
     fn load_upper_immediate(&mut self, instr: u32) {
         // store imm << 10 in r_a
         let r_a = (instr >> 22) & 0x1F;
@@ -2390,6 +2486,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute a memory operation using an absolute address.
     fn mem_absolute(&mut self, instr: u32, size: u8) {
         // instruction format is
         // 00011aaaaabbbbb?yyzziiiiiiiiiiii
@@ -2481,6 +2578,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute a memory operation using register-relative addressing.
     fn mem_relative(&mut self, instr: u32, size: u8) {
         // instruction format is
         // 00100aaaaabbbbb?iiiiiiiiiiiiiiii
@@ -2560,6 +2658,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute a memory operation using an encoded immediate offset.
     fn mem_imm(&mut self, instr: u32, size: u8) {
         // instruction format is
         // 00101aaaaa?iiiiiiiiiiiiiiiiiiiii
@@ -2634,6 +2733,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute an atomic operation using an absolute address.
     fn atomic_absolute(&mut self, instr: u32, type_: u8) {
         // instruction format is
         // 10000aaaaabbbbbccccciiiiiiiiiiii - fadd
@@ -2669,6 +2769,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute an atomic operation using register-relative addressing.
     fn atomic_relative(&mut self, instr: u32, type_: u8) {
         // instruction format is
         // 10001aaaaabbbbbccccciiiiiiiiiiii
@@ -2708,6 +2809,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Execute an atomic operation using an encoded immediate offset.
     fn atomic_imm(&mut self, instr: u32, type_: u8) {
         // instruction format is
         // 10010aaaaabbbbbiiiiiiiiiiiiiiiii
@@ -2744,6 +2846,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Evaluate the encoded branch condition against the current flags.
     fn get_branch_condition(&mut self, op: u32) -> Option<bool> {
         let carry = (self.cregfile[5] & 1) != 0;
         let zero = (self.cregfile[5] & 2) != 0;
@@ -2777,6 +2880,7 @@ impl Emulator {
         }
     }
 
+    // Execute a PC-relative branch using its encoded displacement.
     fn branch_imm(&mut self, instr: u32) {
         // instruction format is
         // 01100?????iiiiiiiiiiiiiiiiiiiiii
@@ -2799,6 +2903,7 @@ impl Emulator {
         }
     }
 
+    // Execute a branch to the address formed from two registers.
     fn branch_absolute(&mut self, instr: u32) {
         // instruction format is
         // 01101?????xxxxxxxxxxxxaaaaabbbbb
@@ -2822,6 +2927,7 @@ impl Emulator {
         }
     }
 
+    // Execute a branch using a register-relative target.
     fn branch_relative(&mut self, instr: u32) {
         // instruction format is
         // 01110?????xxxxxxxxxxxxaaaaabbbbb
@@ -2845,6 +2951,7 @@ impl Emulator {
         }
     }
 
+    // Enter the trap path for the encoded trap instruction.
     fn trap_instr(&mut self, instr: u32) {
         const TRAP_PAYLOAD_MASK: u32 = 0x07FF_FFFF;
         const TRAP_VECTOR_ADDR: u32 = 0x04;
@@ -2887,6 +2994,7 @@ impl Emulator {
         }
     }
 
+    // Dispatch a privileged instruction by its kernel sub-opcode.
     fn kernel_instr(&mut self, instr: u32) {
         if !self.get_kmode() {
             // exec_priv
@@ -2931,6 +3039,7 @@ impl Emulator {
         }
     }
 
+    // Dispatch TLB read, write, and invalidate suboperations.
     fn tlb_op(&mut self, instr: u32) {
         let op = (instr >> 10) & 3;
         let ra = (instr >> 22) & 0x1F;
@@ -2961,6 +3070,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Move data between a general-purpose and control register.
     fn crmv_op(&mut self, instr: u32) {
         let op = (instr >> 10) & 3;
         let ra = (instr >> 22) & 0x1F;
@@ -2993,6 +3103,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Send an inter-processor interrupt and its mailbox payload.
     fn ipi_op(&mut self, instr: u32) {
         let ra = (instr >> 22) & 0x1F;
         let all = ((instr >> 11) & 1) != 0;
@@ -3015,6 +3126,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Acknowledge selected interrupt-service bits.
     fn eoi_op(&mut self, instr: u32) {
         let all = ((instr >> 11) & 1) != 0;
         let cleared_mask = if all { u32::MAX } else { 1u32 << (instr & 0xF) };
@@ -3023,6 +3135,7 @@ impl Emulator {
         self.pc += 4;
     }
 
+    // Enter or leave the architectural sleep mode.
     fn mode_op(&mut self, instr: u32) {
         let op = (instr >> 10) & 3;
 
@@ -3040,6 +3153,7 @@ impl Emulator {
         }
     }
 
+    // Restore the saved processor state after an exception or interrupt.
     fn rfe(&mut self, instr: u32) {
         if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
             println!(
@@ -3061,6 +3175,7 @@ impl Emulator {
     }
 }
 
+// Run core loop.
 fn run_core_loop(
     mut cpu: Emulator,
     max_iters: u32,
@@ -3131,6 +3246,7 @@ fn run_core_loop(
 mod tests {
     use super::*;
 
+    // Test write ISR preserves concurrently pending IPI.
     #[test]
     fn write_isr_preserves_concurrently_pending_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3164,6 +3280,7 @@ mod tests {
         );
     }
 
+    // Test send IPI fails until target acknowledges IPI.
     #[test]
     fn send_ipi_fails_until_target_acknowledges_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3213,6 +3330,7 @@ mod tests {
         );
     }
 
+    // Test IPI all reports only cores without outstanding IPI.
     #[test]
     fn ipi_all_reports_only_cores_without_outstanding_ipi() {
         let interrupts = InterruptController::new(3);
@@ -3243,6 +3361,7 @@ mod tests {
         );
     }
 
+    // Test CRMV write to ISR is ignored.
     #[test]
     fn crmv_write_to_isr_is_ignored() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3261,6 +3380,7 @@ mod tests {
         );
     }
 
+    // Test EOI specific clears only selected ISR bit.
     #[test]
     fn eoi_specific_clears_only_selected_isr_bit() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3278,6 +3398,7 @@ mod tests {
         );
     }
 
+    // Test EOI all preserves concurrently pending IPI.
     #[test]
     fn eoi_all_preserves_concurrently_pending_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));

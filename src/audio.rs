@@ -12,6 +12,7 @@ use crate::memory::AUDIO_SAMPLE_RATE_HZ;
 const AUDIO_FLUSH_INTERVAL_SAMPLES: usize = 2048;
 const AUDIO_BUFFERED_BATCH_QUEUE: usize = 4;
 
+// Shares host-audio error state and the queue consumed by the writer thread.
 struct AudioSinkState {
     writer: BufWriter<ChildStdin>,
     samples_since_flush: usize,
@@ -19,19 +20,21 @@ struct AudioSinkState {
     last_player_error: Arc<Mutex<Option<String>>>,
 }
 
+// Queues guest PCM samples and forwards them to the host audio process.
 struct BufferedAudioSink {
     sender: SyncSender<Vec<i16>>,
     failed: Arc<AtomicBool>,
     last_player_error: Arc<Mutex<Option<String>>>,
 }
 
+// Stores either a synchronous player connection or a buffered audio worker.
 enum AudioSinkInner {
     Direct(Mutex<AudioSinkState>),
     Buffered(BufferedAudioSink),
 }
 
-// Purpose: serialize guest PCM samples into the host player stdin pipe.
-// Inputs/outputs: emulator code writes signed 16-bit mono samples; the sink
+// Serialize guest PCM samples into the host player stdin pipe.
+// Emulator code writes signed 16-bit mono samples; the sink
 // writes little-endian bytes to the child process and periodically flushes them.
 // Invariants:
 // - writes preserve guest sample ordering
@@ -45,6 +48,7 @@ pub struct AudioSink {
 }
 
 impl AudioSink {
+    // Record a host-player error without losing the buffered sink state.
     fn report_host_audio_error(state: &mut AudioSinkState, operation: &str, err: &std::io::Error) {
         state.failed = true;
         if let Some(player_error) = state.last_player_error.lock().unwrap().clone() {
@@ -57,6 +61,7 @@ impl AudioSink {
         }
     }
 
+    // Append a batch of PCM samples while holding the sink queue lock once.
     fn write_samples_locked(state: &mut AudioSinkState, samples: &[i16]) {
         if state.failed {
             return;
@@ -79,6 +84,7 @@ impl AudioSink {
         }
     }
 
+    // Record an error reported by the buffered writer thread.
     fn report_buffered_audio_error(buffered: &BufferedAudioSink) {
         if buffered.failed.swap(true, Ordering::SeqCst) {
             return;
@@ -93,12 +99,13 @@ impl AudioSink {
         }
     }
 
+    // Append one PCM sample to the synchronized host-audio queue.
     pub fn write_sample(&self, sample: i16) {
         self.write_samples(&[sample]);
     }
 
-    // Purpose: serialize a contiguous batch of guest PCM samples with one sink lock.
-    // Inputs/outputs: preserves sample ordering and writes each sample as exactly
+    // Serialize a contiguous batch of guest PCM samples with one sink lock.
+    // Preserves sample ordering and writes each sample as exactly
     // two little-endian bytes to the host player stdin pipe.
     pub fn write_samples(&self, samples: &[i16]) {
         match &self.inner {
@@ -128,8 +135,8 @@ impl AudioSink {
     }
 }
 
-// Purpose: owns the `ffplay` child process used for host audio playback.
-// Inputs/outputs: callers clone `shared_sink()` and push guest PCM samples into it.
+// Owns the `ffplay` child process used for host audio playback.
+// Callers clone `shared_sink()` and push guest PCM samples into it.
 // Drop behavior closes stdin and waits for the player to exit.
 pub struct AudioOutput {
     sink: Option<Arc<AudioSink>>,
@@ -139,6 +146,7 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    // Spawn the host audio writer and return its shared output handle.
     pub fn start(buffered: bool) -> Result<Self, String> {
         let last_player_error = Arc::new(Mutex::new(None));
         let mut child = Command::new("ffplay")
@@ -196,6 +204,7 @@ impl AudioOutput {
         })
     }
 
+    // Clone the shared queue used to submit guest PCM samples.
     pub fn shared_sink(&self) -> Arc<AudioSink> {
         Arc::clone(
             self.sink
@@ -206,6 +215,7 @@ impl AudioOutput {
 }
 
 impl Drop for AudioOutput {
+    // Close the sink, terminate a buffered player, and join its writer thread.
     fn drop(&mut self) {
         let buffered = self.writer_thread.is_some();
         self.sink.take();
@@ -226,6 +236,7 @@ impl Drop for AudioOutput {
     }
 }
 
+// Spawn buffered audio writer.
 fn spawn_buffered_audio_writer(
     stdin: ChildStdin,
     last_player_error: Arc<Mutex<Option<String>>>,
@@ -251,6 +262,7 @@ fn spawn_buffered_audio_writer(
     })
 }
 
+// Spawn ffplay stderr thread.
 fn spawn_ffplay_stderr_thread(
     stderr: ChildStderr,
     last_player_error: Arc<Mutex<Option<String>>>,
@@ -270,6 +282,7 @@ fn spawn_ffplay_stderr_thread(
     })
 }
 
+// Build the ffplay arguments for the guest's mono PCM stream.
 fn ffplay_args() -> Vec<String> {
     vec![
         "-loglevel".to_string(),
@@ -291,6 +304,7 @@ fn ffplay_args() -> Vec<String> {
 mod tests {
     use super::*;
 
+    // Test ffplay args match guest audio format.
     #[test]
     fn ffplay_args_match_guest_audio_format() {
         let args = ffplay_args();
@@ -300,6 +314,7 @@ mod tests {
         assert!(args.contains(&"pipe:0".to_string()));
     }
 
+    // Test sample encoding is little endian.
     #[test]
     fn sample_encoding_is_little_endian() {
         assert_eq!(i16::from_le_bytes([0x34, 0x12]), 0x1234);

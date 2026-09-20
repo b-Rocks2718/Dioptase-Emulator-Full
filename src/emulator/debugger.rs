@@ -14,6 +14,7 @@ use super::{
     WatchpointHit, load_program,
 };
 
+// Parse a debugger address from decimal, hexadecimal, or a source label.
 fn parse_addr(token: &str) -> Option<u32> {
     let s = token.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -28,6 +29,7 @@ fn parse_addr(token: &str) -> Option<u32> {
     None
 }
 
+// Resolve a debug file path relative to the loaded program when needed.
 fn resolve_source_path(file: &str) -> Result<PathBuf, String> {
     let path = Path::new(file);
     if path.is_absolute() {
@@ -37,6 +39,7 @@ fn resolve_source_path(file: &str) -> Result<PathBuf, String> {
     Ok(cwd.join(file))
 }
 
+// Read and return one source line for debugger display.
 fn read_source_line(path: &Path, line: u32) -> Result<String, String> {
     if line == 0 {
         return Err("Line numbers start at 1".to_string());
@@ -55,6 +58,7 @@ fn read_source_line(path: &Path, line: u32) -> Result<String, String> {
     Err(format!("File {} has no line {}", path.display(), line))
 }
 
+// Build labels by addr.
 fn build_labels_by_addr(labels: &LabelMap) -> HashMap<u32, Vec<String>> {
     let mut by_addr: HashMap<u32, Vec<String>> = HashMap::new();
     for (name, addrs) in labels {
@@ -65,18 +69,21 @@ fn build_labels_by_addr(labels: &LabelMap) -> HashMap<u32, Vec<String>> {
     by_addr
 }
 
+// Reports whether a debugger step executed, slept, or faulted in the TLB.
 enum StepOutcome {
     Executed { pc: u32, instr: u32 },
     Sleeping,
     TlbMiss { pc: u32 },
 }
 
+// Identifies why debugger execution returned control to the user.
 enum RunOutcome {
     Breakpoint(u32),
     Halted,
     Watchpoint(WatchpointHit),
 }
 
+// Run until breakpoint.
 fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>) -> RunOutcome {
     loop {
         if cpu.halted {
@@ -96,6 +103,7 @@ fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>) -> RunOu
     }
 }
 
+// Format addr list.
 fn format_addr_list(addrs: &[u32]) -> String {
     let mut parts = Vec::new();
     for addr in addrs {
@@ -104,6 +112,7 @@ fn format_addr_list(addrs: &[u32]) -> String {
     parts.join(", ")
 }
 
+// Render a breakpoint with its address, condition, and source location.
 fn format_breakpoint(addr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) -> String {
     if let Some(names) = labels_by_addr.get(&addr) {
         format!("{:08X} ({})", addr, names.join(", "))
@@ -112,6 +121,7 @@ fn format_breakpoint(addr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) -> S
     }
 }
 
+// Print all currently configured breakpoints.
 fn list_breakpoints(breakpoints: &HashSet<u32>, labels_by_addr: &HashMap<u32, Vec<String>>) {
     if breakpoints.is_empty() {
         println!("No breakpoints set.");
@@ -124,6 +134,7 @@ fn list_breakpoints(breakpoints: &HashSet<u32>, labels_by_addr: &HashMap<u32, Ve
     }
 }
 
+// Return the display label for a watchpoint access kind.
 fn watch_kind_label(kind: WatchKind) -> &'static str {
     match kind {
         WatchKind::Read => "r",
@@ -132,6 +143,7 @@ fn watch_kind_label(kind: WatchKind) -> &'static str {
     }
 }
 
+// Return the display label for the access that triggered a watchpoint.
 fn watch_access_label(access: WatchAccess) -> &'static str {
     match access {
         WatchAccess::Read => "read",
@@ -139,6 +151,7 @@ fn watch_access_label(access: WatchAccess) -> &'static str {
     }
 }
 
+// Parse the debugger's read/write/read-write watchpoint selector.
 fn parse_watch_kind(token: &str) -> Option<WatchKind> {
     match token {
         "r" => Some(WatchKind::Read),
@@ -148,6 +161,7 @@ fn parse_watch_kind(token: &str) -> Option<WatchKind> {
     }
 }
 
+// Combine a new watchpoint kind with an existing one.
 fn merge_watch_kind(existing: WatchKind, new_kind: WatchKind) -> WatchKind {
     if existing == new_kind {
         existing
@@ -156,6 +170,7 @@ fn merge_watch_kind(existing: WatchKind, new_kind: WatchKind) -> WatchKind {
     }
 }
 
+// Insert or merge a watchpoint for the requested address range and access kind.
 fn add_watchpoint(list: &mut Vec<Watchpoint>, addr: u32, kind: WatchKind) -> WatchKind {
     for wp in list.iter_mut() {
         if wp.addr == addr {
@@ -167,12 +182,14 @@ fn add_watchpoint(list: &mut Vec<Watchpoint>, addr: u32, kind: WatchKind) -> Wat
     kind
 }
 
+// Remove the watchpoint covering the requested address, if one exists.
 fn remove_watchpoint(list: &mut Vec<Watchpoint>, addr: u32) -> bool {
     let before = list.len();
     list.retain(|wp| wp.addr != addr);
     before != list.len()
 }
 
+// Print all currently configured watchpoints.
 fn list_watchpoints(list: &[Watchpoint]) {
     if list.is_empty() {
         println!("No watchpoints set.");
@@ -185,6 +202,7 @@ fn list_watchpoints(list: &[Watchpoint]) {
     }
 }
 
+// Print watchpoint hit.
 fn print_watchpoint_hit(hit: WatchpointHit, pc: u32) {
     println!(
         "Watchpoint hit ({} at {:08X} = {:02X}) pc {:08X}",
@@ -195,6 +213,7 @@ fn print_watchpoint_hit(hit: WatchpointHit, pc: u32) {
     );
 }
 
+// Remove the breakpoint at the requested address or label.
 fn delete_breakpoint(target: &str, breakpoints: &mut HashSet<u32>, labels: &LabelMap) {
     match resolve_label_or_addr(target, labels) {
         Ok(addrs) => {
@@ -235,6 +254,7 @@ where
     }
 }
 
+// Resolve a debugger location from either a numeric address or a symbol.
 fn resolve_label_or_addr(target: &str, labels: &LabelMap) -> Result<Vec<u32>, String> {
     if let Some(addr) = parse_addr(target) {
         return Ok(vec![addr]);
@@ -245,6 +265,7 @@ fn resolve_label_or_addr(target: &str, labels: &LabelMap) -> Result<Vec<u32>, St
     Err(format!("Unknown label {}", target))
 }
 
+// Print the instruction and source location reached by a single-step stop.
 fn print_step(pc: u32, instr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) {
     let disasm = disassemble(instr);
     if let Some(names) = labels_by_addr.get(&pc) {
@@ -260,6 +281,7 @@ fn print_step(pc: u32, instr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) {
     }
 }
 
+// Print the breakpoint stop reason and the instruction at its address.
 fn print_breakpoint(addr: u32, labels_by_addr: &HashMap<u32, Vec<String>>, cpu: &mut Emulator) {
     if let Some(instr) = cpu.fetch(addr) {
         print_step(addr, instr, labels_by_addr);
@@ -275,6 +297,7 @@ const BP_REG: u32 = 30;
 // Debug display uses word-sized (4-byte) reads.
 const DEBUG_WORD_BYTES: u32 = 4;
 
+// Build line index.
 fn build_line_index(lines: &[DebugLine]) -> HashMap<String, HashMap<u32, Vec<u32>>> {
     let mut index: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     for line in lines {
@@ -312,6 +335,7 @@ fn line_for_pc<'a>(lines: &'a [DebugLine], pc: u32) -> Option<&'a DebugLine> {
     if lo == 0 { None } else { Some(&lines[lo - 1]) }
 }
 
+// Return whether two debug locations refer to the same source line.
 fn same_source_line(a: Option<&DebugLine>, b: Option<&DebugLine>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.line == b.line && a.file == b.file,
@@ -320,10 +344,12 @@ fn same_source_line(a: Option<&DebugLine>, b: Option<&DebugLine>) -> bool {
     }
 }
 
+// Format source line.
 fn format_source_line(line: &DebugLine) -> String {
     format!("{}:{}", line.file, line.line)
 }
 
+// Print c location.
 fn print_c_location(pc: u32, line: Option<&DebugLine>) {
     if let Some(line) = line {
         match resolve_source_path(&line.file) {
@@ -338,6 +364,7 @@ fn print_c_location(pc: u32, line: Option<&DebugLine>) {
     }
 }
 
+// Format breakpoint c.
 fn format_breakpoint_c(addr: u32, lines: &[DebugLine]) -> String {
     if let Some(line) = line_for_pc(lines, addr) {
         format!("{:08X} ({})", addr, format_source_line(line))
@@ -346,6 +373,7 @@ fn format_breakpoint_c(addr: u32, lines: &[DebugLine]) -> String {
     }
 }
 
+// Print breakpoints with their resolved C source locations.
 fn list_breakpoints_c(breakpoints: &HashSet<u32>, lines: &[DebugLine]) {
     if breakpoints.is_empty() {
         println!("No breakpoints set.");
@@ -358,6 +386,7 @@ fn list_breakpoints_c(breakpoints: &HashSet<u32>, lines: &[DebugLine]) {
     }
 }
 
+// Build locals by addr.
 fn build_locals_by_addr(debug: &DebugInfo) -> Vec<(u32, Vec<DebugLocal>)> {
     let mut locals: Vec<(u32, Vec<DebugLocal>)> = debug
         .locals_by_addr
@@ -516,6 +545,7 @@ fn display_local_name(name: &str) -> &str {
     name
 }
 
+// Resolve C source locations into concrete breakpoint addresses.
 fn resolve_break_targets_c(
     token: &str,
     labels: &LabelMap,
@@ -572,6 +602,7 @@ fn read_debug32_virt(cpu: &mut Emulator, addr: u32) -> Option<u32> {
     Some(value)
 }
 
+// Read a virtual debugger range without applying execution watchpoints.
 fn read_debug_bytes_virt(cpu: &mut Emulator, addr: u32, size: u32) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(size as usize);
     for i in 0..size {
@@ -604,15 +635,18 @@ fn format_bytes(bytes: &[u8]) -> String {
 }
 
 impl Emulator {
+    // Apply debugger watchpoint commands to the emulator's access filters.
     fn set_watchpoints(&mut self, watchpoints: &[Watchpoint]) {
         self.watchpoints.clear();
         self.watchpoints.extend_from_slice(watchpoints);
     }
 
+    // Take watchpoint hit.
     fn take_watchpoint_hit(&mut self) -> Option<WatchpointHit> {
         self.watchpoint_hit.take()
     }
 
+    // Execute one instruction and report the resulting debugger stop reason.
     fn step_instruction(&mut self) -> StepOutcome {
         self.check_for_interrupts();
         self.handle_interrupts();
@@ -636,6 +670,7 @@ impl Emulator {
         }
     }
 
+    // Display all general-purpose registers and their current values.
     fn print_regs(&self) {
         println!("pc: {:08X} kmode: {}", self.pc, self.get_kmode());
         for row in 0..8 {
@@ -680,6 +715,7 @@ impl Emulator {
         );
     }
 
+    // Display all control registers and their current values.
     fn print_cregs(&self) {
         println!("kmode: {}", self.get_kmode());
         println!("cr0 (psr): {:08X}", self.read_creg(0));
@@ -697,6 +733,7 @@ impl Emulator {
         println!("cr12 (tlbf): {:08X}", self.read_creg(12));
     }
 
+    // Print single reg.
     fn print_single_reg(&self, token: &str) -> bool {
         let token = token.to_ascii_lowercase();
         match token.as_str() {
@@ -796,6 +833,7 @@ impl Emulator {
         false
     }
 
+    // Parse and write a new value to the selected general-purpose register.
     fn set_reg_value(&mut self, token: &str, value: u32) -> bool {
         let token = token.to_ascii_lowercase();
         match token.as_str() {
@@ -899,10 +937,12 @@ impl Emulator {
         false
     }
 
+    // Display private and global TLB entries with their permissions.
     fn print_tlb(&self) {
         self.tlb.debug_dump();
     }
 
+    // Display bytes read from a physical address range.
     fn print_phys(&mut self, addr: u32) {
         if addr > PHYSMEM_MAX {
             println!("Warning: physical address out of range 0x{:08X}", addr);
@@ -914,6 +954,7 @@ impl Emulator {
         }
     }
 
+    // Display bytes read through virtual-address translation.
     fn print_virt(&mut self, addr: u32) {
         match self.convert_mem_address(addr, 0) {
             Some(paddr) => match self.read_phys32(paddr) {
@@ -924,6 +965,7 @@ impl Emulator {
         }
     }
 
+    // Run the interactive debugger command loop.
     pub fn debug(
         path: String,
         use_uart_rx: bool,
@@ -1231,6 +1273,7 @@ impl Emulator {
         cpu
     }
 
+    // Run the C-source-oriented debugger command loop.
     pub fn debug_c(
         path: String,
         use_uart_rx: bool,
@@ -1602,6 +1645,7 @@ impl Emulator {
 mod tests {
     use super::*;
 
+    // Test parse addr accepts hex and dec.
     #[test]
     fn parse_addr_accepts_hex_and_dec() {
         assert_eq!(parse_addr("0x10"), Some(0x10));
@@ -1611,6 +1655,7 @@ mod tests {
         assert_eq!(parse_addr("not-a-number"), None);
     }
 
+    // Test watchpoint merge upgrades kind.
     #[test]
     fn watchpoint_merge_upgrades_kind() {
         let mut list = Vec::new();
@@ -1620,6 +1665,7 @@ mod tests {
         assert_eq!(list.len(), 1);
     }
 
+    // Test parse watch kind variants.
     #[test]
     fn parse_watch_kind_variants() {
         assert_eq!(parse_watch_kind("r"), Some(WatchKind::Read));

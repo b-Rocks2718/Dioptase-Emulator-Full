@@ -12,8 +12,7 @@ use crate::memory::*;
 
 const SCREEN_WIDTH: u32 = 640;
 const SCREEN_HEIGHT: u32 = 480;
-// Purpose: scale the host window without changing logical resolution.
-// Invariants: buffer remains FRAME_WIDTH x FRAME_HEIGHT.
+// Scale the host window without changing logical resolution.
 const DISPLAY_SCALE: u32 = 2;
 const WINDOW_WIDTH: u32 = SCREEN_WIDTH * DISPLAY_SCALE;
 const WINDOW_HEIGHT: u32 = SCREEN_HEIGHT * DISPLAY_SCALE;
@@ -52,9 +51,8 @@ const KEY_RIGHT_CTRL: u8 = 0xE4;
 const KEY_RIGHT_SHIFT: u8 = 0xE5;
 const KEY_RIGHT_ALT: u8 = 0xE6;
 
-// Purpose: convert a guest keycode into the 16-bit PS/2 MMIO event value.
-// Inputs: base guest keycode plus press/release state.
-// Outputs: low byte = guest keycode, bit 8 = release when applicable.
+// Convert a guest keycode into the 16-bit PS/2 MMIO event value.
+// Low byte = guest keycode, bit 8 = release when applicable.
 fn encode_guest_key_event(code: u8, state: ButtonState) -> u16 {
     match state {
         ButtonState::Press => code as u16,
@@ -62,10 +60,9 @@ fn encode_guest_key_event(code: u8, state: ButtonState) -> u16 {
     }
 }
 
-// Purpose: translate the windowing library's logical key enum into the guest
+// Translate the windowing library's logical key enum into the guest
 // keycode contract described above.
-// Inputs: `piston_window::Key`.
-// Outputs: `Some(keycode)` when the key has a stable guest encoding.
+// `Some(keycode)` when the key has a stable guest encoding.
 // Notes:
 // - Printable keys use the unshifted base-key identity.
 // - Numpad digits/operators are normalized to the corresponding base keycodes.
@@ -174,10 +171,9 @@ fn guest_keycode_for_key(key: Key) -> Option<u8> {
     }
 }
 
-// Purpose: recover the unshifted base key identity from the text event that
+// Recover the unshifted base key identity from the text event that
 // follows a backend `Key::Unknown` press.
-// Inputs: composed host character.
-// Outputs: base guest keycode for the originating key when it is representable.
+// Base guest keycode for the originating key when it is representable.
 // Notes:
 // - This is primarily needed for keys like apostrophe and grave accent because
 //   the current `piston_window` backend drops their dedicated logical key.
@@ -214,7 +210,7 @@ fn guest_keycode_from_text_char(ch: char) -> Option<u8> {
     }
 }
 
-// Purpose: translate host keyboard input events into the guest PS/2 key-event
+// Translate host keyboard input events into the guest PS/2 key-event
 // stream while preserving press/release ordering.
 // Invariants:
 // - `pending_unknown_press_scancodes` holds host scancodes for unresolved
@@ -233,6 +229,7 @@ struct GuestKeyboardMapper {
 }
 
 impl GuestKeyboardMapper {
+    // Create a keyboard mapper with no pending host-key state.
     fn new() -> Self {
         Self {
             pending_unknown_press_scancodes: VecDeque::new(),
@@ -242,6 +239,7 @@ impl GuestKeyboardMapper {
         }
     }
 
+    // Clear the stored state.
     fn clear(&mut self) {
         self.pending_unknown_press_scancodes.clear();
         self.fallback_keycodes_by_scancode.clear();
@@ -249,6 +247,7 @@ impl GuestKeyboardMapper {
         self.recent_button_press_code = None;
     }
 
+    // Translate a host button event into a guest PS/2 key event.
     fn translate_button(
         &mut self,
         key: Key,
@@ -308,6 +307,7 @@ impl GuestKeyboardMapper {
         }
     }
 
+    // Translate a text event when no stable host scancode is available.
     fn translate_text(&mut self, text: &str) -> Option<u16> {
         let mut chars = text.chars();
         let ch = chars.next()?;
@@ -341,9 +341,8 @@ impl GuestKeyboardMapper {
     }
 }
 
-// Purpose: expand an 8-bit sprite/tile color into 4-bit RGB channels.
-// Inputs: 8-bit color in RGB332 format.
-// Outputs: (r4, g4, b4) in 0..=15.
+// Expand an 8-bit sprite/tile color into 4-bit RGB channels.
+// Returns (r4, g4, b4) in 0..=15.
 fn expand_rgb332(color: u8) -> (u8, u8, u8) {
     let r3 = (color >> 5) & 0x7;
     let g3 = (color >> 2) & 0x7;
@@ -354,13 +353,14 @@ fn expand_rgb332(color: u8) -> (u8, u8, u8) {
     (r4, g4, b4)
 }
 
-// Purpose: decode a signed 16-bit scroll offset from two MMIO bytes.
-// Inputs: (low, high) bytes in little-endian order.
-// Outputs: signed pixel offset.
+// Decode a signed 16-bit scroll offset from two MMIO bytes.
+// (low, high) bytes in little-endian order.
+// Signed pixel offset.
 fn decode_scroll_offset(pair: (u8, u8)) -> i32 {
     i32::from(i16::from_le_bytes([pair.0, pair.1]))
 }
 
+// Owns the guest framebuffer layers and their host-window presentation state.
 pub struct Graphics {
     window: PistonWindow,
     buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
@@ -386,6 +386,7 @@ pub struct Graphics {
 }
 
 impl Graphics {
+    // Create empty tile and pixel layers at the guest display resolution.
     pub fn new(
         pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
         tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
@@ -445,6 +446,7 @@ impl Graphics {
         }
     }
 
+    // Enter the window event/render loop until the emulator finishes.
     pub fn start(&mut self, finished: Arc<Mutex<bool>>, stay_open: bool) {
         while let Some(event) = self.window.next() {
             match event {
@@ -509,6 +511,7 @@ impl Graphics {
         }
     }
 
+    // Apply the tile-layer changes reported by the guest MMIO state.
     fn tile_layer_update(&mut self) {
         // draw the tile layer over the pixel layer
         let fb = self.tile_frame_buffer.read().unwrap();
@@ -570,6 +573,7 @@ impl Graphics {
         }
     }
 
+    // Apply the pixel-layer changes reported by the guest MMIO state.
     fn pixel_layer_update(&mut self) {
         // draw the pixel layer as the background
         let fb = self.pixel_frame_buffer.read().unwrap();
@@ -611,6 +615,7 @@ impl Graphics {
         }
     }
 
+    // Redraw the host window from the current guest framebuffer layers.
     fn update(&mut self) {
         // set status to busy
         *self.vga_status_register.write().unwrap() = 0;
@@ -700,6 +705,7 @@ impl Graphics {
 mod tests {
     use super::*;
 
+    // Test guest keycode preserves unshifted printable identity.
     #[test]
     fn guest_keycode_preserves_unshifted_printable_identity() {
         assert_eq!(guest_keycode_for_key(Key::A), Some(b'a'));
@@ -711,6 +717,7 @@ mod tests {
         assert_eq!(guest_keycode_for_key(Key::F12), Some(KEY_F12));
     }
 
+    // Test guest keycode normalizes shifted symbol variants to base keys.
     #[test]
     fn guest_keycode_normalizes_shifted_symbol_variants_to_base_keys() {
         assert_eq!(guest_keycode_for_key(Key::Exclaim), Some(b'1'));
@@ -727,6 +734,7 @@ mod tests {
         assert_eq!(guest_keycode_for_key(Key::Caret), Some(b'6'));
     }
 
+    // Test text fallback recovers base key from shifted punctuation.
     #[test]
     fn text_fallback_recovers_base_key_from_shifted_punctuation() {
         assert_eq!(guest_keycode_from_text_char('!'), Some(b'1'));
@@ -735,6 +743,7 @@ mod tests {
         assert_eq!(guest_keycode_from_text_char('|'), Some(b'\\'));
     }
 
+    // Test unknown key uses text fallback for make and break.
     #[test]
     fn unknown_key_uses_text_fallback_for_make_and_break() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -750,6 +759,7 @@ mod tests {
         );
     }
 
+    // Test text before unknown key press still preserves break event.
     #[test]
     fn text_before_unknown_key_press_still_preserves_break_event() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -765,6 +775,7 @@ mod tests {
         );
     }
 
+    // Test text after known button press is ignored as duplicate.
     #[test]
     fn text_after_known_button_press_is_ignored_as_duplicate() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -780,6 +791,7 @@ mod tests {
         );
     }
 
+    // Test unknown key without scancode can still emit text make event.
     #[test]
     fn unknown_key_without_scancode_can_still_emit_text_make_event() {
         let mut mapper = GuestKeyboardMapper::new();

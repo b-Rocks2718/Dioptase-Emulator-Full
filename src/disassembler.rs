@@ -1,4 +1,4 @@
-// Disassembler written by Codex
+// Decode Dioptase instruction words into canonical assembler syntax.
 
 fn sign_extend(value: u32, bits: u8) -> i32 {
     let shift = 32 - bits;
@@ -374,21 +374,21 @@ pub fn disassemble(instr: u32) -> String {
 mod tests {
     use super::disassemble;
 
-    // Test disassembles EOI specific.
+    // Decode an indexed EOI without confusing it with the all-sources form.
     #[test]
     fn disassembles_eoi_specific() {
         let instr = (31u32 << 27) | (5u32 << 12) | 6u32;
         assert_eq!(disassemble(instr), "eoi 6");
     }
 
-    // Test disassembles EOI all.
+    // Decode the EOI-all control bit as the dedicated mnemonic form.
     #[test]
     fn disassembles_eoi_all() {
         let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
         assert_eq!(disassemble(instr), "eoi all");
     }
 
-    // Test disassembles reserved alt rfe encoding as data.
+    // Keep the reserved alternate RFE encoding visible as raw data.
     #[test]
     fn disassembles_reserved_alt_rfe_encoding_as_data() {
         let instr = (31u32 << 27) | (3u32 << 12) | (1u32 << 11);

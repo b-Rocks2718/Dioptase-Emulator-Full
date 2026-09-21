@@ -1,4 +1,4 @@
-// Debugger written by Codex
+// Interactive instruction- and C-source-level debugger support.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -58,7 +58,7 @@ fn read_source_line(path: &Path, line: u32) -> Result<String, String> {
     Err(format!("File {} has no line {}", path.display(), line))
 }
 
-// Build labels by addr.
+// Invert the label map so every address lists all symbols defined there.
 fn build_labels_by_addr(labels: &LabelMap) -> HashMap<u32, Vec<String>> {
     let mut by_addr: HashMap<u32, Vec<String>> = HashMap::new();
     for (name, addrs) in labels {
@@ -83,7 +83,7 @@ enum RunOutcome {
     Watchpoint(WatchpointHit),
 }
 
-// Run until breakpoint.
+// Continue until halt, sleep, a TLB miss, a breakpoint, or a watchpoint.
 fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>) -> RunOutcome {
     loop {
         if cpu.halted {
@@ -103,7 +103,7 @@ fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>) -> RunOu
     }
 }
 
-// Format addr list.
+// Format addresses as a comma-separated list of eight-digit hex values.
 fn format_addr_list(addrs: &[u32]) -> String {
     let mut parts = Vec::new();
     for addr in addrs {
@@ -202,7 +202,7 @@ fn list_watchpoints(list: &[Watchpoint]) {
     }
 }
 
-// Print watchpoint hit.
+// Report the triggering access, byte value, and current program counter.
 fn print_watchpoint_hit(hit: WatchpointHit, pc: u32) {
     println!(
         "Watchpoint hit ({} at {:08X} = {:02X}) pc {:08X}",
@@ -297,7 +297,7 @@ const BP_REG: u32 = 30;
 // Debug display uses word-sized (4-byte) reads.
 const DEBUG_WORD_BYTES: u32 = 4;
 
-// Build line index.
+// Index debug addresses by source file and line, sorting and deduplicating each list.
 fn build_line_index(lines: &[DebugLine]) -> HashMap<String, HashMap<u32, Vec<u32>>> {
     let mut index: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     for line in lines {
@@ -344,12 +344,12 @@ fn same_source_line(a: Option<&DebugLine>, b: Option<&DebugLine>) -> bool {
     }
 }
 
-// Format source line.
+// Format a debug location as ``file:line``.
 fn format_source_line(line: &DebugLine) -> String {
     format!("{}:{}", line.file, line.line)
 }
 
-// Print c location.
+// Print the source line mapped to a PC, including lookup failures inline.
 fn print_c_location(pc: u32, line: Option<&DebugLine>) {
     if let Some(line) = line {
         match resolve_source_path(&line.file) {
@@ -364,7 +364,7 @@ fn print_c_location(pc: u32, line: Option<&DebugLine>) {
     }
 }
 
-// Format breakpoint c.
+// Add a resolved C source location to a breakpoint address when available.
 fn format_breakpoint_c(addr: u32, lines: &[DebugLine]) -> String {
     if let Some(line) = line_for_pc(lines, addr) {
         format!("{:08X} ({})", addr, format_source_line(line))
@@ -386,7 +386,7 @@ fn list_breakpoints_c(breakpoints: &HashSet<u32>, lines: &[DebugLine]) {
     }
 }
 
-// Build locals by addr.
+// Sort local-variable descriptions by function address and stack offset.
 fn build_locals_by_addr(debug: &DebugInfo) -> Vec<(u32, Vec<DebugLocal>)> {
     let mut locals: Vec<(u32, Vec<DebugLocal>)> = debug
         .locals_by_addr
@@ -733,7 +733,7 @@ impl Emulator {
         println!("cr12 (tlbf): {:08X}", self.read_creg(12));
     }
 
-    // Print single reg.
+    // Print one named or numbered register, accepting ABI aliases.
     fn print_single_reg(&self, token: &str) -> bool {
         let token = token.to_ascii_lowercase();
         match token.as_str() {
@@ -1645,7 +1645,7 @@ impl Emulator {
 mod tests {
     use super::*;
 
-    // Test parse addr accepts hex and dec.
+    // Accept explicit hex, implicit hex with letters, and decimal addresses.
     #[test]
     fn parse_addr_accepts_hex_and_dec() {
         assert_eq!(parse_addr("0x10"), Some(0x10));
@@ -1655,7 +1655,7 @@ mod tests {
         assert_eq!(parse_addr("not-a-number"), None);
     }
 
-    // Test watchpoint merge upgrades kind.
+    // Merge read and write watchpoints at one address into a single read/write entry.
     #[test]
     fn watchpoint_merge_upgrades_kind() {
         let mut list = Vec::new();
@@ -1665,7 +1665,7 @@ mod tests {
         assert_eq!(list.len(), 1);
     }
 
-    // Test parse watch kind variants.
+    // Accept every documented watchpoint selector and reject unknown ones.
     #[test]
     fn parse_watch_kind_variants() {
         assert_eq!(parse_watch_kind("r"), Some(WatchKind::Read));

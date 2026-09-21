@@ -63,7 +63,7 @@ const CREG_TLBF: usize = 12;
 // Global toggle for interrupt tracing output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
-// Set trace interrupts.
+// Enable or disable process-wide interrupt trace output.
 pub fn set_trace_interrupts(enabled: bool) {
     TRACE_INTERRUPTS.store(enabled, Ordering::Relaxed);
 }
@@ -546,7 +546,7 @@ impl InterruptController {
         })
     }
 
-    // Set pending bits.
+    // Publish pending interrupt bits without losing concurrent updates.
     fn set_pending_bits(&self, core: usize, bits: u32) {
         self.pending[core].fetch_or(bits, Ordering::Release);
     }
@@ -2019,7 +2019,7 @@ impl Emulator {
         result
     }
 
-    // Check for interrupts.
+    // Route host input, tick core-owned devices, and enter any deliverable interrupt.
     fn check_for_interrupts(&mut self) {
         // Input routing only needs a queue-empty check, not the full queue lock.
         let io_nonempty = self.memory.has_pending_input();
@@ -3175,7 +3175,7 @@ impl Emulator {
     }
 }
 
-// Run core loop.
+// Execute one core until it halts, sleeps, faults, or reaches the cycle budget.
 fn run_core_loop(
     mut cpu: Emulator,
     max_iters: u32,
@@ -3246,7 +3246,7 @@ fn run_core_loop(
 mod tests {
     use super::*;
 
-    // Test write ISR preserves concurrently pending IPI.
+    // Preserve an IPI that becomes pending while software writes ISR state.
     #[test]
     fn write_isr_preserves_concurrently_pending_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3280,7 +3280,7 @@ mod tests {
         );
     }
 
-    // Test send IPI fails until target acknowledges IPI.
+    // Reject a second IPI until the target acknowledges the outstanding one.
     #[test]
     fn send_ipi_fails_until_target_acknowledges_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3330,7 +3330,7 @@ mod tests {
         );
     }
 
-    // Test IPI all reports only cores without outstanding IPI.
+    // Report only targets that accept an IPI-all broadcast.
     #[test]
     fn ipi_all_reports_only_cores_without_outstanding_ipi() {
         let interrupts = InterruptController::new(3);
@@ -3361,7 +3361,7 @@ mod tests {
         );
     }
 
-    // Test CRMV write to ISR is ignored.
+    // Ignore CRMV writes to the read-only ISR control register.
     #[test]
     fn crmv_write_to_isr_is_ignored() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3380,7 +3380,7 @@ mod tests {
         );
     }
 
-    // Test EOI specific clears only selected ISR bit.
+    // Clear only the selected in-service bit for an indexed EOI.
     #[test]
     fn eoi_specific_clears_only_selected_isr_bit() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
@@ -3398,7 +3398,7 @@ mod tests {
         );
     }
 
-    // Test EOI all preserves concurrently pending IPI.
+    // Preserve a concurrently arriving IPI while EOI clears existing service state.
     #[test]
     fn eoi_all_preserves_concurrently_pending_ipi() {
         let memory = Arc::new(Memory::new(HashMap::new(), false, 1));

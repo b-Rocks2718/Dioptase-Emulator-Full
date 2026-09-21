@@ -705,7 +705,7 @@ impl Graphics {
 mod tests {
     use super::*;
 
-    // Test guest keycode preserves unshifted printable identity.
+    // Preserve the base printable key identity for an unshifted key event.
     #[test]
     fn guest_keycode_preserves_unshifted_printable_identity() {
         assert_eq!(guest_keycode_for_key(Key::A), Some(b'a'));
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(guest_keycode_for_key(Key::F12), Some(KEY_F12));
     }
 
-    // Test guest keycode normalizes shifted symbol variants to base keys.
+    // Normalize shifted symbols to the base key used for make/break identity.
     #[test]
     fn guest_keycode_normalizes_shifted_symbol_variants_to_base_keys() {
         assert_eq!(guest_keycode_for_key(Key::Exclaim), Some(b'1'));
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(guest_keycode_for_key(Key::Caret), Some(b'6'));
     }
 
-    // Test text fallback recovers base key from shifted punctuation.
+    // Recover a base key from shifted punctuation supplied only as text.
     #[test]
     fn text_fallback_recovers_base_key_from_shifted_punctuation() {
         assert_eq!(guest_keycode_from_text_char('!'), Some(b'1'));
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(guest_keycode_from_text_char('|'), Some(b'\\'));
     }
 
-    // Test unknown key uses text fallback for make and break.
+    // Pair make and break events when an unknown key is identified through text.
     #[test]
     fn unknown_key_uses_text_fallback_for_make_and_break() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -759,7 +759,7 @@ mod tests {
         );
     }
 
-    // Test text before unknown key press still preserves break event.
+    // Preserve the eventual break event when text arrives before an unknown key press.
     #[test]
     fn text_before_unknown_key_press_still_preserves_break_event() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -775,7 +775,7 @@ mod tests {
         );
     }
 
-    // Test text after known button press is ignored as duplicate.
+    // Ignore text that duplicates an already decoded physical key press.
     #[test]
     fn text_after_known_button_press_is_ignored_as_duplicate() {
         let mut mapper = GuestKeyboardMapper::new();
@@ -791,7 +791,7 @@ mod tests {
         );
     }
 
-    // Test unknown key without scancode can still emit text make event.
+    // Emit a text-derived make event even when no physical scancode is available.
     #[test]
     fn unknown_key_without_scancode_can_still_emit_text_make_event() {
         let mut mapper = GuestKeyboardMapper::new();

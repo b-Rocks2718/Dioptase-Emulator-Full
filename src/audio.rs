@@ -236,7 +236,7 @@ impl Drop for AudioOutput {
     }
 }
 
-// Spawn buffered audio writer.
+// Drain queued guest samples into the player's buffered stdin on a worker thread.
 fn spawn_buffered_audio_writer(
     stdin: ChildStdin,
     last_player_error: Arc<Mutex<Option<String>>>,
@@ -262,7 +262,7 @@ fn spawn_buffered_audio_writer(
     })
 }
 
-// Spawn ffplay stderr thread.
+// Capture the latest nonempty ffplay diagnostic without blocking sample writes.
 fn spawn_ffplay_stderr_thread(
     stderr: ChildStderr,
     last_player_error: Arc<Mutex<Option<String>>>,
@@ -304,7 +304,7 @@ fn ffplay_args() -> Vec<String> {
 mod tests {
     use super::*;
 
-    // Test ffplay args match guest audio format.
+    // Configure ffplay for the guest's signed 16-bit mono PCM stream.
     #[test]
     fn ffplay_args_match_guest_audio_format() {
         let args = ffplay_args();
@@ -314,7 +314,7 @@ mod tests {
         assert!(args.contains(&"pipe:0".to_string()));
     }
 
-    // Test sample encoding is little endian.
+    // Encode each signed sample as two little-endian bytes.
     #[test]
     fn sample_encoding_is_little_endian() {
         assert_eq!(i16::from_le_bytes([0x34, 0x12]), 0x1234);

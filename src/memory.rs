@@ -743,7 +743,7 @@ impl Memory {
         (addr as usize) & RAM_PAGE_MASK
     }
 
-    // Collect RAM page indices.
+    // Return the sorted unique RAM pages that must be locked for an address set.
     fn collect_ram_page_indices(addrs: &[u32]) -> Vec<usize> {
         let mut pages = Vec::new();
         for addr in addrs {
@@ -815,14 +815,14 @@ impl Memory {
             .all(|(index, addr)| *addr == first + index as u32 && *addr < PIT_START + 4)
     }
 
-    // Conditionally handle warn null read.
+    // Warn when guest code reads the null physical address.
     fn maybe_warn_null_read(addr: u32) {
         if addr == 0 {
             println!("Warning: reading from physical address 0x00000000");
         }
     }
 
-    // Conditionally handle warn null write.
+    // Warn when guest code writes the null physical address.
     fn maybe_warn_null_write(addr: u32, data: u8) {
         if addr == 0 {
             println!(
@@ -869,7 +869,7 @@ impl Memory {
         self.pit_reload.store(reload, Ordering::SeqCst);
     }
 
-    // Raise pending interrupt.
+    // Publish an interrupt bit without discarding concurrently pending sources.
     fn raise_pending_interrupt(&self, interrupt_bit: u32) {
         self.pending_interrupt
             .fetch_or(interrupt_bit, Ordering::SeqCst);
@@ -1769,7 +1769,7 @@ Summary:
 mod tests {
     use super::*;
 
-    // Test SD dump preserves loaded image length.
+    // Preserve the original image length when no later writes extend it.
     #[test]
     fn sd_dump_preserves_loaded_image_length() {
         let mut sd = SdCard::new(1);
@@ -1778,7 +1778,7 @@ mod tests {
         assert_eq!(sd.dump_image(), image);
     }
 
-    // Test SD dump grows to cover written bytes.
+    // Extend an exported SD image far enough to include newly written bytes.
     #[test]
     fn sd_dump_grows_to_cover_written_bytes() {
         let mut sd = SdCard::new(1);
@@ -1791,7 +1791,7 @@ mod tests {
         assert_eq!(image[511], 0xCC);
     }
 
-    // Test SD dump zero fills sparse gaps.
+    // Fill unwritten gaps with zeros when exporting sparse SD storage.
     #[test]
     fn sd_dump_zero_fills_sparse_gaps() {
         let mut sd = SdCard::new(1);
@@ -1804,7 +1804,7 @@ mod tests {
         assert_eq!(image[600], 0x5A);
     }
 
-    // Test RAM reads zero from unallocated pages.
+    // Return zero when guest RAM reads a page that has never been allocated.
     #[test]
     fn ram_reads_zero_from_unallocated_pages() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1813,7 +1813,7 @@ mod tests {
         assert_eq!(memory.read_u32(0x0000_1FFC), 0);
     }
 
-    // Test RAM image initializes multiple pages.
+    // Distribute a loaded RAM image correctly across page boundaries.
     #[test]
     fn ram_image_initializes_multiple_pages() {
         let mut image = HashMap::new();
@@ -1827,7 +1827,7 @@ mod tests {
         assert_eq!(memory.read(0x0000_1002), 0);
     }
 
-    // Test RAM phys byte helpers span page boundaries.
+    // Allow physical byte-range helpers to cross from one RAM page to the next.
     #[test]
     fn ram_phys_byte_helpers_span_page_boundaries() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1841,7 +1841,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    // Test pit tick uses latest written reload.
+    // Apply the most recently written PIT reload value on the next timer cycle.
     #[test]
     fn pit_tick_uses_latest_written_reload() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1853,7 +1853,7 @@ mod tests {
         assert_eq!(memory.read_u32(PIT_START), 3);
     }
 
-    // Test pending interrupts swap and clear.
+    // Atomically take all pending interrupts and clear the published set.
     #[test]
     fn pending_interrupts_swap_and_clear() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1867,7 +1867,7 @@ mod tests {
         assert_eq!(memory.check_interrupts(), 0);
     }
 
-    // Test audio ring extends MMIO downward.
+    // Map the audio ring immediately below its control-register window.
     #[test]
     fn audio_ring_extends_mmio_downward() {
         let mut image = HashMap::new();
@@ -1887,7 +1887,7 @@ mod tests {
         assert_eq!(memory.read(AUDIO_RING_BUFFER_START), 0x33);
     }
 
-    // Test audio tick advances read idx and recovers underrun after refill.
+    // Advance the audio consumer index and resume playback after an underrun refill.
     #[test]
     fn audio_tick_advances_read_idx_and_recovers_underrun_after_refill() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1939,7 +1939,7 @@ mod tests {
         );
     }
 
-    // Test audio IRQ fires once on low water rising edge.
+    // Raise one audio interrupt when buffered data first crosses below the watermark.
     #[test]
     fn audio_irq_fires_once_on_low_water_rising_edge() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1966,7 +1966,7 @@ mod tests {
         );
     }
 
-    // Test audio enabling IRQ while low water is already true does not backfill interrupt.
+    // Do not synthesize a past low-water edge when interrupts are enabled late.
     #[test]
     fn audio_enabling_irq_while_low_water_is_already_true_does_not_backfill_interrupt() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -1981,7 +1981,7 @@ mod tests {
         );
     }
 
-    // Test audio underrun does not raise a separate interrupt.
+    // Treat underrun as playback state rather than a second interrupt source.
     #[test]
     fn audio_underrun_does_not_raise_a_separate_interrupt() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -2006,7 +2006,7 @@ mod tests {
         );
     }
 
-    // Test wallclock audio consumption advances without waiting for device ticks.
+    // Let wall-clock audio consumption progress independently of device ticks.
     #[test]
     fn wallclock_audio_consumption_advances_without_waiting_for_device_ticks() {
         let memory = Memory::new(HashMap::new(), false, 1);
@@ -2163,7 +2163,7 @@ impl TileMap {
         return self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize];
     }
 
-    // Set tile byte.
+    // Update one byte in the tile-map backing storage.
     pub fn set_tile_byte(&mut self, addr: u32, data: u8) {
         self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize] = data;
     }
@@ -2187,17 +2187,17 @@ impl SpriteMap {
         SpriteMap { sprites }
     }
 
-    // this will get a single corrsponding pixel
+    // Read one byte from sprite pixel storage.
     pub fn get_sprite_byte(&self, addr: u32) -> u8 {
         return self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize];
     }
 
-    // Set sprite byte.
+    // Update one byte in sprite pixel storage.
     pub fn set_sprite_byte(&mut self, addr: u32, data: u8) {
         self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize] = data;
     }
 
-    // returns the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
+    // Read one byte of a sprite's packed x/y coordinate registers.
     pub fn get_sprite_reg(&self, addr: u32) -> u8 {
         let addr = addr as usize;
         let sprite = &self.sprites[addr / 4];

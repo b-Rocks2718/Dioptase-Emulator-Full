@@ -752,7 +752,7 @@ fn profile_window_limits_counts() {
     use crate::emulator::profiler::{ProfileWindow, Symbols, WindowStart, format_report};
 
     let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_window");
-    let symbols = Symbols::load(&[hex.clone()]).unwrap();
+    let symbols = Symbols::load(std::slice::from_ref(&hex)).unwrap();
     let start = symbols.resolve_trigger("--profile-start", "work").unwrap();
     let stop = symbols.resolve_trigger("--profile-stop", "_start.loop").unwrap();
     let window = ProfileWindow::new(WindowStart::KernelPcs(start), stop, "test".to_string());

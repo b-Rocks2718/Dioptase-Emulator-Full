@@ -18,26 +18,35 @@ use crate::memory::{
 use crate::graphics::Graphics;
 
 mod debugger;
+pub mod profiler;
+
+use profiler::{CoreProfile, ProfileWindow};
 
 // Reset vector for kernel entry (see docs/mem_map.md).
 const RESET_PC: u32 = 0x0000_0400;
 
-// Memory map ranges from Dioptase-OS/docs/kernel_mem_map.md.
+// Memory map ranges from Dioptase-OS/docs/kernel_mem_map.md. End bounds are
+// exclusive. These only label addresses for trace output and bound the
+// profiler's dense PC table; they do not change emulated behavior.
 const IVT_START: u32 = 0x0000_0000;
 const IVT_END: u32 = 0x0000_0400;
 const BIOS_START: u32 = 0x0000_0400;
-const BIOS_SIZE: u32 = 0x0001_0000; // 64KB reserved; kernel can overwrite after entry.
+// 32KiB reserved for the BIOS image and its MBR buffer. The kernel may
+// overwrite both BIOS regions after entry.
+const BIOS_SIZE: u32 = 0x0000_8000;
 const BIOS_END: u32 = BIOS_START + BIOS_SIZE;
+// Boot-core BIOS stack; grows down from BIOS_STACK_TOP in bios/init.s.
+const BIOS_STACK_START: u32 = BIOS_END;
+const BIOS_STACK_END: u32 = 0x0001_0000;
 const KERNEL_TEXT_START: u32 = 0x0001_0000;
-const KERNEL_TEXT_END: u32 = 0x0009_0000;
-const KERNEL_DATA_START: u32 = 0x0009_0000;
-const KERNEL_DATA_END: u32 = 0x000A_0000;
-const KERNEL_RODATA_START: u32 = 0x000A_0000;
-const KERNEL_RODATA_END: u32 = 0x000B_0000;
-const KERNEL_BSS_START: u32 = 0x000B_0000;
-const KERNEL_BSS_END: u32 = 0x000E_0000;
-const KERNEL_INT_STACK_START: u32 = 0x000E_0000;
-const KERNEL_INT_STACK_END: u32 = 0x000F_0000;
+const KERNEL_TEXT_END: u32 = 0x000B_0000;
+const KERNEL_DATA_START: u32 = 0x000B_0000;
+const KERNEL_DATA_END: u32 = 0x000E_0000;
+const KERNEL_RODATA_START: u32 = 0x000E_0000;
+const KERNEL_RODATA_END: u32 = 0x000E_8000;
+const KERNEL_BSS_START: u32 = 0x000E_8000;
+const KERNEL_BSS_END: u32 = 0x000F_0000;
+// Per-core 16KiB kernel stacks: core 3 at the bottom, core 0 at the top.
 const KERNEL_STACK_START: u32 = 0x000F_0000;
 const KERNEL_STACK_END: u32 = 0x0010_0000;
 const TLB_ENTRIES: usize = 16;
@@ -753,6 +762,8 @@ pub struct Emulator {
     pending_tlb_fault: Option<u32>,
     watchpoints: Vec<Watchpoint>,
     watchpoint_hit: Option<WatchpointHit>,
+    // Present only when `--profile` is enabled; see profiler.rs.
+    profile: Option<CoreProfile>,
 }
 
 const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
@@ -1255,7 +1266,15 @@ impl Emulator {
             pending_tlb_fault: None,
             watchpoints: Vec::new(),
             watchpoint_hit: None,
+            profile: None,
         }
+    }
+
+    // Start counting instructions this core dispatches while `window` is open
+    // (see profiler.rs). Call before the core starts running; every core in a
+    // run must share the same window.
+    pub fn enable_profiling(&mut self, window: Arc<ProfileWindow>) {
+        self.profile = Some(CoreProfile::new(self.core_id, window));
     }
 
     // Connect the core to the selected guest/host audio mode and sink.
@@ -1379,24 +1398,25 @@ impl Emulator {
         }
     }
 
-    // Resolve the MMIO region containing an address, if any.
+    // Name the kernel memory-map region (kernel_mem_map.md) containing a
+    // physical address, if any.
     fn memmap_region(paddr: u32) -> Option<&'static str> {
-        if paddr >= KERNEL_TEXT_START && paddr < KERNEL_TEXT_END {
-            Some("kernel_text")
-        } else if paddr >= KERNEL_RODATA_START && paddr < KERNEL_RODATA_END {
-            Some("kernel_rodata")
-        } else if paddr >= KERNEL_DATA_START && paddr < KERNEL_DATA_END {
-            Some("kernel_data")
-        } else if paddr >= KERNEL_BSS_START && paddr < KERNEL_BSS_END {
-            Some("kernel_bss")
-        } else if paddr >= KERNEL_INT_STACK_START && paddr < KERNEL_INT_STACK_END {
-            Some("kernel_int_stack")
-        } else if paddr >= KERNEL_STACK_START && paddr < KERNEL_STACK_END {
-            Some("kernel_stack")
-        } else if paddr >= BIOS_START && paddr < BIOS_END {
-            Some("bios")
-        } else if (IVT_START..IVT_END).contains(&paddr) {
+        if (IVT_START..IVT_END).contains(&paddr) {
             Some("ivt")
+        } else if (BIOS_START..BIOS_END).contains(&paddr) {
+            Some("bios")
+        } else if (BIOS_STACK_START..BIOS_STACK_END).contains(&paddr) {
+            Some("bios_stack")
+        } else if (KERNEL_TEXT_START..KERNEL_TEXT_END).contains(&paddr) {
+            Some("kernel_text")
+        } else if (KERNEL_DATA_START..KERNEL_DATA_END).contains(&paddr) {
+            Some("kernel_data")
+        } else if (KERNEL_RODATA_START..KERNEL_RODATA_END).contains(&paddr) {
+            Some("kernel_rodata")
+        } else if (KERNEL_BSS_START..KERNEL_BSS_END).contains(&paddr) {
+            Some("kernel_bss")
+        } else if (KERNEL_STACK_START..KERNEL_STACK_END).contains(&paddr) {
+            Some("kernel_stack")
         } else {
             None
         }
@@ -1804,6 +1824,9 @@ impl Emulator {
         self.check_for_interrupts();
         self.handle_interrupts();
 
+        // Sleep state after interrupt delivery decides whether this tick fetches.
+        let asleep = self.asleep;
+
         let clk_divider = self.memory.read_u32(CLK_REG_START);
 
         if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
@@ -1815,21 +1838,42 @@ impl Emulator {
             if self.pc != fetch_pc {
                 // Exception redirect already installed by fetch.
             } else if let Some(instr) = instr {
+                if self.profile.is_some() {
+                    // Sample mode, PID, and link register before `execute` can change them.
+                    let kmode = self.get_kmode();
+                    let pid = self.cregfile[CREG_PID];
+                    let link = self.regfile[profiler::LINK_REGISTER];
+                    if let Some(profile) = self.profile.as_mut() {
+                        profile.record_instruction(fetch_pc, instr, kmode, pid, link);
+                    }
+                }
                 self.execute(instr);
             } else {
                 self.raise_pending_tlb_miss(fetch_pc);
             }
         }
         self.count = self.count.wrapping_add(1);
+
+        // Counted after execute so the tick agrees with any window transition
+        // this tick's instruction caused.
+        if let Some(profile) = self.profile.as_mut() {
+            profile.record_tick(asleep);
+        }
     }
 
     // Run this core until it halts or the shared run state requests a stop.
-    pub fn run(
+    pub fn run(self, max_iters: u32, with_graphics: bool, audio_mode: AudioMode) -> Option<u32> {
+        self.run_with_profile(max_iters, with_graphics, audio_mode).0
+    }
+
+    // Same as `run`, but also returns the profile if `enable_profiling` was
+    // called. The profile is returned even when `max_iters` stops the run.
+    pub fn run_with_profile(
         mut self,
         max_iters: u32,
         with_graphics: bool,
         audio_mode: AudioMode,
-    ) -> Option<u32> {
+    ) -> (Option<u32>, Option<CoreProfile>) {
         let mut graphics: Option<Graphics> = None;
         if with_graphics {
             graphics = Some(Graphics::new(
@@ -1872,13 +1916,14 @@ impl Emulator {
                     if max_iters != 0 && self.count > max_iters {
                         *ret_clone.lock().unwrap() = None;
                         *finished_clone.lock().unwrap() = true;
-                        return;
+                        return self.profile.take();
                     }
                 }
 
                 // return the value in r3
                 *ret_clone.lock().unwrap() = Some(self.regfile[1]);
                 *finished_clone.lock().unwrap() = true;
+                self.profile.take()
             }
         });
 
@@ -1886,15 +1931,17 @@ impl Emulator {
             graphics.unwrap().start(finished, false);
         }
 
-        handle.join().unwrap();
+        let profile = handle.join().unwrap();
         drop(audio_output);
 
         // return the value in r3
-        return *ret.lock().unwrap();
+        let result = *ret.lock().unwrap();
+        (result, profile)
     }
 
     // Run the multicore emulator and keep the shared memory alive for inspection.
-    // Returns core-0 r1 plus the shared memory state after all cores exit.
+    // Returns core-0 r1, the shared memory state after all cores exit, and one
+    // profile per core (in core order) when `profile` is Some, else empty.
     pub fn run_multicore_with_memory(
         path: String,
         cores: usize,
@@ -1906,7 +1953,8 @@ impl Emulator {
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
         sd1_image: Option<&[u8]>,
-    ) -> (Option<u32>, Arc<Memory>) {
+        profile: Option<Arc<ProfileWindow>>,
+    ) -> (Option<u32>, Arc<Memory>, Vec<CoreProfile>) {
         assert!((1..=4).contains(&cores), "cores must be in 1..=4");
         let image = load_program(&path);
         let memory: Arc<Memory> = Arc::new(Memory::new(
@@ -1967,11 +2015,14 @@ impl Emulator {
             if core_id == 0 {
                 cpu.configure_audio(audio_mode, emulated_sink.clone());
             }
+            if let Some(window) = &profile {
+                cpu.enable_profiling(Arc::clone(window));
+            }
             // Each core runs in its own thread to allow real races.
             let shared_clone = Arc::clone(&shared);
             let scheduler_clone = scheduler.clone();
             let handle = thread::spawn(move || {
-                run_core_loop(cpu, max_iters, scheduler_clone, shared_clone, core_id);
+                run_core_loop(cpu, max_iters, scheduler_clone, shared_clone, core_id)
             });
             handles.push(handle);
         }
@@ -1980,14 +2031,17 @@ impl Emulator {
             graphics.start(Arc::clone(&finished), false);
         }
 
+        let mut profiles = Vec::new();
         for handle in handles {
-            handle.join().unwrap();
+            if let Some(core_profile) = handle.join().unwrap() {
+                profiles.push(core_profile);
+            }
         }
         drop(audio_output);
 
         // Return value is r1 from core 0.
         let results = shared.results.lock().unwrap();
-        (results.get(0).copied().unwrap_or(None), memory)
+        (results.get(0).copied().unwrap_or(None), memory, profiles)
     }
 
     // Run the multicore emulator to completion and return core 0's result.
@@ -2004,7 +2058,7 @@ impl Emulator {
         sd0_image: Option<&[u8]>,
         sd1_image: Option<&[u8]>,
     ) -> Option<u32> {
-        let (result, _) = Self::run_multicore_with_memory(
+        let (result, _, _) = Self::run_multicore_with_memory(
             path,
             cores,
             sched,
@@ -2015,6 +2069,7 @@ impl Emulator {
             sd_dma_ticks_per_word,
             sd0_image,
             sd1_image,
+            None,
         );
         result
     }
@@ -3176,13 +3231,14 @@ impl Emulator {
 }
 
 // Execute one core until it halts, sleeps, faults, or reaches the cycle budget.
+// Returns the core's profile if profiling was enabled.
 fn run_core_loop(
     mut cpu: Emulator,
     max_iters: u32,
     scheduler: Option<Arc<Scheduler>>,
     shared: Arc<RunShared>,
     core_id: usize,
-) {
+) -> Option<CoreProfile> {
     cpu.count = 0;
     loop {
         if shared.should_stop() {
@@ -3240,11 +3296,34 @@ fn run_core_loop(
     }
 
     shared.record_exit(core_id, cpu.regfile[1]);
+    cpu.profile.take()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Region bounds must match Dioptase-OS/docs/kernel_mem_map.md so trace-mode
+    // write warnings name the right region. Checks both edges of every region.
+    #[test]
+    fn memmap_regions_match_kernel_mem_map() {
+        let expected: [(u32, u32, &str); 8] = [
+            (0x0000_0000, 0x0000_0400, "ivt"),
+            (0x0000_0400, 0x0000_8400, "bios"),
+            (0x0000_8400, 0x0001_0000, "bios_stack"),
+            (0x0001_0000, 0x000B_0000, "kernel_text"),
+            (0x000B_0000, 0x000E_0000, "kernel_data"),
+            (0x000E_0000, 0x000E_8000, "kernel_rodata"),
+            (0x000E_8000, 0x000F_0000, "kernel_bss"),
+            (0x000F_0000, 0x0010_0000, "kernel_stack"),
+        ];
+        for (start, end, name) in expected {
+            assert_eq!(Emulator::memmap_region(start), Some(name), "first byte of {name}");
+            assert_eq!(Emulator::memmap_region(end - 1), Some(name), "last byte of {name}");
+        }
+        // The physical frame pool is not a named kernel region.
+        assert_eq!(Emulator::memmap_region(0x0010_0000), None);
+    }
 
     // Preserve an IPI that becomes pending while software writes ISR state.
     #[test]

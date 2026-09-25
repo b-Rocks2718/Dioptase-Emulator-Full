@@ -660,3 +660,127 @@ fn atomic_swap() {
 fn carry() {
     run_test("tests/asm/carry.s", 42);
 }
+
+// Assemble a fixture with `-g` so the image carries #label metadata for the profiler.
+// `test_name` keeps the output file unique, since tests run in parallel and
+// may assemble the same fixture concurrently.
+#[cfg(test)]
+fn assemble_with_symbols(asm_file: &'static str, test_name: &str) -> String {
+    ensure_hex_dir();
+    let stem = Path::new(asm_file).file_stem().unwrap().to_string_lossy().to_string();
+    let hex_file = PathBuf::from("tests/hex").join(format!("{}.{}.g.hex", stem, test_name));
+    let status = Command::new(assembler_path())
+        .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel", "-g"])
+        .status()
+        .expect("failed to run assembler");
+    assert!(status.success(), "assembler failed");
+    hex_file.to_string_lossy().to_string()
+}
+
+// Find the report row for `name` in the profiler's function table and return its count.
+#[cfg(test)]
+fn profile_function_count(report: &str, name: &str) -> u64 {
+    let row = report
+        .lines()
+        .find(|line| line.ends_with(&format!("  {}", name)) && line.contains('%'))
+        .unwrap_or_else(|| panic!("profile has no function row for {name}:\n{report}"));
+    row.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+// Profile counts must be exact per function: _start runs 2 + 5 * 6 + 1 = 33
+// instructions and work runs 5 * 2 = 10, with the reset jmp unsymbolized.
+#[test]
+fn profile_counts_calls() {
+    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+
+    let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_counts_calls");
+    let mut cpu = Emulator::new(hex.clone(), false, 1, None, None);
+    cpu.enable_profiling(ProfileWindow::whole_run());
+    let (result, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    assert_eq!(result, Some(5));
+
+    let symbols = Symbols::load(&[hex]).unwrap();
+    let report = format_report(&[profile.expect("profiling was enabled")], &symbols);
+    assert_eq!(profile_function_count(&report, "_start"), 33, "dotted _start.loop must fold into _start");
+    assert_eq!(profile_function_count(&report, "work"), 10);
+    assert_eq!(profile_function_count(&report, "[kernel: no symbol]"), 1);
+}
+
+// Each core returns its own profile; core 1 sleeps until the IPI arrives, so
+// its idle ticks must show up in the asleep column rather than as instructions.
+#[test]
+fn profile_multicore_reports_each_core() {
+    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+
+    let hex = assemble_with_symbols("tests/asm/multicore_ipi.s", "profile_multicore");
+    let (result, _, profiles) = Emulator::run_multicore_with_memory(
+        hex.clone(),
+        2,
+        ScheduleMode::RoundRobin,
+        200000,
+        false,
+        AudioMode::Disabled,
+        false,
+        1,
+        None,
+        None,
+        Some(ProfileWindow::whole_run()),
+    );
+    assert_eq!(result, Some(0x42));
+    assert_eq!(profiles.len(), 2, "one profile per core");
+
+    let report = format_report(&profiles, &Symbols::load(&[hex]).unwrap());
+    let core1: Vec<u64> = report
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|cols| cols.len() == 6 && cols[0] == "1")
+        .expect("per-core table has a row for core 1")
+        .iter()
+        .map(|col| col.parse().unwrap())
+        .collect();
+    let (ticks, asleep, instructions) = (core1[1], core1[2], core1[3]);
+    assert!(asleep > 0, "core 1 starts asleep waiting for the IPI");
+    assert!(instructions > 0, "core 1 runs the IPI handler after waking");
+    assert!(asleep + instructions <= ticks);
+}
+
+// With the window opened at `work` and closed at `_start.loop`, each of the 5
+// iterations counts work (2) plus the add/cmp/bnz tail of _start (3), and the
+// final halt is counted because the last bnz falls through without hitting stop.
+#[test]
+fn profile_window_limits_counts() {
+    use crate::emulator::profiler::{ProfileWindow, Symbols, WindowStart, format_report};
+
+    let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_window");
+    let symbols = Symbols::load(&[hex.clone()]).unwrap();
+    let start = symbols.resolve_trigger("--profile-start", "work").unwrap();
+    let stop = symbols.resolve_trigger("--profile-stop", "_start.loop").unwrap();
+    let window = ProfileWindow::new(WindowStart::KernelPcs(start), stop, "test".to_string());
+
+    let mut cpu = Emulator::new(hex, false, 1, None, None);
+    cpu.enable_profiling(window);
+    let (result, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    assert_eq!(result, Some(5));
+
+    let report = format_report(&[profile.unwrap()], &symbols);
+    assert_eq!(profile_function_count(&report, "work"), 10);
+    assert_eq!(profile_function_count(&report, "_start"), 16);
+    assert!(report.contains("opened 5 times"), "window reopens once per call:\n{report}");
+}
+
+// Call edges on real code: work is called 5 times, all from _start.
+#[test]
+fn profile_reports_callers() {
+    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+
+    let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_callers");
+    let mut cpu = Emulator::new(hex.clone(), false, 1, None, None);
+    cpu.enable_profiling(ProfileWindow::whole_run());
+    let (_, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    let report = format_report(&[profile.unwrap()], &Symbols::load(&[hex]).unwrap());
+    assert!(report.contains("work (self 10, 5 calls, 2.0 instructions/call)"), "{report}");
+    assert!(
+        report.lines().any(|l| l.trim_start().starts_with("5 calls") && l.ends_with("_start")),
+        "all 5 calls come from _start:\n{report}"
+    );
+}

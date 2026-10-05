@@ -1,133 +1,96 @@
-#[cfg(test)]
+// Instruction-level regression tests: each fixture in tests/asm is assembled
+// with the sibling Dioptase-Assembler checkout and run to `mode halt`; the
+// test checks the r1 value the program returns.
+
 use std::fs;
-
-#[cfg(test)]
 use std::path::{Path, PathBuf};
-
-#[cfg(test)]
 use std::process::Command;
+use std::sync::{Arc, Once};
 
-#[cfg(test)]
-use std::sync::Once;
+use crate::emulator::profiler::ProfileWindow;
+use crate::emulator::{RunConfig, RunResult, ScheduleMode, run_program};
 
-#[cfg(test)]
-use super::*;
+// Tick budget for single-core fixtures; they all halt far sooner.
+const SINGLE_CORE_MAX_CYCLES: u32 = 10_000;
+// Tick budget per core for round-robin multicore fixtures.
+const MULTICORE_MAX_CYCLES: u32 = 200_000;
 
-#[cfg(test)]
-use crate::emulator::{AudioMode, ScheduleMode};
-
-// Select the assembler profile used by the emulator integration tests.
-#[cfg(test)]
+// Assembler build profile matching the test binary profile.
 fn assembler_profile() -> &'static str {
-    // Match the assembler build to the test binary profile.
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
+    if cfg!(debug_assertions) { "debug" } else { "release" }
 }
 
-// Assemble a test program and return its executable image.
-#[cfg(test)]
-fn build_assembler() {
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let asm_dir = manifest.join("../../Dioptase-Assembler");
-        // Build the assembler once so tests can run in clean environments.
-        let status = Command::new("make")
-            .arg(assembler_profile())
-            .current_dir(asm_dir)
-            .status()
-            .expect("failed to run make for assembler");
-        assert!(status.success(), "assembler build failed");
-    });
-}
-
-// Locate the assembler executable used to build a test image.
-#[cfg(test)]
+// Path to the assembler, building it once if it is missing.
 fn assembler_path() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = manifest
-        .join("../../Dioptase-Assembler")
-        .join("build")
-        .join(assembler_profile())
-        .join("basm");
-    if path.exists() {
-        return path;
+    static BUILD: Once = Once::new();
+    let asm_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dioptase-Assembler");
+    let path = asm_dir.join("build").join(assembler_profile()).join("basm");
+    if !path.exists() {
+        BUILD.call_once(|| {
+            let status = Command::new("make")
+                .arg(assembler_profile())
+                .current_dir(&asm_dir)
+                .status()
+                .expect("failed to run make for assembler");
+            assert!(status.success(), "assembler build failed");
+        });
     }
-    // Build on-demand if the binary isn't present yet.
-    build_assembler();
     assert!(path.exists(), "assembler not found at {}", path.display());
     path
 }
 
-// Create the generated-image directory used by instruction fixtures.
-#[cfg(test)]
-fn ensure_hex_dir() {
-    let hex_dir = Path::new("tests/hex");
-    fs::create_dir_all(hex_dir).expect("failed to create tests/hex dir");
+// Assemble a kernel-mode fixture into tests/hex/<stem><suffix>.hex. `suffix`
+// keeps outputs unique when parallel tests assemble the same fixture.
+fn assemble(asm_file: &str, suffix: &str, extra_args: &[&str]) -> String {
+    fs::create_dir_all("tests/hex").expect("failed to create tests/hex dir");
+    let stem = Path::new(asm_file).file_stem().unwrap().to_string_lossy();
+    let hex_file = format!("tests/hex/{}{}.hex", stem, suffix);
+    let status = Command::new(assembler_path())
+        .args([asm_file, "-o", &hex_file, "-kernel"])
+        .args(extra_args)
+        .status()
+        .expect("failed to run assembler");
+    assert!(status.success(), "assembler failed on {}", asm_file);
+    hex_file
 }
 
-// Assemble and execute one instruction-level emulator test case.
-#[cfg(test)]
+// Run an assembled image with `config`.
+fn run_hex(hex_file: &str, config: &RunConfig) -> RunResult {
+    run_program(hex_file, config, None, None).expect("emulator failed to load the test image")
+}
+
+// Assemble and run one single-core fixture, expecting `expected` in r1.
 fn run_test(asm_file: &'static str, expected: u32) {
-    ensure_hex_dir();
-
-    // Build hex file path by replacing asm path prefix/suffix
-    let hex_file = {
-        let asm_path = Path::new(asm_file);
-        let stem = asm_path.file_stem().unwrap(); // e.g., "add"
-        PathBuf::from("tests/hex").join(format!("{}.hex", stem.to_string_lossy()))
+    let hex = assemble(asm_file, "", &[]);
+    let config = RunConfig {
+        max_cycles: SINGLE_CORE_MAX_CYCLES,
+        ..RunConfig::default()
     };
-
-    // assemble test case
-    let assembler = assembler_path();
-    let status = Command::new(&assembler)
-        .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel"])
-        .status()
-        .expect("failed to run assembler");
-    assert!(status.success(), "assembler failed");
-
-    // execute hex file
-    let cpu = Emulator::new(hex_file.to_string_lossy().to_string(), false, 1, None, None);
-    let result = cpu.run(10000, false, AudioMode::Disabled);
-
-    // check result
-    assert_eq!(result, Some(expected));
+    assert_eq!(run_hex(&hex, &config).result, Some(expected), "{} returned the wrong r1", asm_file);
 }
 
-// Assemble a kernel fixture and run it under deterministic round-robin multicore scheduling.
-#[cfg(test)]
+// Assemble a fixture and run it under deterministic round-robin scheduling.
 fn run_multicore_test(asm_file: &'static str, expected: u32, cores: usize) {
-    ensure_hex_dir();
-
-    let hex_file = {
-        let asm_path = Path::new(asm_file);
-        let stem = asm_path.file_stem().unwrap();
-        PathBuf::from("tests/hex").join(format!("{}.hex", stem.to_string_lossy()))
-    };
-
-    let assembler = assembler_path();
-    let status = Command::new(&assembler)
-        .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel"])
-        .status()
-        .expect("failed to run assembler");
-    assert!(status.success(), "assembler failed");
-
-    let result = Emulator::run_multicore(
-        hex_file.to_string_lossy().to_string(),
+    let hex = assemble(asm_file, "", &[]);
+    let config = RunConfig {
         cores,
-        ScheduleMode::RoundRobin,
-        200000,
-        false,
-        AudioMode::Disabled,
-        false,
-        1,
-        None,
-        None,
-    );
-    assert_eq!(result, Some(expected));
+        sched: ScheduleMode::RoundRobin,
+        max_cycles: MULTICORE_MAX_CYCLES,
+        ..RunConfig::default()
+    };
+    assert_eq!(run_hex(&hex, &config).result, Some(expected), "{} returned the wrong r1", asm_file);
+}
+
+// Run a `-g` image with profiling enabled.
+fn run_profiled(hex_file: &str, window: Arc<ProfileWindow>, cores: usize) -> RunResult {
+    let config = RunConfig {
+        cores,
+        sched: if cores == 1 { ScheduleMode::Free } else { ScheduleMode::RoundRobin },
+        max_cycles: if cores == 1 { SINGLE_CORE_MAX_CYCLES } else { MULTICORE_MAX_CYCLES },
+        profile: Some(window),
+        ..RunConfig::default()
+    };
+    run_hex(hex_file, &config)
 }
 
 // I/O tests that must be run manually (12):
@@ -661,24 +624,12 @@ fn carry() {
     run_test("tests/asm/carry.s", 42);
 }
 
-// Assemble a fixture with `-g` so the image carries #label metadata for the profiler.
-// `test_name` keeps the output file unique, since tests run in parallel and
-// may assemble the same fixture concurrently.
-#[cfg(test)]
+// Assemble a fixture with `-g` so the image carries #label metadata.
 fn assemble_with_symbols(asm_file: &'static str, test_name: &str) -> String {
-    ensure_hex_dir();
-    let stem = Path::new(asm_file).file_stem().unwrap().to_string_lossy().to_string();
-    let hex_file = PathBuf::from("tests/hex").join(format!("{}.{}.g.hex", stem, test_name));
-    let status = Command::new(assembler_path())
-        .args([asm_file, "-o", hex_file.to_str().unwrap(), "-kernel", "-g"])
-        .status()
-        .expect("failed to run assembler");
-    assert!(status.success(), "assembler failed");
-    hex_file.to_string_lossy().to_string()
+    assemble(asm_file, &format!(".{}.g", test_name), &["-g"])
 }
 
 // Find the report row for `name` in the profiler's function table and return its count.
-#[cfg(test)]
 fn profile_function_count(report: &str, name: &str) -> u64 {
     let row = report
         .lines()
@@ -691,12 +642,11 @@ fn profile_function_count(report: &str, name: &str) -> u64 {
 // instructions and work runs 5 * 2 = 10, with the reset jmp unsymbolized.
 #[test]
 fn profile_counts_calls() {
-    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+    use crate::emulator::profiler::{Symbols, format_report};
 
     let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_counts_calls");
-    let mut cpu = Emulator::new(hex.clone(), false, 1, None, None);
-    cpu.enable_profiling(ProfileWindow::whole_run());
-    let (result, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    let run = run_profiled(&hex, ProfileWindow::whole_run(), 1);
+    let (result, profile) = (run.result, run.profiles.into_iter().next());
     assert_eq!(result, Some(5));
 
     let symbols = Symbols::load(&[hex]).unwrap();
@@ -710,22 +660,11 @@ fn profile_counts_calls() {
 // its idle ticks must show up in the asleep column rather than as instructions.
 #[test]
 fn profile_multicore_reports_each_core() {
-    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+    use crate::emulator::profiler::{Symbols, format_report};
 
     let hex = assemble_with_symbols("tests/asm/multicore_ipi.s", "profile_multicore");
-    let (result, _, profiles) = Emulator::run_multicore_with_memory(
-        hex.clone(),
-        2,
-        ScheduleMode::RoundRobin,
-        200000,
-        false,
-        AudioMode::Disabled,
-        false,
-        1,
-        None,
-        None,
-        Some(ProfileWindow::whole_run()),
-    );
+    let run = run_profiled(&hex, ProfileWindow::whole_run(), 2);
+    let (result, profiles) = (run.result, run.profiles);
     assert_eq!(result, Some(0x42));
     assert_eq!(profiles.len(), 2, "one profile per core");
 
@@ -749,7 +688,7 @@ fn profile_multicore_reports_each_core() {
 // final halt is counted because the last bnz falls through without hitting stop.
 #[test]
 fn profile_window_limits_counts() {
-    use crate::emulator::profiler::{ProfileWindow, Symbols, WindowStart, format_report};
+    use crate::emulator::profiler::{Symbols, WindowStart, format_report};
 
     let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_window");
     let symbols = Symbols::load(std::slice::from_ref(&hex)).unwrap();
@@ -757,9 +696,8 @@ fn profile_window_limits_counts() {
     let stop = symbols.resolve_trigger("--profile-stop", "_start.loop").unwrap();
     let window = ProfileWindow::new(WindowStart::KernelPcs(start), stop, "test".to_string());
 
-    let mut cpu = Emulator::new(hex, false, 1, None, None);
-    cpu.enable_profiling(window);
-    let (result, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    let run = run_profiled(&hex, window, 1);
+    let (result, profile) = (run.result, run.profiles.into_iter().next());
     assert_eq!(result, Some(5));
 
     let report = format_report(&[profile.unwrap()], &symbols);
@@ -771,16 +709,39 @@ fn profile_window_limits_counts() {
 // Call edges on real code: work is called 5 times, all from _start.
 #[test]
 fn profile_reports_callers() {
-    use crate::emulator::profiler::{ProfileWindow, Symbols, format_report};
+    use crate::emulator::profiler::{Symbols, format_report};
 
     let hex = assemble_with_symbols("tests/asm/profile_calls.s", "profile_callers");
-    let mut cpu = Emulator::new(hex.clone(), false, 1, None, None);
-    cpu.enable_profiling(ProfileWindow::whole_run());
-    let (_, profile) = cpu.run_with_profile(10000, false, AudioMode::Disabled);
+    let run = run_profiled(&hex, ProfileWindow::whole_run(), 1);
+    let (_, profile) = (run.result, run.profiles.into_iter().next());
     let report = format_report(&[profile.unwrap()], &Symbols::load(&[hex]).unwrap());
     assert!(report.contains("work (self 10, 5 calls, 2.0 instructions/call)"), "{report}");
     assert!(
         report.lines().any(|l| l.trim_start().starts_with("5 calls") && l.ends_with("_start")),
         "all 5 calls come from _start:\n{report}"
     );
+}
+
+// asr by 0 must not sign-fill the result.
+#[test]
+fn asr_zero() {
+    run_test("tests/asm/asr_zero.s", 0x8000_0010);
+}
+
+// Immediate subb must use its immediate as the minuend.
+#[test]
+fn subb_imm() {
+    run_test("tests/asm/subb_imm.s", 42);
+}
+
+// Shift amounts above 31 saturate; rotates wrap modulo 32.
+#[test]
+fn shift_large() {
+    run_test("tests/asm/shift_large.s", 2);
+}
+
+// ALU-immediate ops without an immediate encoding raise invalid-instruction.
+#[test]
+fn alu_imm_invalid() {
+    run_test("tests/asm/alu_imm_invalid.s", 2);
 }

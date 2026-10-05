@@ -1,5 +1,6 @@
 // Decode Dioptase instruction words into canonical assembler syntax.
 
+// Sign-extend the low `bits` bits of `value`.
 fn sign_extend(value: u32, bits: u8) -> i32 {
     let shift = 32 - bits;
     ((value << shift) as i32) >> shift
@@ -25,13 +26,22 @@ fn fmt_imm_signed(value: i32) -> String {
     format!("{}", value)
 }
 
-// Map the encoded ALU operation index to its mnemonic.
-fn alu_op_name(op: u32) -> Option<&'static str> {
-    const OPS: [&str; 19] = [
+// Map the encoded ALU operation index to its mnemonic (docs/ISA.md ALU ops).
+// Immediate forms only exist for ops 0..=17.
+fn alu_op_name(op: u32, imm_form: bool) -> Option<&'static str> {
+    const OPS: [&str; 22] = [
         "and", "nand", "or", "nor", "xor", "xnor", "not", "lsl", "lsr", "asr", "rotl", "rotr",
-        "lslc", "lsrc", "add", "addc", "sub", "subb", "mul",
+        "lslc", "lsrc", "add", "addc", "sub", "subb", "sxtb", "sxtd", "tncb", "tncd",
     ];
+    if imm_form && op > 17 {
+        return None;
+    }
     OPS.get(op as usize).copied()
+}
+
+// Single-source ALU ops print as `op rA, rC`.
+fn is_unary_alu_op(op: u32) -> bool {
+    op == 6 || (18..=21).contains(&op)
 }
 
 // Map the encoded relative-branch condition to its mnemonic.
@@ -52,18 +62,17 @@ fn branch_abs_name(op: u32) -> Option<&'static str> {
     OPS.get(op as usize).copied()
 }
 
-// Decode the ALU immediate, including the packed shift-immediate forms.
-fn decode_alu_imm(op: u32, imm: u32) -> (String, bool) {
+// Format the ALU immediate: byte-lane hex for bitwise ops, a 5-bit amount
+// for shifts, and signed decimal for arithmetic.
+fn decode_alu_imm(op: u32, imm: u32) -> String {
     if op <= 6 {
         let shift = 8 * ((imm >> 8) & 3);
-        let value = (imm & 0xFF) << shift;
-        return (fmt_imm_hex(value), true);
+        return fmt_imm_hex((imm & 0xFF) << shift);
     }
     if op <= 13 {
-        return (format!("{}", imm & 0x1F), false);
+        return format!("{}", imm & 0x1F);
     }
-    let value = sign_extend(imm & 0xFFF, 12);
-    (fmt_imm_signed(value), false)
+    fmt_imm_signed(sign_extend(imm & 0xFFF, 12))
 }
 
 // Disassemble an ALU instruction whose operands are registers.
@@ -73,11 +82,11 @@ fn disassemble_alu_reg(instr: u32) -> String {
     let r_c = instr & 0x1F;
     let op = (instr >> 5) & 0x1F;
 
-    let Some(name) = alu_op_name(op) else {
+    let Some(name) = alu_op_name(op, false) else {
         return format!("data {}", fmt_imm_hex(instr));
     };
 
-    if op == 6 {
+    if is_unary_alu_op(op) {
         return format!("{} {}, {}", name, reg_name(r_a), reg_name(r_c));
     }
 
@@ -101,11 +110,11 @@ fn disassemble_alu_imm(instr: u32) -> String {
     let op = (instr >> 12) & 0x1F;
     let imm = instr & 0xFFF;
 
-    let Some(name) = alu_op_name(op) else {
+    let Some(name) = alu_op_name(op, true) else {
         return format!("data {}", fmt_imm_hex(instr));
     };
 
-    let (imm_str, _is_hex) = decode_alu_imm(op, imm);
+    let imm_str = decode_alu_imm(op, imm);
 
     if op == 6 {
         return format!("{} {}, {}", name, reg_name(r_a), imm_str);
@@ -386,6 +395,14 @@ mod tests {
     fn disassembles_eoi_all() {
         let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
         assert_eq!(disassemble(instr), "eoi all");
+    }
+
+    // Name the sign-extend/truncate ops (op 18 used to print as `mul`).
+    #[test]
+    fn disassembles_extend_and_truncate_ops() {
+        assert_eq!(disassemble((2 << 22) | 3 | (18 << 5)), "sxtb r2, r3");
+        assert_eq!(disassemble((2 << 22) | 3 | (21 << 5)), "tncd r2, r3");
+        assert_eq!(disassemble(0x08812000), "data 0x08812000");
     }
 
     // Keep the reserved alternate RFE encoding visible as raw data.

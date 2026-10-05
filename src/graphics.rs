@@ -1,21 +1,22 @@
+// Host window for the VGA device (`--vga`) and host keyboard translation into
+// the guest PS/2 key-event stream (docs/mem_map.md "PS/2 keyboard").
+
 use ::image::{ImageBuffer, Rgba};
 use piston_window::*;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 
 use crate::memory::*;
 
-const SCREEN_WIDTH: u32 = 640;
-const SCREEN_HEIGHT: u32 = 480;
 // Scale the host window without changing logical resolution.
 const DISPLAY_SCALE: u32 = 2;
-const WINDOW_WIDTH: u32 = SCREEN_WIDTH * DISPLAY_SCALE;
-const WINDOW_HEIGHT: u32 = SCREEN_HEIGHT * DISPLAY_SCALE;
+const WINDOW_WIDTH: u32 = FRAME_WIDTH * DISPLAY_SCALE;
+const WINDOW_HEIGHT: u32 = FRAME_HEIGHT * DISPLAY_SCALE;
 
 // Guest-visible PS/2 keycode contract:
 // - bit 8 is the release flag
@@ -341,70 +342,53 @@ impl GuestKeyboardMapper {
     }
 }
 
-// Expand an 8-bit sprite/tile color into 4-bit RGB channels.
-// Returns (r4, g4, b4) in 0..=15.
+// Expand an 8-bit RGB332 tile color into 4-bit RGB channels (0..=15).
 fn expand_rgb332(color: u8) -> (u8, u8, u8) {
     let r3 = (color >> 5) & 0x7;
     let g3 = (color >> 2) & 0x7;
     let b2 = color & 0x3;
-    let r4 = (r3 << 1) | (r3 >> 2);
-    let g4 = (g3 << 1) | (g3 >> 2);
-    let b4 = (b2 << 2) | b2;
-    (r4, g4, b4)
+    ((r3 << 1) | (r3 >> 2), (g3 << 1) | (g3 >> 2), (b2 << 2) | b2)
 }
 
-// Decode a signed 16-bit scroll offset from two MMIO bytes.
-// (low, high) bytes in little-endian order.
-// Signed pixel offset.
-fn decode_scroll_offset(pair: (u8, u8)) -> i32 {
-    i32::from(i16::from_le_bytes([pair.0, pair.1]))
+// Convert a packed 12-bit `0x0BGR` pixel into an opaque host pixel.
+fn bgr12_to_rgba(pixel: u16) -> Rgba<u8> {
+    let channel = |shift: u16| ((pixel >> shift) & 0xF) as u8 * 16;
+    Rgba([channel(0), channel(4), channel(8), 255])
 }
 
-// Owns the guest framebuffer layers and their host-window presentation state.
+// Read a signed 16-bit VGA scroll register.
+fn scroll_offset(reg: &AtomicU16) -> i32 {
+    i32::from(reg.load(Ordering::SeqCst) as i16)
+}
+
+// Write a logical pixel as a `scale` x `scale` block, clipped to the screen.
+fn put_scaled(buffer: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, x: u32, y: u32, scale: u32, pixel: Rgba<u8>) {
+    for dy in 0..scale {
+        for dx in 0..scale {
+            let (sx, sy) = (x * scale + dx, y * scale + dy);
+            if sx < FRAME_WIDTH && sy < FRAME_HEIGHT {
+                buffer.put_pixel(sx, sy, pixel);
+            }
+        }
+    }
+}
+
+// Owns the host window and composites the guest VGA layers into it. Runs on
+// the main thread; reads VGA state from `memory` while cores keep running,
+// so a frame may mix state from slightly different instants (as on hardware).
 pub struct Graphics {
     window: PistonWindow,
     buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    texture_context: G2dTextureContext,
     texture: G2dTexture,
-    pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
-    tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
-    tile_map: Arc<RwLock<TileMap>>,
-    io_buffer: Arc<RwLock<VecDeque<u16>>>,
-    input_pending: Arc<AtomicBool>,
-    tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
-    tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
-    pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
-    pixel_hscroll_register: Arc<RwLock<(u8, u8)>>,
-    tile_scale_register: Arc<RwLock<u8>>,
-    pixel_scale_register: Arc<RwLock<u8>>,
-    sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
-    vga_status_register: Arc<RwLock<u8>>,
-    vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-    pending_interrupt: Arc<AtomicU32>,
-    sprite_map: Arc<RwLock<SpriteMap>>,
+    memory: Arc<Memory>,
     keyboard_mapper: GuestKeyboardMapper,
     keyboard_debug: bool,
 }
 
 impl Graphics {
-    // Create empty tile and pixel layers at the guest display resolution.
-    pub fn new(
-        pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
-        tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
-        tile_map: Arc<RwLock<TileMap>>,
-        io_buffer: Arc<RwLock<VecDeque<u16>>>,
-        input_pending: Arc<AtomicBool>,
-        tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
-        tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
-        pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
-        pixel_hscroll_register: Arc<RwLock<(u8, u8)>>,
-        sprite_map: Arc<RwLock<SpriteMap>>,
-        tile_scale_register: Arc<RwLock<u8>>,
-        pixel_scale_register: Arc<RwLock<u8>>,
-        sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
-        vga_status_register: Arc<RwLock<u8>>,
-        vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-        pending_interrupt: Arc<AtomicU32>,
-    ) -> Graphics {
+    // Open the host window for `memory`'s VGA device.
+    pub fn new(memory: Arc<Memory>) -> Graphics {
         let mut window: PistonWindow =
             WindowSettings::new("Dioptase", [WINDOW_WIDTH, WINDOW_HEIGHT])
                 .exit_on_esc(true)
@@ -414,8 +398,9 @@ impl Graphics {
         window.set_ups(60);
 
         let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(FRAME_WIDTH, FRAME_HEIGHT);
+        let mut texture_context = window.create_texture_context();
         let texture = Texture::from_image(
-            &mut window.create_texture_context(),
+            &mut texture_context,
             &buffer,
             &TextureSettings::new().filter(Filter::Nearest),
         )
@@ -424,48 +409,32 @@ impl Graphics {
         Graphics {
             window,
             buffer,
+            texture_context,
             texture,
-            pixel_frame_buffer,
-            tile_frame_buffer,
-            tile_map,
-            io_buffer,
-            input_pending,
-            tile_vscroll_register,
-            tile_hscroll_register,
-            pixel_vscroll_register,
-            pixel_hscroll_register,
-            sprite_map,
-            tile_scale_register,
-            pixel_scale_register,
-            sprite_scale_registers,
-            vga_status_register,
-            vga_frame_register,
-            pending_interrupt,
+            memory,
             keyboard_mapper: GuestKeyboardMapper::new(),
             keyboard_debug: std::env::var_os("PS2_DEBUG").is_some(),
         }
     }
 
-    // Enter the window event/render loop until the emulator finishes.
-    pub fn start(&mut self, finished: Arc<Mutex<bool>>, stay_open: bool) {
+    // Run the window event/render loop until the user closes the window or
+    // the emulator sets `stop`.
+    pub fn start(&mut self, stop: Arc<AtomicBool>) {
         while let Some(event) = self.window.next() {
             match event {
-                Event::Loop(Loop::Update(_args)) => {
-                    // Automatically closes window on program finish
-                    if !stay_open && *finished.lock().unwrap() {
+                Event::Loop(Loop::Update(_)) => {
+                    if stop.load(Ordering::SeqCst) {
                         self.window.set_should_close(true);
                     }
                     self.update();
                 }
-                Event::Loop(Loop::Render(_args)) => {
-                    self.window.draw_2d(&event, |context, graphics, _| {
-                        clear([0.0; 4], graphics); // black background
+                Event::Loop(Loop::Render(_)) => {
+                    self.window.draw_2d(&event, |context, graphics, device| {
+                        // Submit the texture upload queued by `update`.
+                        self.texture_context.encoder.flush(device);
+                        clear([0.0; 4], graphics);
                         let scale = DISPLAY_SCALE as f64;
-                        image(
-                            &self.texture,
-                            context.transform.scale(scale, scale),
-                            graphics,
-                        );
+                        image(&self.texture, context.transform.scale(scale, scale), graphics);
                     });
                 }
                 Event::Input(
@@ -477,227 +446,129 @@ impl Graphics {
                     _,
                 ) => {
                     if self.keyboard_debug {
-                        eprintln!(
-                            "ps2 host button: key={key:?} state={state:?} scancode={scancode:?}"
-                        );
+                        eprintln!("ps2 host button: key={key:?} state={state:?} scancode={scancode:?}");
                     }
-                    if let Some(event_code) =
-                        self.keyboard_mapper.translate_button(key, state, scancode)
-                    {
-                        if self.keyboard_debug {
-                            eprintln!("ps2 guest event: 0x{event_code:04X}");
-                        }
-                        self.io_buffer.write().unwrap().push_back(event_code);
-                        self.input_pending.store(true, Ordering::SeqCst);
-                    }
+                    let event_code = self.keyboard_mapper.translate_button(key, state, scancode);
+                    self.deliver_key(event_code);
                 }
                 Event::Input(Input::Text(text), _) => {
                     if self.keyboard_debug {
                         eprintln!("ps2 host text: {text:?}");
                     }
-                    if let Some(event_code) = self.keyboard_mapper.translate_text(&text) {
-                        if self.keyboard_debug {
-                            eprintln!("ps2 guest event: 0x{event_code:04X}");
-                        }
-                        self.io_buffer.write().unwrap().push_back(event_code);
-                        self.input_pending.store(true, Ordering::SeqCst);
-                    }
+                    let event_code = self.keyboard_mapper.translate_text(&text);
+                    self.deliver_key(event_code);
                 }
-                Event::Input(Input::Focus(false), _) => {
-                    self.keyboard_mapper.clear();
-                }
+                Event::Input(Input::Focus(false), _) => self.keyboard_mapper.clear(),
                 _ => {}
             }
         }
     }
 
-    // Apply the tile-layer changes reported by the guest MMIO state.
-    fn tile_layer_update(&mut self) {
-        // draw the tile layer over the pixel layer
-        let fb = self.tile_frame_buffer.read().unwrap();
-        let tile_map = self.tile_map.read().unwrap();
-        let scale = 1 << (*self.tile_scale_register.read().unwrap() as u32);
-        for x in 0..fb.width_tiles {
-            for y in 0..fb.height_tiles {
-                let (tile_ptr, tile_color) = fb.get_tile_entry(x, y);
-                let tile = &tile_map.tiles[tile_ptr as usize];
-                for px in 0..TILE_WIDTH {
-                    for py in 0..TILE_WIDTH {
+    // Queue a translated key event for the guest.
+    fn deliver_key(&self, event_code: Option<u16>) {
+        if let Some(event_code) = event_code {
+            if self.keyboard_debug {
+                eprintln!("ps2 guest event: 0x{event_code:04X}");
+            }
+            self.memory.push_input(event_code);
+        }
+    }
+
+    // Draw the pixel layer (background). Pixel scale has an implicit +1 so
+    // n = 0 doubles 320x240 to fill 640x480.
+    fn draw_pixel_layer(&mut self) {
+        let vga = self.memory.vga();
+        let scale = 1 << (u32::from(vga.pixel_scale.load(Ordering::SeqCst)) + 1);
+        let (scroll_x, scroll_y) = (scroll_offset(&vga.pixel_hscroll), scroll_offset(&vga.pixel_vscroll));
+        let fb = vga.pixel_frame_buffer.read().unwrap();
+        for y in 0..PIXEL_FRAME_HEIGHT {
+            for x in 0..PIXEL_FRAME_WIDTH {
+                let idx = 2 * (x + y * PIXEL_FRAME_WIDTH) as usize;
+                let pixel = bgr12_to_rgba(u16::from_le_bytes([fb[idx], fb[idx + 1]]));
+                // Signed scroll wraps with Euclidean modulo so large negative
+                // offsets keep wrapping correctly.
+                let fx = (x as i32 + scroll_x).rem_euclid(FRAME_WIDTH as i32) as u32;
+                let fy = (y as i32 + scroll_y).rem_euclid(FRAME_HEIGHT as i32) as u32;
+                put_scaled(&mut self.buffer, fx, fy, scale, pixel);
+            }
+        }
+    }
+
+    // Draw the tile layer over the pixel layer. 0xFXXX tile pixels are
+    // transparent and 0xCXXX pixels take the entry's RGB332 tile color.
+    fn draw_tile_layer(&mut self) {
+        let vga = self.memory.vga();
+        let scale = 1 << u32::from(vga.tile_scale.load(Ordering::SeqCst));
+        let (scroll_x, scroll_y) = (scroll_offset(&vga.tile_hscroll), scroll_offset(&vga.tile_vscroll));
+        let fb = vga.tile_frame_buffer.read().unwrap();
+        let tile_map = vga.tile_map.read().unwrap();
+        for ty in 0..TILE_FB_HEIGHT_TILES {
+            for tx in 0..TILE_FB_WIDTH_TILES {
+                let entry = 2 * (tx + ty * TILE_FB_WIDTH_TILES) as usize;
+                let (tile_index, tile_color) = (fb[entry] as usize, fb[entry + 1]);
+                let tile = &tile_map[tile_index * TILE_SIZE as usize..][..TILE_SIZE as usize];
+                for py in 0..TILE_WIDTH {
+                    for px in 0..TILE_WIDTH {
                         let addr = (2 * (px + py * TILE_WIDTH)) as usize;
-                        let tile_pixel_low = tile.pixels[addr];
-                        let tile_pixel_high = tile.pixels[addr + 1];
-                        // 0xFXXX pixels are transparent in the tile layer.
-                        let transparent = (tile_pixel_high & 0xf0) == 0xf0;
-                        if transparent {
-                            continue;
-                        }
-                        let use_tile_color = (tile_pixel_high & 0xf0) == 0xc0;
-                        let (red, green, blue) = if use_tile_color {
-                            let (r4, g4, b4) = expand_rgb332(tile_color);
-                            (r4 * 16, g4 * 16, b4 * 16)
-                        } else {
-                            (
-                                (tile_pixel_low & 0x0f) as u8 * 16,
-                                ((tile_pixel_low & 0xf0) >> 4) as u8 * 16,
-                                (tile_pixel_high & 0x0f) as u8 * 16,
-                            )
+                        let raw = u16::from_le_bytes([tile[addr], tile[addr + 1]]);
+                        let pixel = match raw >> 12 {
+                            0xF => continue,
+                            0xC => {
+                                let (r, g, b) = expand_rgb332(tile_color);
+                                Rgba([r * 16, g * 16, b * 16, 255])
+                            }
+                            _ => bgr12_to_rgba(raw),
                         };
-                        let pixel = Rgba([red, green, blue, 255]);
-
-                        // positions in the logical screen
-                        let scroll_x_pair = *self.tile_hscroll_register.read().unwrap();
-                        let scroll_y_pair = *self.tile_vscroll_register.read().unwrap();
-                        let scroll_x = decode_scroll_offset(scroll_x_pair);
-                        let scroll_y = decode_scroll_offset(scroll_y_pair);
-                        let raw_x: i32 = (x * TILE_WIDTH) as i32 + px as i32 + scroll_x;
-                        let raw_y: i32 = (y * TILE_WIDTH) as i32 + py as i32 + scroll_y;
-                        // Scroll registers are signed; use Euclidean modulo so large negative
-                        // offsets continue wrapping correctly after many screens of scroll.
-                        let final_x: u32 = raw_x.rem_euclid(FRAME_WIDTH as i32) as u32;
-                        let final_y: u32 = raw_y.rem_euclid(FRAME_HEIGHT as i32) as u32;
-
-                        // print the pixel rgba in the physical screen
-                        for i in 0..scale {
-                            for j in 0..scale {
-                                let screen_x: u32 = final_x * scale + i;
-                                let screen_y: u32 = final_y * scale + j;
-
-                                if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
-                                    self.buffer.put_pixel(screen_x, screen_y, pixel);
-                                }
-                            }
-                        }
+                        let raw_x = (tx * TILE_WIDTH + px) as i32 + scroll_x;
+                        let raw_y = (ty * TILE_WIDTH + py) as i32 + scroll_y;
+                        let fx = raw_x.rem_euclid(FRAME_WIDTH as i32) as u32;
+                        let fy = raw_y.rem_euclid(FRAME_HEIGHT as i32) as u32;
+                        put_scaled(&mut self.buffer, fx, fy, scale, pixel);
                     }
                 }
             }
         }
     }
 
-    // Apply the pixel-layer changes reported by the guest MMIO state.
-    fn pixel_layer_update(&mut self) {
-        // draw the pixel layer as the background
-        let fb = self.pixel_frame_buffer.read().unwrap();
-        // Pixel layer uses an exponent with an implicit +1 so that:
-        // n=0 -> 2x, n=1 -> 4x, matching 320x240 -> 640x480 at n=0.
-        let scale = 1 << ((*self.pixel_scale_register.read().unwrap() as u32) + 1);
-        for x in 0..fb.width_pixels {
-            for y in 0..fb.height_pixels {
-                let pixel = fb.get_pixel(x, y);
-                let red = (pixel & 0x0F) as u8 * 16;
-                let green = ((pixel & 0xF0) >> 4) as u8 * 16;
-                let blue = ((pixel & 0xF00) >> 8) as u8 * 16;
-                let pixel = Rgba([red, green, blue, 255]);
-
-                // positions in the logical screen
-                let scroll_x_pair = *self.pixel_hscroll_register.read().unwrap();
-                let scroll_y_pair = *self.pixel_vscroll_register.read().unwrap();
-                let scroll_x = decode_scroll_offset(scroll_x_pair);
-                let scroll_y = decode_scroll_offset(scroll_y_pair);
-                let raw_x: i32 = x as i32 + scroll_x;
-                let raw_y: i32 = y as i32 + scroll_y;
-                // Scroll registers are signed; use Euclidean modulo so large negative
-                // offsets continue wrapping correctly after many screens of scroll.
-                let final_x: u32 = raw_x.rem_euclid(FRAME_WIDTH as i32) as u32;
-                let final_y: u32 = raw_y.rem_euclid(FRAME_HEIGHT as i32) as u32;
-
-                // print the pixel rgba in the physical screen
-                for i in 0..scale {
-                    for j in 0..scale {
-                        let screen_x: u32 = final_x * scale + i;
-                        let screen_y: u32 = final_y * scale + j;
-
-                        if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
-                            self.buffer.put_pixel(screen_x, screen_y, pixel);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Redraw the host window from the current guest framebuffer layers.
-    fn update(&mut self) {
-        // set status to busy
-        *self.vga_status_register.write().unwrap() = 0;
-
-        // Updates buffer from emulated frame buffers and tile map.
-        self.pixel_layer_update();
-        self.tile_layer_update();
-
-        // draw the sprites of the sprite map
-        let sprite_map = self.sprite_map.read().unwrap();
-        let sprite_scales = self.sprite_scale_registers.read().unwrap();
-        for (sprite_index, sprite) in sprite_map.sprites.iter().enumerate() {
-            let scale = 1 << (sprite_scales.get(sprite_index).copied().unwrap_or(0) as u32);
-            // Sprite coordinates are signed 16-bit little-endian MMIO values.
-            let sprite_x = i32::from(i16::from_le_bytes([sprite.x.0, sprite.x.1]));
-            let sprite_y = i32::from(i16::from_le_bytes([sprite.y.0, sprite.y.1]));
-            for px in 0..SPRITE_WIDTH {
-                for py in 0..SPRITE_WIDTH {
+    // Draw the sprites on top; later sprites overlap earlier ones. Sprite
+    // coordinates are signed and pixels left of / above the screen are clipped.
+    fn draw_sprites(&mut self) {
+        let vga = self.memory.vga();
+        let sprites = vga.sprite_pixels.read().unwrap();
+        for index in 0..SPRITE_COUNT {
+            let scale = 1 << u32::from(vga.sprite_scales[index].load(Ordering::SeqCst));
+            let coords = vga.sprite_coords[index].load(Ordering::SeqCst);
+            let (sprite_x, sprite_y) = (i32::from(coords as u16 as i16), i32::from((coords >> 16) as u16 as i16));
+            let pixels = &sprites[index * SPRITE_SIZE as usize..][..SPRITE_SIZE as usize];
+            for py in 0..SPRITE_WIDTH {
+                for px in 0..SPRITE_WIDTH {
                     let addr = (2 * (px + py * SPRITE_WIDTH)) as usize;
-                    let tile_pixel_low = sprite.pixels[addr];
-                    let tile_pixel_high = sprite.pixels[addr + 1];
-                    let red = (tile_pixel_low & 0x0f) as u8 * 16;
-                    let green = ((tile_pixel_low & 0xf0) >> 4) as u8 * 16;
-                    let blue = (tile_pixel_high & 0x0f) as u8 * 16;
-                    let transparent = (tile_pixel_high & 0xf0) == 0xf0;
-                    if transparent {
+                    let raw = u16::from_le_bytes([pixels[addr], pixels[addr + 1]]);
+                    let (x, y) = (sprite_x + px as i32, sprite_y + py as i32);
+                    if raw >> 12 == 0xF || x < 0 || y < 0 {
                         continue;
                     }
-
-                    let pixel = Rgba([red, green, blue, 255]);
-                    // Reconstruct the full coordinate before adding the per-pixel offset so carry
-                    // from the low byte is preserved (the previous bytewise OR math dropped carry).
-                    let final_x = sprite_x + px as i32;
-                    let final_y = sprite_y + py as i32;
-                    if final_x < 0 || final_y < 0 {
-                        continue;
-                    }
-                    let final_x = final_x as u32;
-                    let final_y = final_y as u32;
-
-                    // print the pixel rgba in the physical screen
-                    for i in 0..scale {
-                        for j in 0..scale {
-                            let screen_x: u32 = final_x * scale + i;
-                            let screen_y: u32 = final_y * scale + j;
-
-                            if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
-                                self.buffer.put_pixel(screen_x, screen_y, pixel);
-                            }
-                        }
-                    }
+                    put_scaled(&mut self.buffer, x as u32, y as u32, scale, bgr12_to_rgba(raw));
                 }
             }
         }
+    }
 
-        // increment frame register
-        let mut vga_frame_register = self.vga_frame_register.write().unwrap();
-        vga_frame_register.0 = vga_frame_register.0.wrapping_add(1);
-        if vga_frame_register.0 == 0 {
-            vga_frame_register.1 = vga_frame_register.1.wrapping_add(1);
-            if vga_frame_register.1 == 0 {
-                vga_frame_register.2 = vga_frame_register.2.wrapping_add(1);
-                if vga_frame_register.2 == 0 {
-                    vga_frame_register.3 = vga_frame_register.3.wrapping_add(1);
-                }
-            }
-        }
-
-        // Updates texture from buffer
-        self.texture = Texture::from_image(
-            &mut self.window.create_texture_context(),
-            &self.buffer,
-            &TextureSettings::new().filter(Filter::Nearest),
-        )
-        .unwrap();
-
-        // set status to idle
-        *self.vga_status_register.write().unwrap() = 3;
-
-        // send vblank interrupt
-        self.pending_interrupt
-            .fetch_or(VGA_INTERRUPT_BIT, Ordering::SeqCst);
+    // Composite one frame, advance the frame counter, and raise vblank.
+    fn update(&mut self) {
+        let vga = self.memory.vga();
+        // VGA status: 0 = drawing, 3 = idle (vblank).
+        vga.status.store(0, Ordering::SeqCst);
+        self.draw_pixel_layer();
+        self.draw_tile_layer();
+        self.draw_sprites();
+        let vga = self.memory.vga();
+        vga.frame.fetch_add(1, Ordering::SeqCst);
+        self.texture
+            .update(&mut self.texture_context, &self.buffer)
+            .unwrap();
+        vga.status.store(3, Ordering::SeqCst);
+        self.memory.raise_pending_interrupt(VGA_INTERRUPT_BIT);
     }
 }
 

@@ -8,34 +8,144 @@ pub mod disassembler;
 pub mod emulator;
 pub mod graphics;
 pub mod memory;
-pub mod tests;
+#[cfg(test)]
+mod tests;
 
+use audio::AudioMode;
 use emulator::profiler::{CoreProfile, ProfileWindow, Symbols, WindowStart, write_report};
-use emulator::{AudioMode, Emulator, ScheduleMode, set_trace_interrupts};
-use memory::SdSlot;
+use emulator::{Emulator, RunConfig, ScheduleMode, run_program, set_trace_interrupts};
+use memory::{Memory, SdSlot};
 
 const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N] [--profile <report.txt>] [--symbols <file.hex>]... [--profile-start user|<label>|0xADDR] [--profile-stop <label>|0xADDR]";
 
-// Print usage and exit.
-fn print_usage_and_exit() -> ! {
-    println!("{}", USAGE);
+// Print an error and exit with status 1.
+fn fail(message: impl std::fmt::Display) -> ! {
+    println!("{}", message);
     process::exit(1);
 }
 
-fn write_sd_export<F>(path: Option<&str>, slot: SdSlot, dump_image: F)
-where
-    F: FnOnce() -> Vec<u8>,
-{
-    if let Some(path) = path {
-        let image = dump_image();
-        fs::write(path, image).unwrap_or_else(|err| {
-            let slot_name = match slot {
-                SdSlot::Sd0 => "SD0",
-                SdSlot::Sd1 => "SD1",
-            };
-            println!("Failed to write {} image {}: {}", slot_name, path, err);
-            process::exit(1);
-        });
+// Parse a numeric flag value or exit naming the flag.
+fn parse_number<T: std::str::FromStr>(flag: &str, value: &str) -> T {
+    value
+        .parse()
+        .unwrap_or_else(|_| fail(format!("Invalid value for {}: {}", flag, value)))
+}
+
+// Command-line options after parsing.
+struct Options {
+    config: RunConfig,
+    debug: bool,
+    debugc: bool,
+    trace_interrupts: bool,
+    ram_path: String,
+    sd0_path: Option<String>,
+    sd1_path: Option<String>,
+    sd0_out_path: Option<String>,
+    sd1_out_path: Option<String>,
+    profile_path: Option<String>,
+    symbol_paths: Vec<String>,
+    profile_start: Option<String>,
+    profile_stop: Option<String>,
+}
+
+// Parse argv. Value flags accept `--flag value` and `--flag=value`;
+// positional arguments fill the RAM image, then SD0, then SD1.
+fn parse_args(args: &[String]) -> Options {
+    let mut config = RunConfig::default();
+    let (mut debug, mut debugc, mut trace_interrupts) = (false, false, false);
+    let mut audio_flag: Option<&str> = None;
+    let mut ram_path = None;
+    let (mut sd0_path, mut sd1_path, mut sd0_out_path, mut sd1_out_path) = (None, None, None, None);
+    let (mut profile_path, mut profile_start, mut profile_stop) = (None, None, None);
+    let mut symbol_paths = Vec::new();
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let (flag, inline_value) = match arg.split_once('=') {
+            Some((flag, value)) if arg.starts_with("--") => (flag, Some(value.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let mut value = || {
+            inline_value
+                .clone()
+                .or_else(|| iter.next().cloned())
+                .unwrap_or_else(|| fail(format!("Missing value for {}", flag)))
+        };
+        match flag {
+            "--vga" => config.with_graphics = true,
+            "--audio" | "--audio-fast" => {
+                if audio_flag.is_some_and(|prev| prev != flag) {
+                    fail("Error: --audio and --audio-fast are mutually exclusive");
+                }
+                audio_flag = Some(if flag == "--audio" { "--audio" } else { "--audio-fast" });
+                config.audio_mode = if flag == "--audio" { AudioMode::Emulated } else { AudioMode::Fast };
+            }
+            "--uart" => config.use_uart_rx = true,
+            "--debug" => debug = true,
+            "--debugc" => debugc = true,
+            "--trace-ints" | "--trace-interrupts" => trace_interrupts = true,
+            "--cores" => config.cores = parse_number(flag, &value()),
+            "--sched" => {
+                let token = value();
+                config.sched = ScheduleMode::parse(&token)
+                    .unwrap_or_else(|| fail(format!("Unknown scheduler mode: {}", token)));
+            }
+            "--max-cycles" => config.max_cycles = parse_number(flag, &value()),
+            "--sd-dma-ticks" => config.sd_dma_ticks_per_word = parse_number(flag, &value()),
+            "--ram" => ram_path = Some(value()),
+            "--sd0" => sd0_path = Some(value()),
+            "--sd1" => sd1_path = Some(value()),
+            "--sd0-out" => sd0_out_path = Some(value()),
+            "--sd1-out" => sd1_out_path = Some(value()),
+            "--profile" => profile_path = Some(value()),
+            "--symbols" => symbol_paths.push(value()),
+            "--profile-start" => profile_start = Some(value()),
+            "--profile-stop" => profile_stop = Some(value()),
+            _ if flag.starts_with('-') => fail(format!("Unknown flag: {}", arg)),
+            _ => {
+                let slot = [&mut ram_path, &mut sd0_path, &mut sd1_path]
+                    .into_iter()
+                    .find(|slot| slot.is_none())
+                    .unwrap_or_else(|| fail(USAGE));
+                *slot = Some(arg.clone());
+            }
+        }
+    }
+
+    Options {
+        config,
+        debug,
+        debugc,
+        trace_interrupts,
+        ram_path: ram_path.unwrap_or_else(|| fail(USAGE)),
+        sd0_path,
+        sd1_path,
+        sd0_out_path,
+        sd1_out_path,
+        profile_path,
+        symbol_paths,
+        profile_start,
+        profile_stop,
+    }
+}
+
+// Read an SD image named by --sd0/--sd1.
+fn read_sd_image(path: &Option<String>, name: &str) -> Option<Vec<u8>> {
+    path.as_ref().map(|path| {
+        fs::read(path).unwrap_or_else(|err| fail(format!("Failed to read {} image {}: {}", name, path, err)))
+    })
+}
+
+// Write the final SD images requested by --sd0-out/--sd1-out.
+fn write_sd_exports(options: &Options, dump: impl Fn(SdSlot) -> Vec<u8>) {
+    for (path, slot, name) in [
+        (&options.sd0_out_path, SdSlot::Sd0, "SD0"),
+        (&options.sd1_out_path, SdSlot::Sd1, "SD1"),
+    ] {
+        if let Some(path) = path {
+            fs::write(path, dump(slot))
+                .unwrap_or_else(|err| fail(format!("Failed to write {} image {}: {}", name, path, err)));
+        }
     }
 }
 
@@ -82,397 +192,88 @@ fn build_profile_window(
     Ok(ProfileWindow::new(start_kind, stop_pcs, description))
 }
 
-// Configure devices and scheduling from command-line options, then run the emulator.
+// Configure devices and scheduling from command-line options, then run the
+// emulator (or one of the interactive debuggers).
 fn main() {
     let args = env::args().collect::<Vec<_>>();
+    let mut options = parse_args(&args);
+    let sd0_image = read_sd_image(&options.sd0_path, "SD0");
+    let sd1_image = read_sd_image(&options.sd1_path, "SD1");
 
-    let mut with_graphics = false;
-    let mut audio_mode = AudioMode::Disabled;
-    let mut use_uart_rx = false;
-    let mut debug = false;
-    let mut debugc = false;
-    let mut trace_interrupts = false;
-    let mut cores: usize = 1;
-    let mut sched = ScheduleMode::Free;
-    let mut max_cycles: u32 = 0;
-    let mut sd_dma_ticks_per_word: u32 = 1;
-    let mut ram_path: Option<String> = None;
-    let mut sd0_path: Option<String> = None;
-    let mut sd1_path: Option<String> = None;
-    let mut sd0_out_path: Option<String> = None;
-    let mut sd1_out_path: Option<String> = None;
-    let mut profile_path: Option<String> = None;
-    let mut symbol_paths: Vec<String> = Vec::new();
-    let mut profile_start: Option<String> = None;
-    let mut profile_stop: Option<String> = None;
-
-    let mut iter = args.iter().skip(1).peekable();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--vga" => with_graphics = true,
-            "--audio" => {
-                if audio_mode == AudioMode::Fast {
-                    println!("Error: --audio and --audio-fast are mutually exclusive");
-                    process::exit(1);
-                }
-                audio_mode = AudioMode::Emulated;
-            }
-            "--audio-fast" => {
-                if audio_mode == AudioMode::Emulated {
-                    println!("Error: --audio and --audio-fast are mutually exclusive");
-                    process::exit(1);
-                }
-                audio_mode = AudioMode::Fast;
-            }
-            "--uart" => use_uart_rx = true,
-            "--debug" => debug = true,
-            "--debugc" => debugc = true,
-            "--trace-ints" | "--trace-interrupts" => trace_interrupts = true,
-            "--cores" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --cores");
-                    process::exit(1);
-                });
-                cores = value.parse::<usize>().unwrap_or_else(|_| {
-                    println!("Invalid core count: {}", value);
-                    process::exit(1);
-                });
-            }
-            "--sched" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sched");
-                    process::exit(1);
-                });
-                sched = ScheduleMode::parse(value).unwrap_or_else(|| {
-                    println!("Unknown scheduler mode: {}", value);
-                    process::exit(1);
-                });
-            }
-            "--max-cycles" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --max-cycles");
-                    process::exit(1);
-                });
-                max_cycles = value.parse::<u32>().unwrap_or_else(|_| {
-                    println!("Invalid max cycle count: {}", value);
-                    process::exit(1);
-                });
-            }
-            "--sd-dma-ticks" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sd-dma-ticks");
-                    process::exit(1);
-                });
-                sd_dma_ticks_per_word = value.parse::<u32>().unwrap_or_else(|_| {
-                    println!("Invalid SD DMA tick count: {}", value);
-                    process::exit(1);
-                });
-            }
-            "--ram" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --ram");
-                    process::exit(1);
-                });
-                ram_path = Some(value.clone());
-            }
-            "--sd0" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sd0");
-                    process::exit(1);
-                });
-                sd0_path = Some(value.clone());
-            }
-            "--sd1" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sd1");
-                    process::exit(1);
-                });
-                sd1_path = Some(value.clone());
-            }
-            "--sd0-out" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sd0-out");
-                    process::exit(1);
-                });
-                sd0_out_path = Some(value.clone());
-            }
-            "--sd1-out" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --sd1-out");
-                    process::exit(1);
-                });
-                sd1_out_path = Some(value.clone());
-            }
-            "--profile" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --profile");
-                    process::exit(1);
-                });
-                profile_path = Some(value.clone());
-            }
-            "--symbols" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --symbols");
-                    process::exit(1);
-                });
-                symbol_paths.push(value.clone());
-            }
-            "--profile-start" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --profile-start");
-                    process::exit(1);
-                });
-                profile_start = Some(value.clone());
-            }
-            "--profile-stop" => {
-                let value = iter.next().unwrap_or_else(|| {
-                    println!("Missing value for --profile-stop");
-                    process::exit(1);
-                });
-                profile_stop = Some(value.clone());
-            }
-            _ if arg.starts_with("--profile-start=") => {
-                profile_start = Some(arg["--profile-start=".len()..].to_string());
-            }
-            _ if arg.starts_with("--profile-stop=") => {
-                profile_stop = Some(arg["--profile-stop=".len()..].to_string());
-            }
-            _ if arg.starts_with("--profile=") => {
-                profile_path = Some(arg["--profile=".len()..].to_string());
-            }
-            _ if arg.starts_with("--symbols=") => {
-                symbol_paths.push(arg["--symbols=".len()..].to_string());
-            }
-            _ if arg.starts_with("--cores=") => {
-                let value = &arg["--cores=".len()..];
-                cores = value.parse::<usize>().unwrap_or_else(|_| {
-                    println!("Invalid core count: {}", value);
-                    process::exit(1);
-                });
-            }
-            _ if arg.starts_with("--sched=") => {
-                let value = &arg["--sched=".len()..];
-                sched = ScheduleMode::parse(value).unwrap_or_else(|| {
-                    println!("Unknown scheduler mode: {}", value);
-                    process::exit(1);
-                });
-            }
-            _ if arg.starts_with("--max-cycles=") => {
-                let value = &arg["--max-cycles=".len()..];
-                max_cycles = value.parse::<u32>().unwrap_or_else(|_| {
-                    println!("Invalid max cycle count: {}", value);
-                    process::exit(1);
-                });
-            }
-            _ if arg.starts_with("--ram=") => {
-                let value = &arg["--ram=".len()..];
-                ram_path = Some(value.to_string());
-            }
-            _ if arg.starts_with("--sd0=") => {
-                let value = &arg["--sd0=".len()..];
-                sd0_path = Some(value.to_string());
-            }
-            _ if arg.starts_with("--sd1=") => {
-                let value = &arg["--sd1=".len()..];
-                sd1_path = Some(value.to_string());
-            }
-            _ if arg.starts_with("--sd0-out=") => {
-                let value = &arg["--sd0-out=".len()..];
-                sd0_out_path = Some(value.to_string());
-            }
-            _ if arg.starts_with("--sd1-out=") => {
-                let value = &arg["--sd1-out=".len()..];
-                sd1_out_path = Some(value.to_string());
-            }
-            _ if arg.starts_with("--sd-dma-ticks=") => {
-                let value = &arg["--sd-dma-ticks=".len()..];
-                sd_dma_ticks_per_word = value.parse::<u32>().unwrap_or_else(|_| {
-                    println!("Invalid SD DMA tick count: {}", value);
-                    process::exit(1);
-                });
-            }
-            _ if arg.starts_with('-') => {
-                println!("Unknown flag: {}", arg);
-                process::exit(1);
-            }
-            _ => {
-                if ram_path.is_none() {
-                    ram_path = Some(arg.clone());
-                } else if sd0_path.is_none() {
-                    sd0_path = Some(arg.clone());
-                } else if sd1_path.is_none() {
-                    sd1_path = Some(arg.clone());
-                } else {
-                    print_usage_and_exit();
-                }
-            }
-        }
+    set_trace_interrupts(options.trace_interrupts);
+    if options.config.sd_dma_ticks_per_word == 0 {
+        fail("--sd-dma-ticks must be >= 1");
     }
-
-    let ram_path = if let Some(path) = ram_path {
-        path
-    } else {
-        print_usage_and_exit();
-    };
-
-    let sd0_image = sd0_path.as_ref().map(|path| {
-        fs::read(path).unwrap_or_else(|err| {
-            println!("Failed to read SD0 image {}: {}", path, err);
-            process::exit(1);
-        })
-    });
-    let sd1_image = sd1_path.as_ref().map(|path| {
-        fs::read(path).unwrap_or_else(|err| {
-            println!("Failed to read SD1 image {}: {}", path, err);
-            process::exit(1);
-        })
-    });
-
-    set_trace_interrupts(trace_interrupts);
-    if sd_dma_ticks_per_word == 0 {
-        println!("--sd-dma-ticks must be >= 1");
-        process::exit(1);
+    if options.debug && options.debugc {
+        fail("Error: --debug and --debugc are mutually exclusive");
     }
-    if debug && debugc {
-        println!("Error: --debug and --debugc are mutually exclusive");
-        process::exit(1);
-    }
-    if profile_path.is_none()
-        && (!symbol_paths.is_empty() || profile_start.is_some() || profile_stop.is_some())
+    let debug_mode = if options.debugc { Some("debugc") } else if options.debug { Some("debug") } else { None };
+    if options.profile_path.is_none()
+        && (!options.symbol_paths.is_empty() || options.profile_start.is_some() || options.profile_stop.is_some())
     {
         println!("Warning: --symbols, --profile-start, and --profile-stop are ignored without --profile");
     }
-    if profile_path.is_some() && (debug || debugc) {
+    if options.profile_path.is_some() && debug_mode.is_some() {
         println!("Warning: --profile is ignored in debug modes");
-        profile_path = None;
+        options.profile_path = None;
     }
+
+    if let Some(mode) = debug_mode {
+        let config = &options.config;
+        let ignored = [
+            (config.with_graphics, "--vga"),
+            (config.audio_mode != AudioMode::Disabled, "host audio flags"),
+            (config.cores != 1, "--cores"),
+            (config.sched != ScheduleMode::Free, "--sched"),
+            (config.max_cycles != 0, "--max-cycles"),
+        ];
+        for (set, flag) in ignored {
+            if set {
+                let verb = if flag == "host audio flags" { "are" } else { "is" };
+                println!("Warning: {} {} ignored in {} mode", flag, verb, mode);
+            }
+        }
+        let debugger = if mode == "debugc" { Emulator::debug_c } else { Emulator::debug };
+        let cpu = debugger(
+            options.ram_path.clone(),
+            config.use_uart_rx,
+            config.sd_dma_ticks_per_word,
+            sd0_image.as_deref(),
+            sd1_image.as_deref(),
+        )
+        .unwrap_or_else(|err| fail(err));
+        write_sd_exports(&options, |slot| cpu.dump_sd_image(slot));
+        return;
+    }
+
     // Load symbols before running so a bad path fails fast, not after a long
     // run. The RAM image is always included since it may carry -g labels too.
-    let symbols = profile_path.as_ref().map(|_| {
-        let mut paths = vec![ram_path.clone()];
-        paths.extend(symbol_paths.iter().cloned());
-        Symbols::load(&paths).unwrap_or_else(|err| {
-            println!("{}", err);
-            process::exit(1);
-        })
+    let symbols = options.profile_path.as_ref().map(|_| {
+        let mut paths = vec![options.ram_path.clone()];
+        paths.extend(options.symbol_paths.iter().cloned());
+        Symbols::load(&paths).unwrap_or_else(|err| fail(err))
     });
-    let window = symbols.as_ref().map(|symbols| {
-        build_profile_window(symbols, profile_start.as_deref(), profile_stop.as_deref())
-            .unwrap_or_else(|err| {
-                println!("{}", err);
-                process::exit(1);
-            })
-    });
-    // file to run is passed as a command line argument
-    if debugc {
-        if with_graphics {
-            println!("Warning: --vga is ignored in debugc mode");
-        }
-        if audio_mode != AudioMode::Disabled {
-            println!("Warning: host audio flags are ignored in debugc mode");
-        }
-        if cores != 1 {
-            println!("Warning: --cores is ignored in debugc mode");
-        }
-        if sched != ScheduleMode::Free {
-            println!("Warning: --sched is ignored in debugc mode");
-        }
-        if max_cycles != 0 {
-            println!("Warning: --max-cycles is ignored in debugc mode");
-        }
-        let cpu = Emulator::debug_c(
-            ram_path,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-            sd0_image.as_deref(),
-            sd1_image.as_deref(),
-        );
-        write_sd_export(sd0_out_path.as_deref(), SdSlot::Sd0, || {
-            cpu.dump_sd_image(SdSlot::Sd0)
-        });
-        write_sd_export(sd1_out_path.as_deref(), SdSlot::Sd1, || {
-            cpu.dump_sd_image(SdSlot::Sd1)
-        });
-    } else if debug {
-        if with_graphics {
-            println!("Warning: --vga is ignored in debug mode");
-        }
-        if audio_mode != AudioMode::Disabled {
-            println!("Warning: host audio flags are ignored in debug mode");
-        }
-        if cores != 1 {
-            println!("Warning: --cores is ignored in debug mode");
-        }
-        if sched != ScheduleMode::Free {
-            println!("Warning: --sched is ignored in debug mode");
-        }
-        if max_cycles != 0 {
-            println!("Warning: --max-cycles is ignored in debug mode");
-        }
-        let cpu = Emulator::debug(
-            ram_path,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-            sd0_image.as_deref(),
-            sd1_image.as_deref(),
-        );
-        write_sd_export(sd0_out_path.as_deref(), SdSlot::Sd0, || {
-            cpu.dump_sd_image(SdSlot::Sd0)
-        });
-        write_sd_export(sd1_out_path.as_deref(), SdSlot::Sd1, || {
-            cpu.dump_sd_image(SdSlot::Sd1)
-        });
-    } else {
-        if cores == 0 || cores > 4 {
-            println!("--cores must be in 1..=4");
-            process::exit(1);
-        }
-        if cores == 1 {
-            let mut cpu = Emulator::new(
-                ram_path,
-                use_uart_rx,
-                sd_dma_ticks_per_word,
-                sd0_image.as_deref(),
-                sd1_image.as_deref(),
-            );
-            if let Some(window) = &window {
-                cpu.enable_profiling(window.clone());
-            }
-            let memory = cpu.shared_memory();
-            let (result, profile) = cpu.run_with_profile(max_cycles, with_graphics, audio_mode);
-            let profiles: Vec<CoreProfile> = profile.into_iter().collect();
-            write_profile(profile_path.as_deref(), &profiles, symbols.as_ref());
-            let result = result.expect("did not terminate"); // programs should return a value in r1
-            write_sd_export(sd0_out_path.as_deref(), SdSlot::Sd0, || {
-                memory.dump_sd_image(SdSlot::Sd0)
-            });
-            write_sd_export(sd1_out_path.as_deref(), SdSlot::Sd1, || {
-                memory.dump_sd_image(SdSlot::Sd1)
-            });
-            println!("{:08x}", result);
-        } else {
-            let (result, memory, profiles) = Emulator::run_multicore_with_memory(
-                ram_path,
-                cores,
-                sched,
-                max_cycles,
-                with_graphics,
-                audio_mode,
-                use_uart_rx,
-                sd_dma_ticks_per_word,
-                sd0_image.as_deref(),
-                sd1_image.as_deref(),
-                window.clone(),
-            );
-            write_profile(profile_path.as_deref(), &profiles, symbols.as_ref());
-            let result = result.expect("did not terminate");
-            write_sd_export(sd0_out_path.as_deref(), SdSlot::Sd0, || {
-                memory.dump_sd_image(SdSlot::Sd0)
-            });
-            write_sd_export(sd1_out_path.as_deref(), SdSlot::Sd1, || {
-                memory.dump_sd_image(SdSlot::Sd1)
-            });
-            println!("{:08x}", result);
-        }
+    if let Some(symbols) = &symbols {
+        let window = build_profile_window(
+            symbols,
+            options.profile_start.as_deref(),
+            options.profile_stop.as_deref(),
+        )
+        .unwrap_or_else(|err| fail(err));
+        options.config.profile = Some(window);
     }
+
+    let run = run_program(
+        &options.ram_path,
+        &options.config,
+        sd0_image.as_deref(),
+        sd1_image.as_deref(),
+    )
+    .unwrap_or_else(|err| fail(err));
+    write_profile(options.profile_path.as_deref(), &run.profiles, symbols.as_ref());
+    // Programs return a value in r1; a missing result means the cycle budget ran out.
+    let result = run.result.expect("did not terminate");
+    let memory: &Memory = &run.memory;
+    write_sd_exports(&options, |slot| memory.dump_sd_image(slot));
+    println!("{:08x}", result);
 }

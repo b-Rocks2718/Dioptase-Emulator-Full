@@ -26,6 +26,10 @@ Use the `--debug` flag to start an interactive debugger (label breakpoints requi
 
 Use `--sched` to change the scheduling of when cores run. Options are `free`, `rr` (round robin), and `random`.
 
+Use `--cores N` (1 to 4) to run N cores. If any core executes `mode halt`, every core stops and the emulator prints core 0's `r1`.
+
+Use `--max-cycles N` to stop after N ticks per core. A run stopped this way prints no result and exits with `did not terminate`, for any core count.
+
 Use the `--sd-dma-ticks <N>` flag to set the number of emulator ticks per 4-byte SD DMA transfer (default 1)
 
 Use the `--sd0 <file>` and `--sd1 <file>` flags to load raw binary SD images into the two SD devices

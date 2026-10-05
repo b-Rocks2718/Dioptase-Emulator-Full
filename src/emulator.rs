@@ -1,75 +1,112 @@
-use std::cmp;
+// One Dioptase core: architectural register state, instruction execution,
+// address translation, and exception/interrupt entry. Multicore run setup
+// lives in `run`, the interrupt controller in `interrupts`.
+//
+// References: docs/ISA.md (instructions, control registers, exceptions),
+// docs/mem_map.md (IVT and MMIO), Dioptase-OS/docs/kernel_mem_map.md (kernel
+// regions used for trace labels and the profiler's dense PC table).
+//
+// Exception/interrupt entry (docs/ISA.md): EPC <- resume PC, EFG <- FLG,
+// IMR[31] <- 0, PSR <- PSR + 1 (kernel mode is PSR != 0), PC <- IVT[vector].
+// `rfe` reverses this and sets IMR[31].
+
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufRead};
-use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::audio::AudioSink;
+use crate::memory::{Memory, PHYSMEM_MAX, SdSlot};
 
-use crate::audio::{AudioOutput, AudioSink};
-use crate::memory::{
-    AUDIO_INTERRUPT_BIT, AUDIO_SAMPLE_RATE_HZ, CLK_REG_START, Memory, PHYSMEM_MAX,
-    SD_INTERRUPT_BIT, SD2_INTERRUPT_BIT, SdSlot, VGA_INTERRUPT_BIT,
-};
-
-use crate::graphics::Graphics;
-
+mod alu;
 mod debugger;
+mod interrupts;
 pub mod profiler;
+mod program;
+mod run;
+mod tlb;
 
-use profiler::{CoreProfile, ProfileWindow};
+use interrupts::{IPI_INTERRUPT_BIT, InterruptController, format_interrupts};
+use profiler::CoreProfile;
+use program::{
+    DebugInfo, DebugLine, DebugLocal, LabelMap, load_program, parse_debug_line, parse_label_line,
+    read_lines,
+};
+use tlb::{Access, TLB_FAULT_ABSENT, Tlb, TlbAccess};
 
-// Reset vector for kernel entry (see docs/mem_map.md).
+pub use run::{RunConfig, RunResult, ScheduleMode, run_program};
+
+// Reset vector for kernel entry (docs/mem_map.md).
 const RESET_PC: u32 = 0x0000_0400;
 
-// Memory map ranges from Dioptase-OS/docs/kernel_mem_map.md. End bounds are
-// exclusive. These only label addresses for trace output and bound the
+// Kernel memory-map regions from Dioptase-OS/docs/kernel_mem_map.md as
+// (start, exclusive end, name). They only label trace output and bound the
 // profiler's dense PC table; they do not change emulated behavior.
-const IVT_START: u32 = 0x0000_0000;
-const IVT_END: u32 = 0x0000_0400;
-const BIOS_START: u32 = 0x0000_0400;
-// 32KiB reserved for the BIOS image and its MBR buffer. The kernel may
-// overwrite both BIOS regions after entry.
-const BIOS_SIZE: u32 = 0x0000_8000;
-const BIOS_END: u32 = BIOS_START + BIOS_SIZE;
-// Boot-core BIOS stack; grows down from BIOS_STACK_TOP in bios/init.s.
-const BIOS_STACK_START: u32 = BIOS_END;
-const BIOS_STACK_END: u32 = 0x0001_0000;
-const KERNEL_TEXT_START: u32 = 0x0001_0000;
-const KERNEL_TEXT_END: u32 = 0x000B_0000;
-const KERNEL_DATA_START: u32 = 0x000B_0000;
-const KERNEL_DATA_END: u32 = 0x000E_0000;
-const KERNEL_RODATA_START: u32 = 0x000E_0000;
-const KERNEL_RODATA_END: u32 = 0x000E_8000;
-const KERNEL_BSS_START: u32 = 0x000E_8000;
-const KERNEL_BSS_END: u32 = 0x000F_0000;
-// Per-core 16KiB kernel stacks: core 3 at the bottom, core 0 at the top.
-const KERNEL_STACK_START: u32 = 0x000F_0000;
+const KERNEL_REGIONS: [(u32, u32, &str); 8] = [
+    (0x0000_0000, 0x0000_0400, "ivt"),
+    // 32 KiB BIOS image and MBR buffer; the kernel may reuse it after entry.
+    (0x0000_0400, 0x0000_8400, "bios"),
+    // Boot-core BIOS stack; grows down from BIOS_STACK_TOP in bios/init.s.
+    (0x0000_8400, 0x0001_0000, "bios_stack"),
+    (0x0001_0000, 0x000B_0000, "kernel_text"),
+    (0x000B_0000, 0x000E_0000, "kernel_data"),
+    (0x000E_0000, 0x000E_8000, "kernel_rodata"),
+    (0x000E_8000, 0x000F_0000, "kernel_bss"),
+    // Per-core 16 KiB kernel stacks: core 3 at the bottom, core 0 at the top.
+    (0x000F_0000, 0x0010_0000, "kernel_stack"),
+];
+// Top of the kernel image regions; bounds the profiler's dense PC table.
 const KERNEL_STACK_END: u32 = 0x0010_0000;
-const TLB_ENTRIES: usize = 16;
-const TLB_FLAG_READ: u32 = 0x1;
-const TLB_FLAG_WRITE: u32 = 0x2;
-const TLB_FLAG_EXEC: u32 = 0x4;
-const TLB_FLAG_USER: u32 = 0x8;
-const TLB_FAULT_ABSENT: u32 = 0x0;
-const EXC_TLB_MISS_VECTOR: u32 = 0x82;
-const EXC_MISALIGNED_PC_VECTOR: u32 = 0x84;
-const PSR_REASON_TLB_MISS: &str = "tlb_miss";
-const PSR_REASON_MISALIGNED_PC: &str = "misaligned_pc";
+
+// Control register indices (docs/ISA.md "Control registers").
+const CREG_PSR: usize = 0;
 const CREG_PID: usize = 1;
+const CREG_ISR: usize = 2;
 const CREG_IMR: usize = 3;
 const CREG_EPC: usize = 4;
 const CREG_FLG: usize = 5;
 const CREG_EFG: usize = 6;
 const CREG_TLB: usize = 7;
+const CREG_KSP: usize = 8;
 const CREG_CID: usize = 9;
 const CREG_MBI: usize = 10;
+const CREG_MBO: usize = 11;
 const CREG_TLBF: usize = 12;
+const CREG_COUNT: usize = 13;
+// Debugger names for each control register, by index.
+const CREG_NAMES: [&str; CREG_COUNT] = [
+    "psr", "pid", "isr", "imr", "epc", "flg", "efg", "tlb", "ksp", "cid", "mbi", "mbo", "tlbf",
+];
 
-// Global toggle for interrupt tracing output.
+// IMR[31] globally enables interrupts.
+const IMR_GLOBAL_ENABLE: u32 = 1 << 31;
+// Secondary cores start able to take only the wake-up IPI.
+const SECONDARY_CORE_IMR: u32 = IMR_GLOBAL_ENABLE | IPI_INTERRUPT_BIT;
+
+// FLG bits: carry | zero | sign | overflow.
+const FLAG_CARRY: u32 = 1 << 0;
+const FLAG_ZERO: u32 = 1 << 1;
+const FLAG_SIGN: u32 = 1 << 2;
+const FLAG_OVERFLOW: u32 = 1 << 3;
+const ALU_FLAGS: u32 = FLAG_CARRY | FLAG_ZERO | FLAG_SIGN | FLAG_OVERFLOW;
+
+// IVT word indices (docs/ISA.md "Exceptions" and "Interrupts").
+const VEC_TRAP: u32 = 0x01;
+const VEC_INVALID_INSTR: u32 = 0x80;
+const VEC_PRIVILEGE: u32 = 0x81;
+const VEC_TLB_MISS: u32 = 0x82;
+const VEC_MISALIGNED_PC: u32 = 0x84;
+// Interrupt line n (0..=15) vectors through IVT[0xF0 + n]; higher lines win.
+const VEC_INTERRUPT_BASE: u32 = 0xF0;
+const INTERRUPT_LINES_MASK: u32 = 0xFFFF;
+
+// General-purpose register aliased to KSP while in kernel mode.
+const SP_REG: u32 = 31;
+// tlbw keeps the low 27 bits of rA (PPN and flags).
+const TLB_ENTRY_MASK: u32 = 0x07FF_FFFF;
+// trap encodings with any of these bits set are reserved.
+const TRAP_RESERVED_MASK: u32 = 0x07FF_FFFF;
+
+// Global toggle for `--trace-ints` output.
 static TRACE_INTERRUPTS: AtomicBool = AtomicBool::new(false);
 
 // Enable or disable process-wide interrupt trace output.
@@ -77,871 +114,53 @@ pub fn set_trace_interrupts(enabled: bool) {
     TRACE_INTERRUPTS.store(enabled, Ordering::Relaxed);
 }
 
-// Models the randomized replacement cache used by the full emulator.
-#[derive(Debug)]
-pub struct RandomCache {
-    private_table: HashMap<(u32, u32), u32>,
-    global_table: HashMap<u32, u32>,
-    total_capacity: usize,
+// Whether `--trace-ints` output is enabled.
+fn tracing() -> bool {
+    TRACE_INTERRUPTS.load(Ordering::Relaxed)
 }
 
-// Returns either the translated physical address or the faulting virtual address.
+// Field extractors shared by most instruction formats.
+fn field_a(instr: u32) -> u32 {
+    (instr >> 22) & 0x1F
+}
+fn field_b(instr: u32) -> u32 {
+    (instr >> 17) & 0x1F
+}
+
+// Access width of a load or store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TlbAccess {
-    Hit(u32),
-    Fault(u32),
+enum Width {
+    Byte,
+    Half,
+    Word,
 }
 
-impl RandomCache {
-    // Count private and global entries currently resident in the TLB.
-    fn total_size(&self) -> usize {
-        self.private_table.len() + self.global_table.len()
-    }
-
-    // Evict one cache entry selected by the replacement policy.
-    fn evict_one(&mut self, prefer_global: bool) {
-        // Replacement policy is implementation-defined; this emulator uses a
-        // deterministic first-key eviction and prefers evicting from the same
-        // class (global/private) as the incoming entry when possible.
-        if prefer_global {
-            if let Some(evict) = self.global_table.keys().next().cloned() {
-                self.global_table.remove(&evict);
-                return;
-            }
-            if let Some(evict) = self.private_table.keys().next().cloned() {
-                self.private_table.remove(&evict);
-            }
-        } else {
-            if let Some(evict) = self.private_table.keys().next().cloned() {
-                self.private_table.remove(&evict);
-                return;
-            }
-            if let Some(evict) = self.global_table.keys().next().cloned() {
-                self.global_table.remove(&evict);
-            }
+impl Width {
+    fn bytes(self) -> u32 {
+        match self {
+            Width::Byte => 1,
+            Width::Half => 2,
+            Width::Word => 4,
         }
-    }
-
-    // Create an empty cache with the requested capacity and replacement seed.
-    pub fn new(capacity: usize) -> RandomCache {
-        RandomCache {
-            private_table: HashMap::new(),
-            global_table: HashMap::new(),
-            total_capacity: capacity,
-        }
-    }
-
-    // Record the access-fault flags associated with this cache entry.
-    fn fault_flags(entry: u32, operation: u32, kmode: bool) -> u32 {
-        let mut flags = 0;
-        match operation {
-            0 => {
-                if entry & TLB_FLAG_READ == 0 {
-                    flags |= TLB_FLAG_READ;
-                }
-            }
-            1 => {
-                if entry & TLB_FLAG_WRITE == 0 {
-                    flags |= TLB_FLAG_WRITE;
-                }
-            }
-            2 => {
-                if entry & TLB_FLAG_EXEC == 0 {
-                    flags |= TLB_FLAG_EXEC;
-                }
-            }
-            _ => panic!("invalid operation code"),
-        }
-
-        if !kmode && entry & TLB_FLAG_USER == 0 {
-            flags |= TLB_FLAG_USER;
-        }
-
-        flags
-    }
-
-    // Validate permissions and return either the mapped page or fault flags.
-    fn classify_entry(entry: u32, operation: u32, kmode: bool) -> TlbAccess {
-        let flags = Self::fault_flags(entry, operation, kmode);
-        if flags == 0 {
-            TlbAccess::Hit(entry & 0xFFFFF000)
-        } else {
-            TlbAccess::Fault(flags)
-        }
-    }
-
-    // Resolve a virtual page for a read, write, or execute access.
-    fn access(&self, pid: u32, vpn: u32, operation: u32, kmode: bool) -> TlbAccess {
-        // Memory access keeps the existing private-then-global lookup order so
-        // emulator behavior does not change for duplicate private/global entries.
-        assert!(self.total_size() <= self.total_capacity);
-
-        let key = (pid, vpn);
-        let mut private_fault = None;
-        if let Some(entry) = self.private_table.get(&key).copied() {
-            match Self::classify_entry(entry, operation, kmode) {
-                TlbAccess::Hit(ppn) => return TlbAccess::Hit(ppn),
-                TlbAccess::Fault(flags) => private_fault = Some(flags),
-            }
-        }
-
-        if let Some(entry) = self.global_table.get(&vpn).copied() {
-            return Self::classify_entry(entry, operation, kmode);
-        }
-
-        TlbAccess::Fault(private_fault.unwrap_or(TLB_FAULT_ABSENT))
-    }
-
-    // Look up a TLB entry for tlbr, preferring the core-private mapping.
-    pub fn read(&self, pid: u32, vpn: u32) -> Option<u32> {
-        // used by tlbr instruction
-
-        assert!(self.total_size() <= self.total_capacity);
-        let result = self.private_table.get(&(pid, vpn)).copied();
-
-        if result.is_some() {
-            return result;
-        } else {
-            // try global table
-            self.global_table.get(&vpn).copied()
-        }
-    }
-
-    // Insert or replace a private/global TLB mapping, evicting at capacity.
-    pub fn write(&mut self, pid: u32, vpn: u32, ppn: u32) {
-        if ppn & 0x00000010 != 0 {
-            // global entry
-            if !self.global_table.contains_key(&vpn) && self.total_size() >= self.total_capacity {
-                self.evict_one(true);
-            }
-
-            // will replace old mapping if one existed
-            self.global_table.insert(vpn, ppn);
-            assert!(self.total_size() <= self.total_capacity);
-        } else {
-            // private entry
-            if !self.private_table.contains_key(&(pid, vpn))
-                && self.total_size() >= self.total_capacity
-            {
-                self.evict_one(false);
-            }
-
-            // will replace old mapping if one existed
-            self.private_table.insert((pid, vpn), ppn);
-
-            assert!(self.total_size() <= self.total_capacity);
-        }
-    }
-
-    // Remove both private and global mappings for the virtual page.
-    pub fn invalidate(&mut self, pid: u32, vpn: u32) {
-        self.private_table.remove(&(pid, vpn));
-        self.global_table.remove(&vpn);
-    }
-
-    // Clear the stored state.
-    pub fn clear(&mut self) {
-        self.private_table.drain();
-        self.global_table.drain();
-    }
-
-    // Dump cache state for debugging and fault diagnosis.
-    fn debug_dump(&self) {
-        println!("TLB private: {} entries", self.private_table.len());
-        if self.private_table.is_empty() {
-            println!("  (empty)");
-        } else {
-            for ((pid, vpn), entry) in &self.private_table {
-                println!("  pid {:08X} vpn {:08X} -> {:08X}", pid, vpn, entry);
-            }
-        }
-        println!("TLB global: {} entries", self.global_table.len());
-        if self.global_table.is_empty() {
-            println!("  (empty)");
-        } else {
-            for (vpn, entry) in &self.global_table {
-                println!("  vpn {:08X} -> {:08X}", vpn, entry);
-            }
-        }
-        println!(
-            "TLB total: {}/{} entries",
-            self.total_size(),
-            self.total_capacity
-        );
     }
 }
 
+// Address formation shared by the memory and atomic instruction groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Scheduler policy for multicore execution.
-pub enum ScheduleMode {
-    Free,
-    RoundRobin,
-    Random,
+enum AddrMode {
+    // rB + imm (memory forms also support pre/post-increment)
+    Absolute,
+    // rB + imm + PC + 4
+    Relative,
+    // imm + PC + 4
+    Immediate,
 }
 
-impl ScheduleMode {
-    // Parse a scheduler-mode command-line token.
-    pub fn parse(token: &str) -> Option<Self> {
-        match token.to_ascii_lowercase().as_str() {
-            "free" => Some(ScheduleMode::Free),
-            "rr" | "round-robin" | "roundrobin" => Some(ScheduleMode::RoundRobin),
-            "rand" | "random" => Some(ScheduleMode::Random),
-            _ => None,
-        }
-    }
-}
-
+// Read-modify-write operation performed by an atomic instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Host audio policy for emulator runs.
-pub enum AudioMode {
-    // Do not start a host audio player. The MMIO audio device still advances on
-    // emulated device ticks so guest-visible timing stays intact.
-    Disabled,
-    // Mirror the emulated device output to the host player only when core 0
-    // advances the shared device tick.
-    Emulated,
-    // Drive the MMIO audio device from wall-clock time on a helper thread so
-    // host playback stays intelligible even when emulation is slow. This is an
-    // opt-in debugging mode because it changes guest-visible timing.
-    Fast,
-}
-
-// Coordinates core turn-taking and records scheduler shutdown state.
-struct SchedulerState {
-    // Next core allowed to execute in non-free scheduling modes.
-    next_core: usize,
-    // Per-core halt tracking for scheduling decisions.
-    halted: Vec<bool>,
-    // Global stop flag shared by all cores.
-    done: bool,
-    // RNG seed used by random scheduling.
-    seed: u64,
-}
-
-// Coordinates turn-taking and shutdown across emulator cores.
-struct Scheduler {
-    mode: ScheduleMode,
-    cores: usize,
-    state: Mutex<SchedulerState>,
-    cv: Condvar,
-}
-
-impl Scheduler {
-    // Create scheduler state for the configured core count.
-    fn new(mode: ScheduleMode, cores: usize) -> Arc<Scheduler> {
-        let mut seed = seed_from_time();
-        let halted = vec![false; cores];
-        let next_core = if mode == ScheduleMode::Random {
-            choose_random_core(&mut seed, &halted).unwrap_or(0)
-        } else {
-            0
-        };
-        Arc::new(Scheduler {
-            mode,
-            cores,
-            state: Mutex::new(SchedulerState {
-                next_core,
-                halted,
-                done: false,
-                seed,
-            }),
-            cv: Condvar::new(),
-        })
-    }
-
-    // Wait for turn.
-    fn wait_turn(&self, core_id: usize) -> bool {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if state.done || state.halted[core_id] {
-                return false;
-            }
-            if state.next_core == core_id {
-                return true;
-            }
-            // Block until the scheduler hands this core the next turn.
-            state = self.cv.wait(state).unwrap();
-        }
-    }
-
-    // Release the scheduler turn and wake the next eligible core.
-    fn finish_turn(&self, core_id: usize) {
-        let mut state = self.state.lock().unwrap();
-        if state.done {
-            self.cv.notify_all();
-            return;
-        }
-        // Pick the next runnable core based on the chosen scheduling policy.
-        match pick_next_core(self.mode, self.cores, core_id, &mut state) {
-            Some(next) => state.next_core = next,
-            None => state.done = true,
-        }
-        self.cv.notify_all();
-    }
-
-    // Record that this core has halted and notify the shared run state.
-    fn mark_halted(&self, core_id: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.halted[core_id] = true;
-        if state.halted.iter().all(|halted| *halted) {
-            state.done = true;
-            self.cv.notify_all();
-            return;
-        }
-        // If the scheduled core halted, advance to a still-runnable core.
-        if state.halted[state.next_core] {
-            match pick_next_core(self.mode, self.cores, state.next_core, &mut state) {
-                Some(next) => state.next_core = next,
-                None => state.done = true,
-            }
-        }
-        self.cv.notify_all();
-    }
-
-    // Request scheduler shutdown and wake any cores waiting for a turn.
-    fn stop(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.done = true;
-        self.cv.notify_all();
-    }
-}
-
-// Seed from time.
-fn seed_from_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-// Advance the pseudo-random generator and return its next 32-bit value.
-fn next_rand_u32(seed: &mut u64) -> u32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (*seed >> 32) as u32
-}
-
-// Choose random core.
-fn choose_random_core(seed: &mut u64, halted: &[bool]) -> Option<usize> {
-    let active = halted.iter().filter(|h| !**h).count();
-    if active == 0 {
-        return None;
-    }
-    let target = (next_rand_u32(seed) as usize) % active;
-    let mut seen = 0usize;
-    for (idx, is_halted) in halted.iter().enumerate() {
-        if !*is_halted {
-            if seen == target {
-                return Some(idx);
-            }
-            seen += 1;
-        }
-    }
-    None
-}
-
-// Choose next core.
-fn pick_next_core(
-    mode: ScheduleMode,
-    cores: usize,
-    current: usize,
-    state: &mut SchedulerState,
-) -> Option<usize> {
-    match mode {
-        ScheduleMode::Random => choose_random_core(&mut state.seed, &state.halted),
-        ScheduleMode::RoundRobin => {
-            for offset in 1..=cores {
-                let idx = (current + offset) % cores;
-                if !state.halted[idx] {
-                    return Some(idx);
-                }
-            }
-            None
-        }
-        ScheduleMode::Free => {
-            for (idx, halted) in state.halted.iter().enumerate() {
-                if !*halted {
-                    return Some(idx);
-                }
-            }
-            None
-        }
-    }
-}
-
-const TIMER_INTERRUPT_BIT: u32 = 1 << 0;
-const KB_INTERRUPT_BIT: u32 = 1 << 1;
-const UART_INTERRUPT_BIT: u32 = 1 << 2;
-const IPI_INTERRUPT_BIT: u32 = 1 << 5;
-
-// Format pending interrupt bits as stable names for trace output.
-fn format_interrupts(bits: u32) -> String {
-    let mut parts = Vec::new();
-    if (bits & TIMER_INTERRUPT_BIT) != 0 {
-        parts.push("timer");
-    }
-    if (bits & KB_INTERRUPT_BIT) != 0 {
-        parts.push("keyboard");
-    }
-    if (bits & UART_INTERRUPT_BIT) != 0 {
-        parts.push("uart");
-    }
-    if (bits & SD_INTERRUPT_BIT) != 0 {
-        parts.push("sd0");
-    }
-    if (bits & SD2_INTERRUPT_BIT) != 0 {
-        parts.push("sd1");
-    }
-    if (bits & VGA_INTERRUPT_BIT) != 0 {
-        parts.push("vga");
-    }
-    if (bits & AUDIO_INTERRUPT_BIT) != 0 {
-        parts.push("audio");
-    }
-    if (bits & IPI_INTERRUPT_BIT) != 0 {
-        parts.push("ipi");
-    }
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join("|")
-    }
-}
-
-// Stores per-core pending interrupt bits and routed device sources.
-struct InterruptRouteState {
-    // Round-robin pointers for device interrupts routed to a single core.
-    next_kb: usize,
-    next_uart: usize,
-    next_sd: usize,
-    next_sd2: usize,
-    next_vga: usize,
-    next_audio: usize,
-    // Track which core currently has a pending KB/UART interrupt.
-    kb_inflight: Option<usize>,
-    uart_inflight: Option<usize>,
-}
-
-// Models per-core interrupt-pending state and inter-processor interrupt payloads.
-struct InterruptController {
-    cores: usize,
-    // Per-core pending interrupt bits delivered on the next tick.
-    pending: Vec<AtomicU32>,
-    // Per-core IPI payload storage (copied into MBI on delivery).
-    ipi_payload: Vec<AtomicU32>,
-    // One outstanding IPI payload is allowed per core. The latch stays set
-    // from a successful send until the target acknowledges the IPI ISR bit.
-    ipi_inflight: Vec<AtomicBool>,
-    routes: Mutex<InterruptRouteState>,
-}
-
-impl InterruptController {
-    // Create an interrupt controller with no pending sources.
-    fn new(cores: usize) -> Arc<InterruptController> {
-        Arc::new(InterruptController {
-            cores,
-            pending: (0..cores).map(|_| AtomicU32::new(0)).collect(),
-            ipi_payload: (0..cores).map(|_| AtomicU32::new(0)).collect(),
-            ipi_inflight: (0..cores).map(|_| AtomicBool::new(false)).collect(),
-            routes: Mutex::new(InterruptRouteState {
-                next_kb: 0,
-                next_uart: 0,
-                next_sd: 0,
-                next_sd2: 0,
-                next_vga: 0,
-                next_audio: 0,
-                kb_inflight: None,
-                uart_inflight: None,
-            }),
-        })
-    }
-
-    // Publish pending interrupt bits without losing concurrent updates.
-    fn set_pending_bits(&self, core: usize, bits: u32) {
-        self.pending[core].fetch_or(bits, Ordering::Release);
-    }
-
-    // Return pending interrupt bits without consuming them.
-    fn peek_pending(&self, core: usize) -> u32 {
-        self.pending[core].load(Ordering::Acquire)
-    }
-
-    // Atomically consume and return one core's pending interrupt bits.
-    fn take_pending(&self, core: usize) -> u32 {
-        self.pending[core].swap(0, Ordering::AcqRel)
-    }
-
-    // Read and clear the payload queued for an inter-processor interrupt.
-    fn read_ipi_payload(&self, core: usize) -> u32 {
-        self.ipi_payload[core].load(Ordering::Acquire)
-    }
-
-    // Store the payload that will accompany the next inter-processor interrupt.
-    fn write_ipi_payload(&self, core: usize, value: u32) {
-        self.ipi_payload[core].store(value, Ordering::Release);
-    }
-
-    // Queue an IPI payload for one target core if it has no outstanding IPI.
-    fn send_ipi(&self, target: usize, value: u32) -> bool {
-        if target >= self.cores {
-            return false;
-        }
-        if self.ipi_inflight[target]
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        // MBI carries the payload, ISR bit signals delivery.
-        self.write_ipi_payload(target, value);
-        self.set_pending_bits(target, IPI_INTERRUPT_BIT);
-        true
-    }
-
-    // Queue an IPI payload for every eligible core and return the delivery mask.
-    fn send_ipi_all(&self, value: u32) -> u32 {
-        let mut mask = 0u32;
-        for core in 0..self.cores {
-            if self.send_ipi(core, value) {
-                mask |= 1u32 << core;
-            }
-        }
-        mask
-    }
-
-    // Clear the target core's outstanding IPI delivery state.
-    fn ack_ipi(&self, core: usize) {
-        self.ipi_inflight[core].store(false, Ordering::Release);
-    }
-
-    // Route the current input-pending level to the configured interrupt source.
-    fn dispatch_input(&self, use_uart_rx: bool, io_nonempty: bool) {
-        let mut routes = self.routes.lock().unwrap();
-        if use_uart_rx {
-            let bit = UART_INTERRUPT_BIT;
-            if io_nonempty && routes.uart_inflight.is_none() {
-                // Route the next UART interrupt to a single core in round-robin order.
-                let core = routes.next_uart % self.cores;
-                routes.next_uart = (routes.next_uart + 1) % self.cores;
-                routes.uart_inflight = Some(core);
-                self.set_pending_bits(core, bit);
-            }
-        } else {
-            let bit = KB_INTERRUPT_BIT;
-            if io_nonempty && routes.kb_inflight.is_none() {
-                // Route the next keyboard interrupt to a single core in round-robin order.
-                let core = routes.next_kb % self.cores;
-                routes.next_kb = (routes.next_kb + 1) % self.cores;
-                routes.kb_inflight = Some(core);
-                self.set_pending_bits(core, bit);
-            }
-        }
-    }
-
-    // Dispatch device interrupts.
-    fn dispatch_device_interrupts(&self, pending: u32) {
-        if pending == 0 {
-            return;
-        }
-        let mut routes = self.routes.lock().unwrap();
-        if pending & SD_INTERRUPT_BIT != 0 {
-            // SD interrupts go to one core at a time, round-robin.
-            let core = routes.next_sd % self.cores;
-            routes.next_sd = (routes.next_sd + 1) % self.cores;
-            self.set_pending_bits(core, SD_INTERRUPT_BIT);
-        }
-        if pending & SD2_INTERRUPT_BIT != 0 {
-            // SD2 interrupts go to one core at a time, round-robin.
-            let core = routes.next_sd2 % self.cores;
-            routes.next_sd2 = (routes.next_sd2 + 1) % self.cores;
-            self.set_pending_bits(core, SD2_INTERRUPT_BIT);
-        }
-        if pending & VGA_INTERRUPT_BIT != 0 {
-            // VGA interrupts go to one core at a time, round-robin.
-            let core = routes.next_vga % self.cores;
-            routes.next_vga = (routes.next_vga + 1) % self.cores;
-            self.set_pending_bits(core, VGA_INTERRUPT_BIT);
-        }
-        if pending & AUDIO_INTERRUPT_BIT != 0 {
-            // Audio interrupts go to one core at a time, round-robin.
-            let core = routes.next_audio % self.cores;
-            routes.next_audio = (routes.next_audio + 1) % self.cores;
-            self.set_pending_bits(core, AUDIO_INTERRUPT_BIT);
-        }
-    }
-
-    // Raise the timer interrupt bit on every core.
-    fn broadcast_timer(&self) {
-        for core in 0..self.cores {
-            self.set_pending_bits(core, TIMER_INTERRUPT_BIT);
-        }
-    }
-
-    // Clear the input interrupt after the guest consumes its queued input.
-    fn ack_input(&self, core: usize, cleared_bits: u32) {
-        if cleared_bits == 0 {
-            return;
-        }
-        let mut routes = self.routes.lock().unwrap();
-        if (cleared_bits & KB_INTERRUPT_BIT) != 0 {
-            if routes.kb_inflight == Some(core) {
-                routes.kb_inflight = None;
-            }
-        }
-        if (cleared_bits & UART_INTERRUPT_BIT) != 0 {
-            if routes.uart_inflight == Some(core) {
-                routes.uart_inflight = None;
-            }
-        }
-    }
-}
-
-// Holds stop and exit state shared by all emulator cores.
-struct RunShared {
-    // Global stop signal shared by all cores.
-    stop: AtomicBool,
-    // Track how many cores have exited their run loops.
-    halted: AtomicUsize,
-    // Per-core return values (r1) recorded on exit.
-    results: Mutex<Vec<Option<u32>>>,
-    // Shared completion flag for graphics and multi-core coordination.
-    finished: Arc<Mutex<bool>>,
-    cores: usize,
-}
-
-impl RunShared {
-    // Create shared run state with no stop request or exit result.
-    fn new(cores: usize, finished: Arc<Mutex<bool>>) -> RunShared {
-        RunShared {
-            stop: AtomicBool::new(false),
-            halted: AtomicUsize::new(0),
-            results: Mutex::new(vec![None; cores]),
-            finished,
-            cores,
-        }
-    }
-
-    // Return whether any core has requested that execution stop.
-    fn should_stop(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
-    }
-
-    // Publish a stop request and wake all cores waiting on run completion.
-    fn request_stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        *self.finished.lock().unwrap() = true;
-    }
-
-    // Store one core's exit value and mark the core finished.
-    fn record_exit(&self, core_id: usize, value: u32) {
-        self.results.lock().unwrap()[core_id] = Some(value);
-        let halted = self.halted.fetch_add(1, Ordering::Relaxed) + 1;
-        if halted == self.cores {
-            *self.finished.lock().unwrap() = true;
-        }
-    }
-}
-
-// Owns one core's CPU state while sharing memory and devices with other cores.
-pub struct Emulator {
-    regfile: [u32; 32],  // r0 - r31
-    cregfile: [u32; 13], // PSR, PID, ISR, IMR, EPC, FLG, EFG, TLB, KSP, CID, MBI, MBO, TLBF
-    // in FLG, flags are: carry | zero | sign | overflow
-    memory: Arc<Memory>,
-    interrupts: Arc<InterruptController>,
-    tlb: RandomCache,
-    pc: u32,
-    asleep: bool,
-    // Distinguish "mode sleep" from a core that starts asleep.
-    sleep_armed: bool,
-    halted: bool,
-    count: u32,
-    core_id: u32,
-    use_uart_rx: bool,
-    audio_mode: AudioMode,
-    audio_sink: Option<Arc<AudioSink>>,
-    pending_tlb_fault: Option<u32>,
-    watchpoints: Vec<Watchpoint>,
-    watchpoint_hit: Option<WatchpointHit>,
-    // Present only when `--profile` is enabled; see profiler.rs.
-    profile: Option<CoreProfile>,
-}
-
-const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
-const FAST_AUDIO_MAX_CATCH_UP_BATCHES: usize = 8;
-
-// Owns the optional host-audio worker associated with the emulator.
-struct AudioPlayback {
-    output: Option<AudioOutput>,
-    worker_stop: Option<Arc<AtomicBool>>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl AudioPlayback {
-    // Start host-audio playback and return the optional worker handle.
-    fn start(requested_mode: AudioMode, memory: Arc<Memory>) -> (AudioMode, Option<Self>) {
-        if requested_mode == AudioMode::Disabled {
-            return (AudioMode::Disabled, None);
-        }
-
-        let output = match AudioOutput::start(requested_mode == AudioMode::Fast) {
-            Ok(output) => output,
-            Err(err) => {
-                eprintln!("Warning: failed to start host audio output: {}", err);
-                return (AudioMode::Disabled, None);
-            }
-        };
-
-        if requested_mode == AudioMode::Fast {
-            let sink = output.shared_sink();
-            let stop = Arc::new(AtomicBool::new(false));
-            let worker = spawn_fast_audio_worker(memory, sink, Arc::clone(&stop));
-            return (
-                AudioMode::Fast,
-                Some(AudioPlayback {
-                    output: Some(output),
-                    worker_stop: Some(stop),
-                    worker: Some(worker),
-                }),
-            );
-        }
-
-        (
-            AudioMode::Emulated,
-            Some(AudioPlayback {
-                output: Some(output),
-                worker_stop: None,
-                worker: None,
-            }),
-        )
-    }
-
-    // Connect this emulator to the guest audio sink implementation.
-    fn emulated_sink(&self) -> Option<Arc<AudioSink>> {
-        if self.worker.is_some() {
-            return None;
-        }
-        self.output.as_ref().map(|output| output.shared_sink())
-    }
-}
-
-impl Drop for AudioPlayback {
-    // Stop and join the audio worker before dropping its output connection.
-    fn drop(&mut self) {
-        if let Some(stop) = self.worker_stop.take() {
-            stop.store(true, Ordering::SeqCst);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        self.output.take();
-    }
-}
-
-// Convert a PCM batch length into its guest sample-duration in milliseconds.
-fn audio_batch_duration(batch_count: usize) -> Duration {
-    Duration::from_nanos(
-        ((FAST_AUDIO_BATCH_SAMPLES as u64) * (batch_count as u64) * 1_000_000_000u64)
-            / (AUDIO_SAMPLE_RATE_HZ as u64),
-    )
-}
-
-// Keep the optional fast host-audio mode close to real-time wall clock.
-// Consumes PCM MMIO audio samples in 10 ms wall-clock batches until stop.
-// Invariants:
-// - only this helper thread advances the audio MMIO consumer in fast mode
-// - batches are capped so a stalled host does not build unbounded catch-up work
-// - the normal emulated-tick path must stay disabled while this thread runs
-fn spawn_fast_audio_worker(
-    memory: Arc<Memory>,
-    sink: Arc<AudioSink>,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let batch_duration = audio_batch_duration(1);
-        let mut next_deadline = Instant::now() + batch_duration;
-        let mut batch =
-            Vec::with_capacity(FAST_AUDIO_BATCH_SAMPLES * FAST_AUDIO_MAX_CATCH_UP_BATCHES);
-
-        while !stop.load(Ordering::SeqCst) {
-            let now = Instant::now();
-            if now < next_deadline {
-                thread::sleep(next_deadline.duration_since(now));
-                continue;
-            }
-
-            let mut batch_count = 1usize;
-            let late = now.duration_since(next_deadline);
-            let batch_nanos = batch_duration.as_nanos();
-            if batch_nanos != 0 {
-                batch_count += (late.as_nanos() / batch_nanos) as usize;
-            }
-            if batch_count > FAST_AUDIO_MAX_CATCH_UP_BATCHES {
-                batch_count = FAST_AUDIO_MAX_CATCH_UP_BATCHES;
-                next_deadline = now + batch_duration;
-            } else {
-                next_deadline += audio_batch_duration(batch_count);
-            }
-
-            memory.consume_audio_wallclock_samples(
-                batch_count * FAST_AUDIO_BATCH_SAMPLES,
-                &mut batch,
-            );
-            sink.write_samples(&batch);
-        }
-    })
-}
-
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
-}
-
-// Label -> address list (labels can appear multiple times across sections).
-type LabelMap = HashMap<String, Vec<u32>>;
-
-#[derive(Clone, Debug)]
-// Source line marker emitted by the assembler debug pipeline.
-struct DebugLine {
-    file: String,
-    line: u32,
-    addr: u32,
-}
-
-#[derive(Clone, Debug)]
-// Stack local debug metadata anchored to a code address.
-struct DebugLocal {
-    name: String,
-    offset: i32,
-    size: u32,
-}
-
-#[derive(Clone, Debug)]
-// Global data symbol debug metadata.
-struct DebugGlobal {
-    name: String,
-    addr: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-// Aggregated C debug info parsed from a .debug file.
-struct DebugInfo {
-    lines: Vec<DebugLine>,
-    locals_by_addr: HashMap<u32, Vec<DebugLocal>>,
-    globals: Vec<DebugGlobal>,
-    missing_line_addrs: bool,
-    missing_local_addrs: bool,
-    missing_local_sizes: bool,
-}
-
-#[derive(Clone)]
-// Loader output: bytes + labels + C debug metadata.
-struct ProgramImage {
-    instructions: HashMap<u32, u8>,
-    labels: LabelMap,
-    debug: DebugInfo,
+enum AtomicOp {
+    FetchAdd,
+    Swap,
 }
 
 // Selects which kinds of access cause a watchpoint to fire.
@@ -959,7 +178,7 @@ enum WatchAccess {
     Write,
 }
 
-// Single-byte watchpoints tracked by exact address.
+// Single-byte watchpoint tracked by exact virtual address.
 #[derive(Clone, Copy, Debug)]
 struct Watchpoint {
     addr: u32,
@@ -974,294 +193,105 @@ struct WatchpointHit {
     value: u8,
 }
 
-// Parse a hexadecimal 32-bit word from debugger/program-image input.
-fn parse_hex_u32(token: &str) -> Option<u32> {
-    let s = token.trim();
-    let s = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    if s.is_empty() {
-        return None;
-    }
-    u32::from_str_radix(s, 16).ok()
+// What one attempt to run the next instruction did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepOutcome {
+    Executed { pc: u32, instr: u32 },
+    Sleeping,
+    TlbMiss { pc: u32 },
+    MisalignedPc { pc: u32 },
 }
 
-// Index a debug symbol by address for source and debugger lookup.
-fn add_label(labels: &mut LabelMap, name: &str, addr: u32) {
-    let entry = labels.entry(name.to_string()).or_default();
-    if !entry.contains(&addr) {
-        entry.push(addr);
-    }
+// Owns one core's CPU state while sharing memory and devices with other cores.
+pub struct Emulator {
+    regfile: [u32; 32],
+    cregfile: [u32; CREG_COUNT],
+    memory: Arc<Memory>,
+    interrupts: Arc<InterruptController>,
+    tlb: Tlb,
+    pc: u32,
+    asleep: bool,
+    // Set by `mode sleep` so the waking interrupt resumes after the sleep
+    // instruction; secondary cores that start asleep resume at their PC.
+    sleep_armed: bool,
+    halted: bool,
+    // Ticks since the run started (the --max-cycles budget and clock divider).
+    count: u32,
+    core_id: u32,
+    // Whether this core advances the audio device on emulated ticks (core 0
+    // only, and not in wall-clock audio mode).
+    ticks_audio: bool,
+    audio_sink: Option<Arc<AudioSink>>,
+    // TLBF value for the translation fault raised by the current access.
+    pending_tlb_fault: Option<u32>,
+    watchpoints: Vec<Watchpoint>,
+    watchpoint_hit: Option<WatchpointHit>,
+    // Present only when `--profile` is enabled; see profiler.rs.
+    profile: Option<CoreProfile>,
 }
 
-// Parse assembler debug label lines: "#label <name> <addr>".
-fn parse_label_line(line: &str, labels: &mut LabelMap) -> bool {
-    let mut parts = line.split_whitespace();
-    match parts.next() {
-        Some("#label") => {
-            if let (Some(name), Some(addr_str)) = (parts.next(), parts.next()) {
-                if let Some(addr) = parse_hex_u32(addr_str) {
-                    add_label(labels, name, addr);
-                    return true;
-                }
-            }
+// Build guest memory from a program image and optional raw SD images.
+fn build_memory(
+    bytes: HashMap<u32, u8>,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&[u8]>,
+    sd1_image: Option<&[u8]>,
+) -> Arc<Memory> {
+    let memory = Memory::new(bytes, use_uart_rx, sd_dma_ticks_per_word);
+    for (slot, image) in [
+        (SdSlot::Sd0, sd0_image),
+        (SdSlot::Sd1, sd1_image),
+    ] {
+        if let Some(image) = image {
+            memory.load_sd_image(slot, image);
         }
-        _ => {}
     }
-    false
-}
-
-// Parse C debug metadata lines emitted by the assembler.
-fn parse_debug_line(line: &str, debug: &mut DebugInfo) -> bool {
-    const DEFAULT_LOCAL_SIZE_BYTES: u32 = 4;
-    let mut parts = line.split_whitespace();
-    match parts.next() {
-        Some("#line") => {
-            let Some(file) = parts.next() else {
-                return true;
-            };
-            let Some(line_str) = parts.next() else {
-                return true;
-            };
-            let line_num = match line_str.parse::<u32>() {
-                Ok(value) => value,
-                Err(_) => {
-                    debug.missing_line_addrs = true;
-                    return true;
-                }
-            };
-            let addr = match parts.next().and_then(parse_hex_u32) {
-                Some(value) => value,
-                None => {
-                    debug.missing_line_addrs = true;
-                    return true;
-                }
-            };
-            debug.lines.push(DebugLine {
-                file: file.to_string(),
-                line: line_num,
-                addr,
-            });
-            true
-        }
-        Some("#local") => {
-            let Some(name) = parts.next() else {
-                return true;
-            };
-            let Some(offset_str) = parts.next() else {
-                return true;
-            };
-            let offset = match offset_str.parse::<i32>() {
-                Ok(value) => value,
-                Err(_) => {
-                    debug.missing_local_addrs = true;
-                    return true;
-                }
-            };
-            let remaining: Vec<&str> = parts.collect();
-            let (size, addr_str) = match remaining.as_slice() {
-                [] => {
-                    debug.missing_local_sizes = true;
-                    debug.missing_local_addrs = true;
-                    return true;
-                }
-                [addr_only] => {
-                    debug.missing_local_sizes = true;
-                    (DEFAULT_LOCAL_SIZE_BYTES, *addr_only)
-                }
-                [size_str, addr_str, ..] => {
-                    let mut size = match size_str.parse::<u32>() {
-                        Ok(value) if value > 0 => value,
-                        _ => {
-                            debug.missing_local_sizes = true;
-                            DEFAULT_LOCAL_SIZE_BYTES
-                        }
-                    };
-                    if size == 0 {
-                        debug.missing_local_sizes = true;
-                        size = DEFAULT_LOCAL_SIZE_BYTES;
-                    }
-                    (size, *addr_str)
-                }
-            };
-            let addr = match parse_hex_u32(addr_str) {
-                Some(value) => value,
-                None => {
-                    debug.missing_local_addrs = true;
-                    return true;
-                }
-            };
-            debug
-                .locals_by_addr
-                .entry(addr)
-                .or_default()
-                .push(DebugLocal {
-                    name: name.to_string(),
-                    offset,
-                    size,
-                });
-            true
-        }
-        Some("#data") => {
-            let Some(name) = parts.next() else {
-                return true;
-            };
-            let Some(addr_str) = parts.next() else {
-                return true;
-            };
-            if let Some(addr) = parse_hex_u32(addr_str) {
-                if !debug
-                    .globals
-                    .iter()
-                    .any(|g| g.name == name && g.addr == addr)
-                {
-                    debug.globals.push(DebugGlobal {
-                        name: name.to_string(),
-                        addr,
-                    });
-                }
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-// Load hex (or .debug) program and collect any embedded labels.
-fn load_program(path: &str) -> ProgramImage {
-    let mut instructions = HashMap::new();
-    let mut labels = LabelMap::new();
-    let mut debug = DebugInfo::default();
-
-    let lines = read_lines(path).expect("Couldn't open input file");
-    let mut pc: u32 = 0;
-    for line in lines.map_while(Result::ok) {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with('#') {
-            // Debug metadata lines are prefixed with '#'.
-            parse_label_line(line, &mut labels);
-            parse_debug_line(line, &mut debug);
-            continue;
-        }
-        if line.starts_with(';') || line.starts_with("//") {
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix('@') {
-            let addr_str = rest.trim();
-            let addr = u32::from_str_radix(addr_str, 16).expect("Invalid address") * 4;
-            pc = addr;
-            continue;
-        }
-
-        let instruction = u32::from_str_radix(line, 16).expect("Error parsing hex file");
-
-        instructions.insert(pc, instruction as u8);
-        instructions.insert(pc + 1, (instruction >> 8) as u8);
-        instructions.insert(pc + 2, (instruction >> 16) as u8);
-        instructions.insert(pc + 3, (instruction >> 24) as u8);
-
-        pc += 4;
-    }
-
-    ProgramImage {
-        instructions,
-        labels,
-        debug,
-    }
+    Arc::new(memory)
 }
 
 impl Emulator {
-    // Create an emulator from a program image and full-device shared state.
-    pub fn new(
-        path: String,
+    // Create a single-core emulator with its own memory and devices; used by
+    // the interactive debuggers.
+    fn standalone(
+        bytes: HashMap<u32, u8>,
         use_uart_rx: bool,
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
         sd1_image: Option<&[u8]>,
     ) -> Emulator {
-        let image = load_program(&path);
-        Emulator::from_instructions(
-            image.instructions,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-            sd0_image,
-            sd1_image,
-        )
+        let memory = build_memory(bytes, use_uart_rx, sd_dma_ticks_per_word, sd0_image, sd1_image);
+        Emulator::from_shared(memory, InterruptController::new(1, use_uart_rx), 0)
     }
 
-    // Build an emulator image from raw instruction words.
-    pub fn from_instructions(
-        instructions: HashMap<u32, u8>,
-        use_uart_rx: bool,
-        sd_dma_ticks_per_word: u32,
-        sd0_image: Option<&[u8]>,
-        sd1_image: Option<&[u8]>,
-    ) -> Emulator {
-        let memory: Arc<Memory> = Arc::new(Memory::new(
-            instructions,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-        ));
-        if let Some(image) = sd0_image {
-            memory.load_sd_image(SdSlot::Sd0, image);
-        }
-        if let Some(image) = sd1_image {
-            memory.load_sd_image(SdSlot::Sd1, image);
-        }
-        let interrupts = InterruptController::new(1);
-        Emulator::from_shared(memory, interrupts, use_uart_rx, 0)
-    }
-
-    // Export one SD device from this emulator instance as a raw host image.
-    // Returns contiguous bytes representing the tracked SD image contents.
+    // Export one SD device as a raw host image.
     pub fn dump_sd_image(&self, slot: SdSlot) -> Vec<u8> {
         self.memory.dump_sd_image(slot)
     }
 
-    // Expose the shared memory backing this emulator instance.
-    // Returns an Arc clone so callers can inspect memory after `run(self, ...)`.
-    pub fn shared_memory(&self) -> Arc<Memory> {
-        Arc::clone(&self.memory)
-    }
-
-    // Attach a core to existing shared memory and device state.
-    fn from_shared(
-        memory: Arc<Memory>,
-        interrupts: Arc<InterruptController>,
-        use_uart_rx: bool,
-        core_id: u32,
-    ) -> Emulator {
-        let mut cregfile = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // start cores in kernel mode
-        // CID is a read-only core identifier.
+    // Attach a core to existing shared memory and interrupt state. Cores start
+    // in kernel mode at the reset vector; secondaries start asleep waiting for
+    // an IPI.
+    fn from_shared(memory: Arc<Memory>, interrupts: Arc<InterruptController>, core_id: u32) -> Emulator {
+        let mut cregfile = [0; CREG_COUNT];
+        cregfile[CREG_PSR] = 1;
         cregfile[CREG_CID] = core_id;
         if core_id != 0 {
-            // Allow IPI wakeups on secondary cores by default.
-            cregfile[CREG_IMR] = 0x80000020;
+            cregfile[CREG_IMR] = SECONDARY_CORE_IMR;
         }
-
         Emulator {
-            regfile: [
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
-            ],
+            regfile: [0; 32],
             cregfile,
             memory,
             interrupts,
-            tlb: RandomCache::new(TLB_ENTRIES),
+            tlb: Tlb::new(),
             pc: RESET_PC,
             asleep: core_id != 0,
             sleep_armed: false,
             halted: false,
             count: 0,
             core_id,
-            use_uart_rx,
-            audio_mode: AudioMode::Disabled,
+            ticks_audio: core_id == 0,
             audio_sink: None,
             pending_tlb_fault: None,
             watchpoints: Vec::new(),
@@ -1270,80 +300,57 @@ impl Emulator {
         }
     }
 
-    // Start counting instructions this core dispatches while `window` is open
-    // (see profiler.rs). Call before the core starts running; every core in a
-    // run must share the same window.
-    pub fn enable_profiling(&mut self, window: Arc<ProfileWindow>) {
-        self.profile = Some(CoreProfile::new(self.core_id, window));
+    // Kernel mode is derived from the PSR depth, not a cached flag.
+    fn get_kmode(&self) -> bool {
+        self.cregfile[CREG_PSR] != 0
     }
 
-    // Connect the core to the selected guest/host audio mode and sink.
-    fn configure_audio(&mut self, audio_mode: AudioMode, sink: Option<Arc<AudioSink>>) {
-        self.audio_mode = audio_mode;
-        self.audio_sink = sink;
+    // Name the kernel memory-map region containing a physical address.
+    fn memmap_region(paddr: u32) -> Option<&'static str> {
+        KERNEL_REGIONS
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&paddr))
+            .map(|(_, _, name)| *name)
     }
 
-    // Return the interrupt-service bits currently latched in the ISR register.
-    fn read_isr(&self) -> u32 {
-        self.cregfile[2]
-    }
+    // ---- Registers ------------------------------------------------------
 
-    // Update ISR bits while preserving pending sources owned by the controller.
-    fn write_isr(&mut self, value: u32) {
-        let old = self.cregfile[2];
-        // Match the hardware cregfile semantics: software ISR writes must not
-        // drop interrupts that become pending during a read/modify/write clear.
-        let pending = self.interrupts.peek_pending(self.core_id as usize);
-        if (pending & IPI_INTERRUPT_BIT) != 0 {
-            self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
-        }
-        self.cregfile[2] = value | pending;
-        // Let the interrupt controller know when software acknowledges
-        // controller-tracked interrupt state.
-        let cleared = old & !self.cregfile[2];
-        if cleared != 0 {
-            self.interrupts.ack_input(self.core_id as usize, cleared);
-            if (cleared & IPI_INTERRUPT_BIT) != 0 {
-                self.interrupts.ack_ipi(self.core_id as usize);
-            }
+    // Read a general-purpose register; r31 reads KSP in kernel mode.
+    fn get_reg(&self, regnum: u32) -> u32 {
+        if regnum == SP_REG && self.get_kmode() {
+            self.cregfile[CREG_KSP]
+        } else {
+            self.regfile[regnum as usize]
         }
     }
 
-    // Retrieve and clear the payload associated with this core's pending IPI.
-    fn read_mbi(&self) -> u32 {
-        self.cregfile[10]
+    // Write a general-purpose register; r0 is hardwired to zero and r31
+    // writes KSP in kernel mode.
+    fn write_reg(&mut self, regnum: u32, value: u32) {
+        if regnum == SP_REG && self.get_kmode() {
+            self.cregfile[CREG_KSP] = value;
+        } else if regnum != 0 {
+            self.regfile[regnum as usize] = value;
+        }
     }
 
-    // Publish the payload that will be delivered with the next IPI.
-    fn write_mbi(&mut self, value: u32) {
-        self.cregfile[10] = value;
-    }
-
-    // Retrieve one control-register value using the architectural index.
+    // Read a control register.
     fn read_creg(&self, idx: usize) -> u32 {
-        match idx {
-            // ISR and MBI are core-local control registers.
-            2 => self.read_isr(),
-            CREG_MBI => self.read_mbi(),
-            _ => self.cregfile[idx],
-        }
+        self.cregfile[idx]
     }
 
-    // Write one architectural control register with its defined masking rules.
+    // Write a control register through `crmv`. ISR and CID are read-only;
+    // interrupts are acknowledged through `eoi`.
     fn write_creg(&mut self, idx: usize, value: u32) {
         match idx {
-            // Route ISR/MBI through helpers so we can track clears and core-local state.
-            2 | CREG_CID => {
-                // CID is read-only.
+            CREG_ISR | CREG_CID => {
                 println!("Warning: attempt to write read-only register cr{}", idx);
             }
-            CREG_MBI => self.write_mbi(value),
-
             _ => {
-                if idx == 0 && TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+                if idx == CREG_PSR && tracing() {
                     println!(
                         "[core {}] psr write {:08X} -> {:08X} (crmv pc=0x{:08X})",
-                        self.core_id, self.cregfile[0], value, self.pc
+                        self.core_id, self.cregfile[CREG_PSR], value, self.pc
                     );
                 }
                 self.cregfile[idx] = value;
@@ -1351,171 +358,76 @@ impl Emulator {
         }
     }
 
-    // Clear the deferred TLB fault recorded for the current core.
-    fn clear_pending_tlb_fault(&mut self) {
-        self.pending_tlb_fault = None;
-    }
-
-    // Record pending TLB fault.
-    fn record_pending_tlb_fault(&mut self, flags: u32) {
-        self.pending_tlb_fault = Some(flags);
-    }
-
-    // Take pending TLB fault.
-    fn take_pending_tlb_fault(&mut self) -> u32 {
-        self.pending_tlb_fault.take().unwrap_or(TLB_FAULT_ABSENT)
-    }
-
-    // Kernel mode is derived from the PSR (cr0) depth, not a cached flag.
-    fn get_kmode(&self) -> bool {
-        self.cregfile[0] != 0
-    }
-
-    // Increment PSR while applying the architectural privilege checks.
-    fn psr_inc_checked(&mut self, reason: &str) {
-        if self.cregfile[0] == u32::MAX {
-            panic!("too many nested exceptions!");
+    // Update ISR without dropping interrupts that became pending in the
+    // controller during software's read-modify-write (matches the hardware
+    // cregfile). Cleared bits are reported to the controller so input routing
+    // and IPI delivery reopen.
+    fn write_isr(&mut self, value: u32) {
+        let core = self.core_id as usize;
+        let old = self.cregfile[CREG_ISR];
+        let pending = self.interrupts.peek_pending(core);
+        if pending & IPI_INTERRUPT_BIT != 0 {
+            self.cregfile[CREG_MBI] = self.interrupts.read_ipi_payload(core);
         }
-        let old = self.cregfile[0];
-        self.cregfile[0] = self.cregfile[0].wrapping_add(1);
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+        self.cregfile[CREG_ISR] = value | pending;
+        let cleared = old & !self.cregfile[CREG_ISR];
+        if cleared != 0 {
+            self.interrupts.acknowledge(core, cleared);
+        }
+    }
+
+    // Advance to the next sequential instruction.
+    fn advance(&mut self) {
+        self.pc = self.pc.wrapping_add(4);
+    }
+
+    // ---- Exceptions and interrupts ---------------------------------------
+
+    // Increment PSR on handler entry.
+    fn psr_inc(&mut self, reason: &str) {
+        let old = self.cregfile[CREG_PSR];
+        assert!(old != u32::MAX, "core {}: PSR overflow entering {} handler at pc 0x{:08X}", self.core_id, reason, self.pc);
+        self.cregfile[CREG_PSR] = old + 1;
+        if tracing() {
             println!(
                 "[core {}] psr inc {:08X} -> {:08X} ({} pc=0x{:08X})",
-                self.core_id, old, self.cregfile[0], reason, self.pc
+                self.core_id, old, old + 1, reason, self.pc
             );
         }
     }
 
-    // Decrement PSR while preserving the defined status bits.
-    fn psr_dec(&mut self, reason: &str) {
-        let old = self.cregfile[0];
-        self.cregfile[0] = self.cregfile[0].wrapping_sub(1);
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-            println!(
-                "[core {}] psr dec {:08X} -> {:08X} ({} pc=0x{:08X})",
-                self.core_id, old, self.cregfile[0], reason, self.pc
-            );
-        }
-    }
-
-    // Name the kernel memory-map region (kernel_mem_map.md) containing a
-    // physical address, if any.
-    fn memmap_region(paddr: u32) -> Option<&'static str> {
-        if (IVT_START..IVT_END).contains(&paddr) {
-            Some("ivt")
-        } else if (BIOS_START..BIOS_END).contains(&paddr) {
-            Some("bios")
-        } else if (BIOS_STACK_START..BIOS_STACK_END).contains(&paddr) {
-            Some("bios_stack")
-        } else if (KERNEL_TEXT_START..KERNEL_TEXT_END).contains(&paddr) {
-            Some("kernel_text")
-        } else if (KERNEL_DATA_START..KERNEL_DATA_END).contains(&paddr) {
-            Some("kernel_data")
-        } else if (KERNEL_RODATA_START..KERNEL_RODATA_END).contains(&paddr) {
-            Some("kernel_rodata")
-        } else if (KERNEL_BSS_START..KERNEL_BSS_END).contains(&paddr) {
-            Some("kernel_bss")
-        } else if (KERNEL_STACK_START..KERNEL_STACK_END).contains(&paddr) {
-            Some("kernel_stack")
-        } else {
-            None
-        }
-    }
-
-    // Warn about on write.
-    fn warn_on_write(region: &str) -> bool {
-        matches!(region, "kernel_text" | "kernel_rodata" | "bios" | "ivt")
-    }
-
-    // Conditionally handle log memmap write.
-    fn maybe_log_memmap_write(&self, vaddr: u32, paddr: u32, size: u8) {
-        if !TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(region) = Self::memmap_region(paddr) {
-            if Self::warn_on_write(region) {
-                println!(
-                    "[core {}] Warning: write to {} vaddr=0x{:08X} paddr=0x{:08X} size={} pc=0x{:08X}",
-                    self.core_id, region, vaddr, paddr, size, self.pc
-                );
-            }
-        }
-    }
-
-    // Record the first watchpoint hit so the debugger can stop after stepping.
-    fn maybe_watch(&mut self, addr: u32, access: WatchAccess, value: u8) {
-        if self.watchpoint_hit.is_some() || self.watchpoints.is_empty() {
-            return;
-        }
-        for wp in &self.watchpoints {
-            if wp.addr == addr {
-                let matches = match (wp.kind, access) {
-                    (WatchKind::Read, WatchAccess::Read) => true,
-                    (WatchKind::Write, WatchAccess::Write) => true,
-                    (WatchKind::ReadWrite, _) => true,
-                    _ => false,
-                };
-                if matches {
-                    self.watchpoint_hit = Some(WatchpointHit {
-                        addr,
-                        access,
-                        value,
-                    });
-                    break;
-                }
-            }
-        }
-    }
-
-    // Convert mem address.
-    fn convert_mem_address(&mut self, addr: u32, operation: u32) -> Option<u32> {
-        let kmode = self.get_kmode();
-        if kmode {
-            if addr <= PHYSMEM_MAX {
-                Some(addr)
-            } else {
-                match self
-                    .tlb
-                    .access(self.cregfile[CREG_PID], addr >> 12, operation, kmode)
-                {
-                    TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
-                    TlbAccess::Fault(flags) => {
-                        self.record_pending_tlb_fault(flags);
-                        None
-                    }
-                }
-            }
-        } else {
-            match self
-                .tlb
-                .access(self.cregfile[CREG_PID], addr >> 12, operation, kmode)
-            {
-                TlbAccess::Hit(result) => Some(result | (addr & 0xFFF)),
-                TlbAccess::Fault(flags) => {
-                    self.record_pending_tlb_fault(flags);
-                    None
-                }
-            }
-        }
-    }
-
-    // Save the interrupted PC and processor status for exception return.
-    fn save_state(&mut self) {
-        // save state as an interrupt happens
-
-        // save pc
-        self.cregfile[CREG_EPC] = self.pc;
-
-        // save flags
+    // Enter a handler: snapshot EPC/EFG, disable interrupts, raise PSR, and
+    // jump through the IVT. After `psr_inc` the core is in kernel mode, so the
+    // vector is read physically (it cannot fault or hit watchpoints).
+    fn enter_handler(&mut self, vector: u32, epc: u32, reason: &str) {
+        self.cregfile[CREG_EPC] = epc;
         self.cregfile[CREG_EFG] = self.cregfile[CREG_FLG];
-
-        // disable interrupts
-        self.cregfile[CREG_IMR] &= 0x7FFFFFFF;
+        self.cregfile[CREG_IMR] &= !IMR_GLOBAL_ENABLE;
+        self.psr_inc(reason);
+        self.pc = self.memory.read_u32(vector * 4);
     }
 
-    // Redirect execution to the TLB-miss handler with the fault address recorded.
-    fn raise_tlb_miss(&mut self, addr: u32, flags: u32) {
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+    // Raise a synchronous exception that resumes at the faulting instruction.
+    fn raise_exception(&mut self, vector: u32, reason: &str) {
+        if tracing() {
+            println!(
+                "[core {}] exception {} pc=0x{:08X} psr=0x{:08X}",
+                self.core_id, reason, self.pc, self.cregfile[CREG_PSR]
+            );
+        }
+        self.enter_handler(vector, self.pc, reason);
+    }
+
+    // Raise an invalid-instruction exception for the current instruction.
+    fn raise_invalid_instruction(&mut self) {
+        self.raise_exception(VEC_INVALID_INSTR, "invalid_instr");
+    }
+
+    // Raise a TLB miss for `addr` using the fault flags recorded by the
+    // failed translation (0 when the access failed for another reason).
+    fn raise_pending_tlb_miss(&mut self, addr: u32) {
+        let flags = self.pending_tlb_fault.take().unwrap_or(TLB_FAULT_ABSENT);
+        if tracing() {
             println!(
                 "[core {}] exception tlb_miss mode={} addr=0x{:08X} flags=0x{:08X} pc=0x{:08X} psr=0x{:08X}",
                 self.core_id,
@@ -1523,337 +435,289 @@ impl Emulator {
                 addr,
                 flags,
                 self.pc,
-                self.cregfile[0]
+                self.cregfile[CREG_PSR]
             );
         }
-
-        // save address and pid that caused exception
         self.cregfile[CREG_TLB] = (addr >> 12) | (self.cregfile[CREG_PID] << 20);
         self.cregfile[CREG_TLBF] = flags;
-
-        self.save_state();
-
-        self.psr_inc_checked(PSR_REASON_TLB_MISS);
-        self.pc = self
-            .mem_read32(EXC_TLB_MISS_VECTOR * 4)
-            .expect("shouldnt fail");
+        self.enter_handler(VEC_TLB_MISS, self.pc, "tlb_miss");
     }
 
-    // Raise pending TLB miss.
-    fn raise_pending_tlb_miss(&mut self, addr: u32) {
-        let flags = self.take_pending_tlb_fault();
-        self.raise_tlb_miss(addr, flags);
-    }
-
-    // Raise misaligned PC.
-    fn raise_misaligned_pc(&mut self, pc: u32) {
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-            println!(
-                "[core {}] exception misaligned_pc pc=0x{:08X} psr=0x{:08X}",
-                self.core_id, pc, self.cregfile[0]
-            );
+    // Take the controller's pending bits into ISR; core 0 also advances the
+    // shared devices first. Device interrupts raised this tick become visible
+    // on the next tick.
+    fn collect_interrupts(&mut self) {
+        let core = self.core_id as usize;
+        self.interrupts.dispatch_input(self.memory.has_pending_input());
+        if core == 0 {
+            self.tick_devices();
         }
-
-        self.save_state();
-        self.psr_inc_checked(PSR_REASON_MISALIGNED_PC);
-        self.pc = self
-            .mem_read32(EXC_MISALIGNED_PC_VECTOR * 4)
-            .expect("misaligned-pc vector read should succeed");
-    }
-
-    // memory operations must be aligned
-    fn mem_write8(&mut self, addr: u32, data: u8) -> bool {
-        self.clear_pending_tlb_fault();
-        if addr == 0 {
-            println!(
-                "Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-
-        let vaddr = addr;
-        let addr = self.convert_mem_address(addr, 1);
-
-        if let Some(addr) = addr {
-            self.maybe_log_memmap_write(vaddr, addr, 1);
-            self.maybe_watch(vaddr, WatchAccess::Write, data);
-            self.memory.write(addr, data);
-            true
-        } else {
-            false
+        let pending = self.interrupts.take_pending(core);
+        if pending != 0 {
+            // IPI payloads are copied into the core-local MBI register.
+            if pending & IPI_INTERRUPT_BIT != 0 {
+                self.cregfile[CREG_MBI] = self.interrupts.read_ipi_payload(core);
+            }
+            self.cregfile[CREG_ISR] |= pending;
         }
     }
 
-    // Execute a 16-bit memory store.
-    fn mem_write16(&mut self, addr: u32, data: u16) -> bool {
-        self.clear_pending_tlb_fault();
-        if (addr & 1) != 0 {
-            // unaligned access
-            println!("Warning: unaligned memory access at 0x{:08x}", addr);
+    // Advance the shared PIT, SD DMA engines, and audio device by one tick.
+    // Only core 0 calls this.
+    fn tick_devices(&mut self) {
+        self.interrupts
+            .dispatch_device_interrupts(self.memory.check_interrupts());
+        if self.memory.tick_pit() {
+            self.interrupts.broadcast_timer();
         }
-        if addr == 0 {
-            println!(
-                "Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-        let addr = addr & 0xFFFFFFFE;
-        let bytes = data.to_le_bytes();
-        let Some(paddr) = self.convert_mem_address(addr, 1) else {
-            return false;
-        };
-        if paddr > PHYSMEM_MAX - 1 {
-            return false;
-        }
-        let addrs = [paddr, paddr + 1];
-        for (i, paddr) in addrs.iter().enumerate() {
-            if let Some(region) = Self::memmap_region(*paddr) {
-                if Self::warn_on_write(region) {
-                    self.maybe_log_memmap_write(addr + i as u32, *paddr, 2);
-                    break;
+        self.memory.tick_sd_dma();
+        if self.ticks_audio
+            && let Some(sample) = self.memory.tick_audio()
+                && let Some(sink) = &self.audio_sink {
+                    sink.write_sample(sample);
                 }
+    }
+
+    // Enter the highest-numbered enabled interrupt, waking the core if needed.
+    fn handle_interrupts(&mut self) {
+        let imr = self.cregfile[CREG_IMR];
+        if imr & IMR_GLOBAL_ENABLE == 0 {
+            return;
+        }
+        // Only lines 0..=15 have vectors; the controller never raises others.
+        let active = imr & self.cregfile[CREG_ISR] & INTERRUPT_LINES_MASK;
+        if active == 0 {
+            return;
+        }
+        if tracing() {
+            println!(
+                "[core {}] interrupt {} (active={:08X} imr={:08X} pc={:08X})",
+                self.core_id,
+                format_interrupts(active),
+                active,
+                imr,
+                self.pc
+            );
+        }
+        // Waking from `mode sleep` resumes after the sleep instruction.
+        if self.asleep && self.sleep_armed {
+            self.advance();
+        }
+        self.asleep = false;
+        self.sleep_armed = false;
+
+        let line = 31 - active.leading_zeros();
+        self.enter_handler(VEC_INTERRUPT_BASE + line, self.pc, "interrupt");
+    }
+
+    // Collect and deliver interrupts at the start of a tick.
+    fn service_interrupts(&mut self) {
+        self.collect_interrupts();
+        self.handle_interrupts();
+    }
+
+    // ---- Memory access ---------------------------------------------------
+
+    // Translate a virtual address. Kernel-mode addresses inside physical
+    // memory bypass the TLB. On a fault the TLBF bits are recorded for
+    // `raise_pending_tlb_miss` and None is returned.
+    fn translate(&mut self, vaddr: u32, access: Access) -> Option<u32> {
+        let kmode = self.get_kmode();
+        if kmode && vaddr <= PHYSMEM_MAX {
+            return Some(vaddr);
+        }
+        match self
+            .tlb
+            .access(self.cregfile[CREG_PID], vaddr >> 12, access, kmode)
+        {
+            TlbAccess::Hit(page) => Some(page | (vaddr & 0xFFF)),
+            TlbAccess::Fault(flags) => {
+                self.pending_tlb_fault = Some(flags);
+                None
             }
         }
-        self.maybe_watch(addr, WatchAccess::Write, bytes[0]);
-        self.maybe_watch(addr + 1, WatchAccess::Write, bytes[1]);
-        self.memory.write_u16(paddr, data);
+    }
+
+    // Emit the unaligned/null warnings for a data access and return the
+    // address with its low bits cleared (accesses are naturally aligned).
+    fn align_data_addr(&mut self, addr: u32, width: Width, verb: &str) -> u32 {
+        self.pending_tlb_fault = None;
+        let size = width.bytes();
+        if size > 1 && addr & (size - 1) != 0 {
+            println!("Warning: unaligned memory access at {:08x}", addr);
+        }
+        if addr == 0 {
+            println!(
+                "Warning: core {} {} virtual address 0x00000000 from pc 0x{:08X}",
+                self.core_id, verb, self.pc
+            );
+        }
+        addr & !(size - 1)
+    }
+
+    // Under --trace-ints, warn about stores into read-only kernel regions.
+    // Regions are at least 1 KiB aligned, so the first byte decides.
+    fn trace_protected_write(&self, vaddr: u32, paddr: u32, size: u32) {
+        if !tracing() {
+            return;
+        }
+        if let Some(region @ ("kernel_text" | "kernel_rodata" | "bios" | "ivt")) =
+            Self::memmap_region(paddr)
+        {
+            println!(
+                "[core {}] Warning: write to {} vaddr=0x{:08X} paddr=0x{:08X} size={} pc=0x{:08X}",
+                self.core_id, region, vaddr, paddr, size, self.pc
+            );
+        }
+    }
+
+    // Record the first watchpoint hit among the bytes of an access.
+    fn watch(&mut self, vaddr: u32, access: WatchAccess, bytes: &[u8]) {
+        if self.watchpoints.is_empty() {
+            return;
+        }
+        for (i, value) in bytes.iter().enumerate() {
+            if self.watchpoint_hit.is_some() {
+                return;
+            }
+            let addr = vaddr.wrapping_add(i as u32);
+            let hit = self.watchpoints.iter().any(|wp| {
+                wp.addr == addr
+                    && matches!(
+                        (wp.kind, access),
+                        (WatchKind::ReadWrite, _)
+                            | (WatchKind::Read, WatchAccess::Read)
+                            | (WatchKind::Write, WatchAccess::Write)
+                    )
+            });
+            if hit {
+                self.watchpoint_hit = Some(WatchpointHit {
+                    addr,
+                    access,
+                    value: *value,
+                });
+            }
+        }
+    }
+
+    // Load `width` bytes (zero-extended). None means a translation fault.
+    fn load(&mut self, addr: u32, width: Width) -> Option<u32> {
+        let vaddr = self.align_data_addr(addr, width, "reading from");
+        let paddr = self.translate(vaddr, Access::Read)?;
+        let value = match width {
+            Width::Byte => u32::from(self.memory.read(paddr)),
+            Width::Half => u32::from(self.memory.read_u16(paddr)),
+            Width::Word => self.memory.read_u32(paddr),
+        };
+        let bytes = value.to_le_bytes();
+        self.watch(vaddr, WatchAccess::Read, &bytes[..width.bytes() as usize]);
+        Some(value)
+    }
+
+    // Store the low `width` bytes of `value`. False means a translation fault.
+    fn store(&mut self, addr: u32, width: Width, value: u32) -> bool {
+        let vaddr = self.align_data_addr(addr, width, "writing to");
+        let Some(paddr) = self.translate(vaddr, Access::Write) else {
+            return false;
+        };
+        self.trace_protected_write(vaddr, paddr, width.bytes());
+        let bytes = value.to_le_bytes();
+        self.watch(vaddr, WatchAccess::Write, &bytes[..width.bytes() as usize]);
+        match width {
+            Width::Byte => self.memory.write(paddr, value as u8),
+            Width::Half => self.memory.write_u16(paddr, value as u16),
+            Width::Word => self.memory.write_u32(paddr, value),
+        }
         true
     }
 
-    // Execute a 32-bit memory store.
-    fn mem_write32(&mut self, addr: u32, data: u32) -> bool {
-        self.clear_pending_tlb_fault();
-        if (addr & 3) != 0 {
-            // unaligned access
+    // Atomic 32-bit read-modify-write; returns the previous value. The page
+    // must be both readable and writable through the same mapping.
+    fn atomic_rmw(&mut self, addr: u32, op: AtomicOp, operand: u32) -> Option<u32> {
+        self.pending_tlb_fault = None;
+        if addr & 3 != 0 {
             println!("Warning: unaligned memory access at {:08x}", addr);
         }
-        if addr == 0 {
-            println!(
-                "Warning: core {} writing to virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-        let addr = addr & 0xFFFFFFFC;
-        let bytes = data.to_le_bytes();
-        let Some(paddr) = self.convert_mem_address(addr, 1) else {
-            return false;
-        };
-        if paddr > PHYSMEM_MAX - 3 {
-            return false;
-        }
-        let addrs = [paddr, paddr + 1, paddr + 2, paddr + 3];
-        for (i, paddr) in addrs.iter().enumerate() {
-            if let Some(region) = Self::memmap_region(*paddr) {
-                if Self::warn_on_write(region) {
-                    self.maybe_log_memmap_write(addr + i as u32, *paddr, 4);
-                    break;
-                }
-            }
-        }
-        for (i, byte) in bytes.iter().enumerate() {
-            self.maybe_watch(addr + i as u32, WatchAccess::Write, *byte);
-        }
-        self.memory.write_u32(paddr, data);
-        true
-    }
-
-    // Execute an 8-bit memory load.
-    fn mem_read8(&mut self, addr: u32) -> Option<u8> {
-        self.clear_pending_tlb_fault();
-        if addr == 0 {
-            println!(
-                "Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-
-        let vaddr = addr;
-        let addr = self.convert_mem_address(addr, 0);
-
-        if let Some(addr) = addr {
-            let value = self.memory.read(addr);
-            self.maybe_watch(vaddr, WatchAccess::Read, value);
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    // Execute a 16-bit memory load.
-    fn mem_read16(&mut self, addr: u32) -> Option<u16> {
-        self.clear_pending_tlb_fault();
-        if (addr & 1) != 0 {
-            // unaligned access
-            println!("Warning: unaligned memory access at {:08x}", addr);
-        }
-        if addr == 0 {
-            println!(
-                "Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-        let addr = addr & 0xFFFFFFFE;
-        let paddr = self.convert_mem_address(addr, 0)?;
-        if paddr > PHYSMEM_MAX - 1 {
-            return None;
-        }
-        let bytes = self.memory.read_u16(paddr).to_le_bytes();
-        self.maybe_watch(addr, WatchAccess::Read, bytes[0]);
-        self.maybe_watch(addr + 1, WatchAccess::Read, bytes[1]);
-        Some(u16::from_le_bytes(bytes))
-    }
-
-    // Execute a 32-bit memory load.
-    fn mem_read32(&mut self, addr: u32) -> Option<u32> {
-        self.clear_pending_tlb_fault();
-        if (addr & 3) != 0 {
-            // unaligned access
-            println!("Warning: unaligned memory access at {:08x}", addr);
-        }
-        if addr == 0 {
-            println!(
-                "Warning: core {} reading from virtual address 0x00000000 from pc 0x{:08X}",
-                self.cregfile[9], self.pc
-            );
-        }
-        let addr = addr & 0xFFFFFFFC;
-        let paddr = self.convert_mem_address(addr, 0)?;
-        if paddr > PHYSMEM_MAX - 3 {
-            return None;
-        }
-        let bytes = self.memory.read_u32(paddr).to_le_bytes();
-        for (i, byte) in bytes.iter().enumerate() {
-            self.maybe_watch(addr + i as u32, WatchAccess::Read, *byte);
-        }
-        Some(u32::from_le_bytes(bytes))
-    }
-
-    // Execute a 32-bit atomic swap through the memory interface.
-    fn mem_atomic_swap32(&mut self, addr: u32, value: u32) -> Option<u32> {
-        self.clear_pending_tlb_fault();
-        if (addr & 3) != 0 {
-            println!("Warning: unaligned memory access at {:08x}", addr);
-        }
-        let addr = addr & 0xFFFFFFFC;
-        let read_addr = self.convert_mem_address(addr, 0)?;
-        let write_addr = self.convert_mem_address(addr, 1)?;
+        let vaddr = addr & !3;
+        let read_addr = self.translate(vaddr, Access::Read)?;
+        let write_addr = self.translate(vaddr, Access::Write)?;
         if read_addr != write_addr {
             return None;
         }
-        self.maybe_log_memmap_write(addr, write_addr, 4);
-        let prev = self.memory.atomic_swap_u32(read_addr, value);
-        let prev_bytes = prev.to_le_bytes();
-        let new_bytes = value.to_le_bytes();
+        self.trace_protected_write(vaddr, write_addr, 4);
+        let prev = self.memory.atomic_update_u32(read_addr, |prev| match op {
+            AtomicOp::FetchAdd => prev.wrapping_add(operand),
+            AtomicOp::Swap => operand,
+        });
+        let next = match op {
+            AtomicOp::FetchAdd => prev.wrapping_add(operand),
+            AtomicOp::Swap => operand,
+        };
+        let (prev_bytes, next_bytes) = (prev.to_le_bytes(), next.to_le_bytes());
         for i in 0..4 {
-            let vaddr = addr + i as u32;
-            self.maybe_watch(vaddr, WatchAccess::Read, prev_bytes[i]);
-            self.maybe_watch(vaddr, WatchAccess::Write, new_bytes[i]);
+            let byte_addr = vaddr + i as u32;
+            self.watch(byte_addr, WatchAccess::Read, &prev_bytes[i..=i]);
+            self.watch(byte_addr, WatchAccess::Write, &next_bytes[i..=i]);
         }
         Some(prev)
     }
 
-    // Execute a 32-bit atomic add through the memory interface.
-    fn mem_atomic_add32(&mut self, addr: u32, value: u32) -> Option<u32> {
-        self.clear_pending_tlb_fault();
-        if (addr & 3) != 0 {
-            println!("Warning: unaligned memory access at {:08x}", addr);
-        }
-        let addr = addr & 0xFFFFFFFC;
-        let read_addr = self.convert_mem_address(addr, 0)?;
-        let write_addr = self.convert_mem_address(addr, 1)?;
-        if read_addr != write_addr {
+    // Read an instruction word for display without raising exceptions.
+    fn peek_instruction(&mut self, vaddr: u32) -> Option<u32> {
+        if vaddr & 3 != 0 {
             return None;
         }
-        self.maybe_log_memmap_write(addr, write_addr, 4);
-        let prev = self.memory.atomic_add_u32(read_addr, value);
-        let next = u32::wrapping_add(prev, value);
-        let prev_bytes = prev.to_le_bytes();
-        let next_bytes = next.to_le_bytes();
-        for i in 0..4 {
-            let vaddr = addr + i as u32;
-            self.maybe_watch(vaddr, WatchAccess::Read, prev_bytes[i]);
-            self.maybe_watch(vaddr, WatchAccess::Write, next_bytes[i]);
-        }
-        Some(prev)
+        let paddr = self.translate(vaddr, Access::Execute);
+        self.pending_tlb_fault = None;
+        Some(self.memory.read_u32(paddr?))
     }
 
-    // Read an aligned physical word without triggering debugger watchpoints.
-    fn read_phys32(&mut self, addr: u32) -> Option<u32> {
-        if addr > PHYSMEM_MAX || addr + 3 > PHYSMEM_MAX {
-            return None;
-        }
-        Some(self.memory.read_u32(addr))
-    }
+    // ---- Execution -------------------------------------------------------
 
-    // Debug reads bypass watchpoints so inspection doesn't change execution flow.
-    fn read_phys8_debug(&mut self, addr: u32) -> Option<u8> {
-        if addr > PHYSMEM_MAX {
-            return None;
+    // Fetch and execute the instruction at PC, raising misaligned-PC or
+    // TLB-miss exceptions instead when the fetch fails.
+    fn execute_next(&mut self) -> StepOutcome {
+        let pc = self.pc;
+        self.pending_tlb_fault = None;
+        if pc & 3 != 0 {
+            if tracing() {
+                println!(
+                    "[core {}] exception misaligned_pc pc=0x{:08X} psr=0x{:08X}",
+                    self.core_id, pc, self.cregfile[CREG_PSR]
+                );
+            }
+            self.enter_handler(VEC_MISALIGNED_PC, pc, "misaligned_pc");
+            return StepOutcome::MisalignedPc { pc };
         }
-        Some(self.memory.read(addr))
-    }
-
-    // Debug reads bypass watchpoints so inspection doesn't change execution flow.
-    fn read_virt8_debug(&mut self, addr: u32) -> Option<u8> {
-        self.convert_mem_address(addr, 0)
-            .map(|paddr| self.memory.read(paddr))
-    }
-
-    // Fetch and translate the next aligned instruction word.
-    fn fetch(&mut self, vaddr: u32) -> Option<u32> {
-        self.clear_pending_tlb_fault();
-        if (vaddr & 3) != 0 {
-            self.raise_misaligned_pc(vaddr);
-            return None;
-        }
-        if vaddr == 0 {
+        if pc == 0 {
             println!("Warning: fetching from virtual address 0x00000000");
         }
-
-        let paddr = self.convert_mem_address(vaddr, 2);
-
-        if let Some(addr) = paddr {
-            Some(self.memory.read_u32(addr))
-        } else {
-            None
+        let Some(paddr) = self.translate(pc, Access::Execute) else {
+            self.raise_pending_tlb_miss(pc);
+            return StepOutcome::TlbMiss { pc };
+        };
+        let instr = self.memory.read_u32(paddr);
+        if let Some(profile) = self.profile.as_mut() {
+            // Sample mode, PID, and link register before `execute` changes them.
+            let kmode = self.cregfile[CREG_PSR] != 0;
+            let link = self.regfile[profiler::LINK_REGISTER];
+            profile.record_instruction(pc, instr, kmode, self.cregfile[CREG_PID], link);
         }
+        self.execute(instr);
+        StepOutcome::Executed { pc, instr }
     }
 
-    // Advance the core and its visible device timing by one tick.
+    // Advance the core and (on core 0) the shared devices by one tick. The
+    // clock-divider register gates instruction issue to every (div + 1)th tick.
     fn tick(&mut self) {
-        self.check_for_interrupts();
-        self.handle_interrupts();
-
-        // Sleep state after interrupt delivery decides whether this tick fetches.
+        self.service_interrupts();
+        // Sleep state after interrupt delivery decides whether this tick issues.
         let asleep = self.asleep;
-
-        let clk_divider = self.memory.read_u32(CLK_REG_START);
-
-        if !self.asleep && ((self.count % cmp::max(u32::wrapping_add(clk_divider, 1), 1)) == 0) {
-            let fetch_pc = self.pc;
-            let instr = self.fetch(fetch_pc);
-
-            // Fetch can raise a synchronous exception before any instruction is
-            // decoded, so avoid reclassifying that cycle as a TLB miss.
-            if self.pc != fetch_pc {
-                // Exception redirect already installed by fetch.
-            } else if let Some(instr) = instr {
-                if self.profile.is_some() {
-                    // Sample mode, PID, and link register before `execute` can change them.
-                    let kmode = self.get_kmode();
-                    let pid = self.cregfile[CREG_PID];
-                    let link = self.regfile[profiler::LINK_REGISTER];
-                    if let Some(profile) = self.profile.as_mut() {
-                        profile.record_instruction(fetch_pc, instr, kmode, pid, link);
-                    }
-                }
-                self.execute(instr);
-            } else {
-                self.raise_pending_tlb_miss(fetch_pc);
-            }
+        let divider = self.memory.clock_divider().wrapping_add(1).max(1);
+        if !asleep && self.count.is_multiple_of(divider) {
+            self.execute_next();
         }
         self.count = self.count.wrapping_add(1);
-
         // Counted after execute so the tick agrees with any window transition
         // this tick's instruction caused.
         if let Some(profile) = self.profile.as_mut() {
@@ -1861,1447 +725,360 @@ impl Emulator {
         }
     }
 
-    // Run this core until it halts or the shared run state requests a stop.
-    pub fn run(self, max_iters: u32, with_graphics: bool, audio_mode: AudioMode) -> Option<u32> {
-        self.run_with_profile(max_iters, with_graphics, audio_mode).0
+    // Debugger single step: deliver interrupts, then run one instruction
+    // unless asleep. Ignores the clock divider.
+    fn step_instruction(&mut self) -> StepOutcome {
+        self.service_interrupts();
+        if self.asleep {
+            return StepOutcome::Sleeping;
+        }
+        let outcome = self.execute_next();
+        self.count = self.count.wrapping_add(1);
+        outcome
     }
 
-    // Same as `run`, but also returns the profile if `enable_profiling` was
-    // called. The profile is returned even when `max_iters` stops the run.
-    pub fn run_with_profile(
-        mut self,
-        max_iters: u32,
-        with_graphics: bool,
-        audio_mode: AudioMode,
-    ) -> (Option<u32>, Option<CoreProfile>) {
-        let mut graphics: Option<Graphics> = None;
-        if with_graphics {
-            graphics = Some(Graphics::new(
-                self.memory.get_pixel_frame_buffer(),
-                self.memory.get_tile_frame_buffer(),
-                self.memory.get_tile_map(),
-                self.memory.get_io_buffer(),
-                self.memory.get_input_pending(),
-                self.memory.get_tile_vscroll_register(),
-                self.memory.get_tile_hscroll_register(),
-                self.memory.get_pixel_vscroll_register(),
-                self.memory.get_pixel_hscroll_register(),
-                self.memory.get_sprite_map(),
-                self.memory.get_tile_scale_register(),
-                self.memory.get_pixel_scale_register(),
-                self.memory.get_sprite_scale_registers(),
-                self.memory.get_vga_status_register(),
-                self.memory.get_vga_frame_register(),
-                self.memory.get_pending_interrupt(),
-            ));
-        }
-        let (audio_mode, audio_output) = AudioPlayback::start(audio_mode, Arc::clone(&self.memory));
-        let emulated_sink = audio_output
-            .as_ref()
-            .and_then(|output| output.emulated_sink());
-        self.configure_audio(audio_mode, emulated_sink);
-
-        // Share the result slot and completion flag with the graphics thread.
-        let ret: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
-        let finished: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-
-        // Runs emulator on thread because graphics must use main thread
-        let handle = thread::spawn({
-            let ret_clone = Arc::clone(&ret);
-            let finished_clone = Arc::clone(&finished);
-            move || {
-                self.count = 0;
-                while !self.halted {
-                    self.tick();
-                    if max_iters != 0 && self.count > max_iters {
-                        *ret_clone.lock().unwrap() = None;
-                        *finished_clone.lock().unwrap() = true;
-                        return self.profile.take();
-                    }
-                }
-
-                // return the value in r3
-                *ret_clone.lock().unwrap() = Some(self.regfile[1]);
-                *finished_clone.lock().unwrap() = true;
-                self.profile.take()
-            }
-        });
-
-        if with_graphics {
-            graphics.unwrap().start(finished, false);
-        }
-
-        let profile = handle.join().unwrap();
-        drop(audio_output);
-
-        // return the value in r3
-        let result = *ret.lock().unwrap();
-        (result, profile)
-    }
-
-    // Run the multicore emulator and keep the shared memory alive for inspection.
-    // Returns core-0 r1, the shared memory state after all cores exit, and one
-    // profile per core (in core order) when `profile` is Some, else empty.
-    pub fn run_multicore_with_memory(
-        path: String,
-        cores: usize,
-        sched: ScheduleMode,
-        max_iters: u32,
-        with_graphics: bool,
-        audio_mode: AudioMode,
-        use_uart_rx: bool,
-        sd_dma_ticks_per_word: u32,
-        sd0_image: Option<&[u8]>,
-        sd1_image: Option<&[u8]>,
-        profile: Option<Arc<ProfileWindow>>,
-    ) -> (Option<u32>, Arc<Memory>, Vec<CoreProfile>) {
-        assert!((1..=4).contains(&cores), "cores must be in 1..=4");
-        let image = load_program(&path);
-        let memory: Arc<Memory> = Arc::new(Memory::new(
-            image.instructions,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-        ));
-        if let Some(image) = sd0_image {
-            memory.load_sd_image(SdSlot::Sd0, image);
-        }
-        if let Some(image) = sd1_image {
-            memory.load_sd_image(SdSlot::Sd1, image);
-        }
-        let interrupts = InterruptController::new(cores);
-
-        let finished = Arc::new(Mutex::new(false));
-        let shared = Arc::new(RunShared::new(cores, Arc::clone(&finished)));
-
-        let scheduler = match sched {
-            ScheduleMode::Free => None,
-            _ => Some(Scheduler::new(sched, cores)),
-        };
-
-        let mut graphics = None;
-        if with_graphics {
-            graphics = Some(Graphics::new(
-                memory.get_pixel_frame_buffer(),
-                memory.get_tile_frame_buffer(),
-                memory.get_tile_map(),
-                memory.get_io_buffer(),
-                memory.get_input_pending(),
-                memory.get_tile_vscroll_register(),
-                memory.get_tile_hscroll_register(),
-                memory.get_pixel_vscroll_register(),
-                memory.get_pixel_hscroll_register(),
-                memory.get_sprite_map(),
-                memory.get_tile_scale_register(),
-                memory.get_pixel_scale_register(),
-                memory.get_sprite_scale_registers(),
-                memory.get_vga_status_register(),
-                memory.get_vga_frame_register(),
-                memory.get_pending_interrupt(),
-            ));
-        }
-        let (audio_mode, audio_output) = AudioPlayback::start(audio_mode, Arc::clone(&memory));
-        let emulated_sink = audio_output
-            .as_ref()
-            .and_then(|output| output.emulated_sink());
-
-        let mut handles = Vec::new();
-        for core_id in 0..cores {
-            let mut cpu = Emulator::from_shared(
-                Arc::clone(&memory),
-                Arc::clone(&interrupts),
-                use_uart_rx,
-                core_id as u32,
-            );
-            if core_id == 0 {
-                cpu.configure_audio(audio_mode, emulated_sink.clone());
-            }
-            if let Some(window) = &profile {
-                cpu.enable_profiling(Arc::clone(window));
-            }
-            // Each core runs in its own thread to allow real races.
-            let shared_clone = Arc::clone(&shared);
-            let scheduler_clone = scheduler.clone();
-            let handle = thread::spawn(move || {
-                run_core_loop(cpu, max_iters, scheduler_clone, shared_clone, core_id)
-            });
-            handles.push(handle);
-        }
-
-        if let Some(mut graphics) = graphics {
-            graphics.start(Arc::clone(&finished), false);
-        }
-
-        let mut profiles = Vec::new();
-        for handle in handles {
-            if let Some(core_profile) = handle.join().unwrap() {
-                profiles.push(core_profile);
-            }
-        }
-        drop(audio_output);
-
-        // Return value is r1 from core 0.
-        let results = shared.results.lock().unwrap();
-        (results.get(0).copied().unwrap_or(None), memory, profiles)
-    }
-
-    // Run the multicore emulator to completion and return core 0's result.
-    // Returns core-0 r1, or None if the program failed to terminate.
-    pub fn run_multicore(
-        path: String,
-        cores: usize,
-        sched: ScheduleMode,
-        max_iters: u32,
-        with_graphics: bool,
-        audio_mode: AudioMode,
-        use_uart_rx: bool,
-        sd_dma_ticks_per_word: u32,
-        sd0_image: Option<&[u8]>,
-        sd1_image: Option<&[u8]>,
-    ) -> Option<u32> {
-        let (result, _, _) = Self::run_multicore_with_memory(
-            path,
-            cores,
-            sched,
-            max_iters,
-            with_graphics,
-            audio_mode,
-            use_uart_rx,
-            sd_dma_ticks_per_word,
-            sd0_image,
-            sd1_image,
-            None,
-        );
-        result
-    }
-
-    // Route host input, tick core-owned devices, and enter any deliverable interrupt.
-    fn check_for_interrupts(&mut self) {
-        // Input routing only needs a queue-empty check, not the full queue lock.
-        let io_nonempty = self.memory.has_pending_input();
-        self.interrupts
-            .dispatch_input(self.use_uart_rx, io_nonempty);
-
-        if self.core_id == 0 {
-            let ints = self.memory.check_interrupts();
-            self.interrupts.dispatch_device_interrupts(ints);
-
-            // Shared PIT countdown is advanced by core 0 only.
-            if self.memory.tick_pit() {
-                self.interrupts.broadcast_timer();
-            }
-
-            // Advance shared device engines after sampling the current interrupt
-            // lines so newly-raised device interrupts appear on the next tick.
-            self.memory.tick_sd_dma();
-            if self.audio_mode != AudioMode::Fast {
-                if let Some(sample) = self.memory.tick_audio() {
-                    if let Some(sink) = self.audio_sink.as_ref() {
-                        sink.write_sample(sample);
-                    }
-                }
-            }
-        }
-
-        let pending = self.interrupts.take_pending(self.core_id as usize);
-        if pending != 0 {
-            // IPI payloads are copied into the core-local MBI register.
-            if (pending & IPI_INTERRUPT_BIT) != 0 {
-                self.cregfile[10] = self.interrupts.read_ipi_payload(self.core_id as usize);
-            }
-            self.cregfile[2] |= pending;
-        }
-    }
-
-    // Select and enter any interrupt currently enabled for this core.
-    fn handle_interrupts(&mut self) {
-        if self.cregfile[3] >> 31 != 0 {
-            // top bit activates/disables all interrupts
-            let active_ints = self.cregfile[3] & self.read_isr();
-
-            if active_ints == 0 {
-                return;
-            }
-
-            if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-                println!(
-                    "[core {}] interrupt {} (active={:08X} imr={:08X} pc={:08X})",
-                    self.core_id,
-                    format_interrupts(active_ints),
-                    active_ints,
-                    self.cregfile[3],
-                    self.pc
-                );
-            }
-
-            // Undo sleep; "mode sleep" advances to the next instruction.
-            if self.asleep {
-                if self.sleep_armed {
-                    self.pc += 4;
-                }
-            }
-            self.asleep = false;
-            self.sleep_armed = false;
-
-            self.save_state();
-
-            // enter kernel mode
-            self.psr_inc_checked("interrupt");
-
-            // disable interrupts
-            self.cregfile[3] &= 0x7FFFFFFF;
-
-            if (active_ints >> 15) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFF * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 14) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFE * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 13) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFD * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 12) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFC * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 11) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFB * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 10) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xFA * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 9) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF9 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 8) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF8 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 7) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF7 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 6) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF6 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 5) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF5 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 4) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF4 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 3) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF3 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 2) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF2 * 4)
-                    .expect("this address shouldn't error");
-            } else if (active_ints >> 1) & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF1 * 4)
-                    .expect("this address shouldn't error");
-            } else if active_ints & 1 != 0 {
-                self.pc = self
-                    .mem_read32(0xF0 * 4)
-                    .expect("this address shouldn't error");
-            }
-        }
-    }
-
-    // Raise exc instr.
-    fn raise_exc_instr(&mut self) {
-        // exec_instr
-
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-            println!(
-                "[core {}] exception invalid_instr pc=0x{:08X} psr=0x{:08X}",
-                self.core_id, self.pc, self.cregfile[0]
-            );
-        }
-
-        self.save_state();
-
-        self.psr_inc_checked("invalid_instr");
-
-        self.pc = self.mem_read32(0x80 * 4).expect("shouldn't fail");
-        return;
-    }
-
-    // Decode the opcode and execute one guest instruction.
+    // Decode the opcode (top 5 bits) and execute one instruction.
     fn execute(&mut self, instr: u32) {
-        let opcode = instr >> 27; // opcode is top 5 bits of instruction
-
+        const WIDTHS: [Width; 3] = [Width::Word, Width::Half, Width::Byte];
+        const MODES: [AddrMode; 3] = [AddrMode::Absolute, AddrMode::Relative, AddrMode::Immediate];
+        let opcode = instr >> 27;
         match opcode {
-            0 => self.alu_op(instr, false),
-            1 => self.alu_op(instr, true),
-            2 => self.load_upper_immediate(instr),
-
-            // 32 bit mem instructions
-            3 => self.mem_absolute(instr, 2),
-            4 => self.mem_relative(instr, 2),
-            5 => self.mem_imm(instr, 2),
-
-            // 16 bit mem instructions
-            6 => self.mem_absolute(instr, 1),
-            7 => self.mem_relative(instr, 1),
-            8 => self.mem_imm(instr, 1),
-
-            // 8 bit mem instructions
-            9 => self.mem_absolute(instr, 0),
-            10 => self.mem_relative(instr, 0),
-            11 => self.mem_imm(instr, 0),
-
-            12 => self.branch_imm(instr),
-            13 => self.branch_absolute(instr),
-            14 => self.branch_relative(instr),
-
-            15 => self.trap_instr(instr),
-
-            22 => self.adpc(instr),
-
-            // fadd
-            16 => self.atomic_absolute(instr, 0),
-            17 => self.atomic_relative(instr, 0),
-            18 => self.atomic_imm(instr, 0),
-
-            // swap
-            19 => self.atomic_absolute(instr, 1),
-            20 => self.atomic_relative(instr, 1),
-            21 => self.atomic_imm(instr, 1),
-
-            31 => self.kernel_instr(instr),
-            _ => self.raise_exc_instr(),
-        }
-    }
-
-    // Read a general-purpose register, preserving the architectural r0 value.
-    fn get_reg(&self, regnum: u32) -> u32 {
-        if self.get_kmode() && regnum == 31 {
-            // use ISP while handling exceptions or interrupts in kernel mode
-            self.cregfile[8]
-        } else {
-            // normal register access
-            self.regfile[regnum as usize]
-        }
-    }
-
-    // Add the signed displacement to the current PC and write the result.
-    fn adpc(&mut self, instr: u32) {
-        // adpc rA, i
-        // rA <- pc + 4 + sign-extended 22-bit immediate (pc-relative to next instruction).
-        let r_a = (instr >> 22) & 0x1F;
-        let imm = (instr & 0x3FFFFF) as i32;
-        let imm = (imm << 10) >> 10; // sign-extend 22 bits
-        let pc = self.pc as i32;
-        let value = pc.wrapping_add(4).wrapping_add(imm) as u32;
-        self.write_reg(r_a, value);
-        self.pc += 4;
-    }
-
-    // Write a general-purpose register while ignoring writes to r0.
-    fn write_reg(&mut self, regnum: u32, value: u32) {
-        if self.get_kmode() && regnum == 31 {
-            // use ISP while handling exceptions or interrupts in kernel mode
-            self.cregfile[8] = value;
-        } else {
-            // normal register access
-            if regnum != 0 {
-                // r0 is always zero
-                self.regfile[regnum as usize] = value;
-            }
-        }
-    }
-
-    // Decode the immediate ALU encoding, including packed shift forms.
-    fn decode_alu_imm(&mut self, op: u32, imm: u32) -> Option<u32> {
-        match op {
-            0..=6 => {
-                // Bitwise op
-                Some((imm & 0xFF) << (8 * ((imm >> 8) & 3)))
-            }
-            7..=13 => {
-                // Shift op
-                Some(imm & 0x1F)
-            }
-            14..=18 => {
-                // Arithmetic op
-                Some(imm | (0xFFFFF000 * ((imm >> 11) & 1))) // sign extend
-            }
-            _ => {
-                self.raise_exc_instr();
-                return None;
-            }
-        }
-    }
-
-    // 2nd operand is either register or immediate
-    fn alu_op(&mut self, instr: u32, imm: bool) {
-        // instruction format is
-        // 00000aaaaabbbbbxxxxxxx?????ccccc
-        // op (5 bits) | r_a (5 bits) | r_b (5 bits) | unused (7 bits) | op (5 bits) | r_c (5 bits)
-        let r_a = (instr >> 22) & 0x1F;
-        let r_b = (instr >> 17) & 0x1F;
-        let op = if imm {
-            (instr >> 12) & 0x1F
-        } else {
-            (instr >> 5) & 0x1F
-        };
-
-        // retrieve arguments
-        let r_b = self.get_reg(r_b);
-
-        let r_c = if imm {
-            self.decode_alu_imm(op, instr & 0xFFF)
-                .expect("immediate decoding failed")
-        } else {
-            let r_c = instr & 0x1F;
-            self.get_reg(r_c)
-        };
-
-        let prev_carry = self.cregfile[5] & 1;
-
-        self.cregfile[5] &= 0xFFFFFFF0; // clear arithmetic flags
-
-        // carry flag is set differently for each instruction,
-        // so its handled here. The other flags are all handled together
-        let result = match op {
-            0 => {
-                r_b & r_c // and
-            }
-            1 => {
-                !(r_b & r_c) // nand
-            }
+            0 => self.alu_instr(instr, false),
+            1 => self.alu_instr(instr, true),
             2 => {
-                r_b | r_c // or
+                // lui: rA <- imm22 << 10
+                self.write_reg(field_a(instr), (instr & 0x3F_FFFF) << 10);
+                self.advance();
             }
-            3 => {
-                !(r_b | r_c) // nor
+            3..=11 => {
+                let group = (opcode - 3) as usize;
+                self.mem_instr(instr, WIDTHS[group / 3], MODES[group % 3]);
             }
-            4 => {
-                r_b ^ r_c // xor
+            12 => self.branch_imm(instr),
+            13 => self.branch_reg(instr, false),
+            14 => self.branch_reg(instr, true),
+            15 => self.trap_instr(instr),
+            16..=18 => self.atomic_instr(instr, AtomicOp::FetchAdd, MODES[(opcode - 16) as usize]),
+            19..=21 => self.atomic_instr(instr, AtomicOp::Swap, MODES[(opcode - 19) as usize]),
+            22 => {
+                // adpc: rA <- PC + 4 + sext(imm22)
+                let imm = alu::sign_extend(instr & 0x3F_FFFF, 22);
+                self.write_reg(field_a(instr), self.pc.wrapping_add(4).wrapping_add(imm));
+                self.advance();
             }
-            5 => {
-                !(r_b ^ r_c) // xnor
-            }
-            6 => {
-                !r_c // not
-            }
-            7 => {
-                // set carry flag
-                self.cregfile[5] |= (r_b >> if r_c > 0 { 32 - r_c } else { 0 } != 0) as u32;
-                r_b << r_c // lsl
-            }
-            8 => {
-                // set carry flag
-                self.cregfile[5] |= (r_b & ((1 << r_c) - 1) != 0) as u32;
-                r_b >> r_c // lsr
-            }
-            9 => {
-                // set carry flag
-                let carry = r_b & 1;
-                let sign = r_b >> 31;
-                self.cregfile[5] |= carry;
-                (r_b >> r_c) | (0xFFFFFFFF * sign << if r_c > 0 { 32 - r_c } else { 0 }) // asr
-            }
-            10 => {
-                // set carry flag
-                let carry = r_b >> if r_c > 0 { 32 - r_c } else { 0 };
-                self.cregfile[5] |= (carry != 0) as u32;
-                (r_b << r_c) | carry // rotl
-            }
-            11 => {
-                // set carry flag
-                let carry = r_b & ((1 << r_c) - 1);
-                self.cregfile[5] |= (carry != 0) as u32;
-                (r_b >> r_c) | (carry << if r_c > 0 { 32 - r_c } else { 0 }) // rotr
-            }
-            12 => {
-                // set carry flag
-                let carry = if r_c > 0 { r_b >> (32 - r_c) } else { 0 };
-                self.cregfile[5] |= (carry != 0) as u32;
-                (r_b << r_c) | if r_c > 0 { prev_carry << (r_c - 1) } else { 0 } // lslc
-            }
-            13 => {
-                // set carry flag
-                let carry = r_b & ((1 << r_c) - 1);
-                self.cregfile[5] |= (carry != 0) as u32;
-                (r_b >> r_c) | (prev_carry << if r_c > 0 { 32 - r_c } else { 0 }) // lsrc
-            }
-            14 => {
-                // add
-                let result = u64::from(r_b) + u64::from(r_c);
+            31 => self.kernel_instr(instr),
+            _ => self.raise_invalid_instruction(),
+        }
+    }
 
-                // set the carry flag
-                self.cregfile[5] |= (result >> 32 != 0) as u32;
-
-                result as u32
+    // ALU instruction; the second operand is rC or a decoded immediate.
+    fn alu_instr(&mut self, instr: u32, imm_form: bool) {
+        let r_a = field_a(instr);
+        let lhs = self.get_reg(field_b(instr));
+        let (op, rhs) = if imm_form {
+            let op = (instr >> 12) & 0x1F;
+            match alu::decode_imm(op, instr & 0xFFF) {
+                Some(imm) => (op, imm),
+                None => return self.raise_invalid_instruction(),
             }
-            15 => {
-                // addc
-                let result = u64::from(r_c) + u64::from(r_b) + u64::from(prev_carry);
+        } else {
+            ((instr >> 5) & 0x1F, self.get_reg(instr & 0x1F))
+        };
+        let carry_in = self.cregfile[CREG_FLG] & FLAG_CARRY != 0;
+        let Some(out) = alu::evaluate(op, lhs, rhs, carry_in, imm_form) else {
+            return self.raise_invalid_instruction();
+        };
+        // Immediate subtractions compute imm - rB, so V uses that order.
+        let reversed = imm_form && (op == alu::OP_SUB || op == alu::OP_SUBB);
+        let (a, b) = if reversed { (rhs, lhs) } else { (lhs, rhs) };
+        let mut flags = 0;
+        if out.carry {
+            flags |= FLAG_CARRY;
+        }
+        if out.value == 0 {
+            flags |= FLAG_ZERO;
+        }
+        if out.value >> 31 != 0 {
+            flags |= FLAG_SIGN;
+        }
+        if alu::overflow(op, a, b, out.value) {
+            flags |= FLAG_OVERFLOW;
+        }
+        self.write_reg(r_a, out.value);
+        self.cregfile[CREG_FLG] = (self.cregfile[CREG_FLG] & !ALU_FLAGS) | flags;
+        self.advance();
+    }
 
-                // set the carry flag
-                self.cregfile[5] |= (result >> 32 != 0) as u32;
-
-                result as u32
+    // Load/store with absolute, PC-relative, or immediate addressing.
+    fn mem_instr(&mut self, instr: u32, width: Width, mode: AddrMode) {
+        let r_a = field_a(instr);
+        let (addr, is_load, writeback) = match mode {
+            AddrMode::Absolute => {
+                // op | rA | rB | load | y(2) | z(2) | imm12; imm is shifted by z.
+                // y: 0 = offset, 1 = pre-increment, 2 = post-increment. y = 3
+                // is not specified by docs/ISA.md and behaves like y = 0.
+                let r_b = field_b(instr);
+                let y = (instr >> 14) & 3;
+                let imm = alu::sign_extend(instr & 0xFFF, 12) << ((instr >> 12) & 3);
+                let base = self.get_reg(r_b);
+                let offset_addr = base.wrapping_add(imm);
+                let addr = if y == 2 { base } else { offset_addr };
+                let writeback = matches!(y, 1 | 2).then_some((r_b, offset_addr));
+                (addr, (instr >> 16) & 1 != 0, writeback)
             }
-            16 => {
-                // sub
-
-                // two's complement
-                // sub with immediate does imm - reg
-                let result = if imm {
-                    let r_b = 1 + u64::from(!r_b);
-                    u64::from(r_c) + r_b
-                } else {
-                    let r_c = 1 + u64::from(!r_c);
-                    r_c + u64::from(r_b)
-                };
-
-                // set the carry flag
-                self.cregfile[5] |= (result >> 32 != 0) as u32;
-
-                result as u32
+            AddrMode::Relative => {
+                let imm = alu::sign_extend(instr & 0xFFFF, 16);
+                let addr = self
+                    .get_reg(field_b(instr))
+                    .wrapping_add(imm)
+                    .wrapping_add(self.pc)
+                    .wrapping_add(4);
+                (addr, (instr >> 16) & 1 != 0, None)
             }
-            17 => {
-                // subb
-
-                // two's complement
-                let result = if imm {
-                    let r_b = 1 + u64::from(!(u32::wrapping_add(u32::from(prev_carry == 0), r_b)));
-                    u64::from(imm) + r_b
-                } else {
-                    let r_c = 1 + u64::from(!(u32::wrapping_add(u32::from(prev_carry == 0), r_c)));
-                    r_c + u64::from(r_b)
-                };
-
-                // set the carry flag
-                self.cregfile[5] |= (result >> 32 != 0) as u32;
-
-                result as u32
+            AddrMode::Immediate => {
+                let imm = alu::sign_extend(instr & 0x1F_FFFF, 21);
+                let addr = imm.wrapping_add(self.pc).wrapping_add(4);
+                (addr, (instr >> 21) & 1 != 0, None)
             }
-            18 => {
-                // sxtb (sign extend byte)
-                let byte = r_c & 0xFF;
-                if (byte & 0x80) != 0 {
-                    byte | 0xFFFFFF00
-                } else {
-                    byte
+        };
+        let ok = if is_load {
+            match self.load(addr, width) {
+                Some(value) => {
+                    self.write_reg(r_a, value);
+                    true
                 }
+                None => false,
             }
-            19 => {
-                // sxtd (sign extend double)
-                let half = r_c & 0xFFFF;
-                if (half & 0x8000) != 0 {
-                    half | 0xFFFF0000
-                } else {
-                    half
-                }
-            }
-            20 => {
-                // tncb (truncate to byte)
-                r_c & 0xFF
-            }
-            21 => {
-                // tncd (truncate to double)
-                r_c & 0xFFFF
-            }
+        } else {
+            let value = self.get_reg(r_a);
+            self.store(addr, width, value)
+        };
+        if !ok {
+            return self.raise_pending_tlb_miss(addr);
+        }
+        if let Some((r_b, value)) = writeback {
+            self.write_reg(r_b, value);
+        }
+        self.advance();
+    }
+
+    // Atomic fetch-add or swap: rA <- old [addr], [addr] <- f(old, rC).
+    fn atomic_instr(&mut self, instr: u32, op: AtomicOp, mode: AddrMode) {
+        // op | rA | rC | rB | imm12, or op | rA | rC | imm17 for Immediate.
+        let r_a = field_a(instr);
+        let operand = self.get_reg(field_b(instr));
+        let addr = match mode {
+            AddrMode::Immediate => alu::sign_extend(instr & 0x1_FFFF, 17)
+                .wrapping_add(self.pc)
+                .wrapping_add(4),
             _ => {
-                self.raise_exc_instr();
-                return;
+                let base = self
+                    .get_reg((instr >> 12) & 0x1F)
+                    .wrapping_add(alu::sign_extend(instr & 0xFFF, 12));
+                if mode == AddrMode::Relative {
+                    base.wrapping_add(self.pc).wrapping_add(4)
+                } else {
+                    base
+                }
             }
         };
-
-        // never update r0
-        self.write_reg(r_a, result);
-
-        self.update_flags(result, r_b, r_c, op);
-
-        self.pc += 4;
-    }
-
-    // Load upper immediate.
-    fn load_upper_immediate(&mut self, instr: u32) {
-        // store imm << 10 in r_a
-        let r_a = (instr >> 22) & 0x1F;
-        let imm = (instr & 0x03FFFFF) << 10;
-
-        self.write_reg(r_a, imm);
-
-        self.pc += 4;
-    }
-
-    // Execute a memory operation using an absolute address.
-    fn mem_absolute(&mut self, instr: u32, size: u8) {
-        // instruction format is
-        // 00011aaaaabbbbb?yyzziiiiiiiiiiii
-        // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | y (2 bits) | z (2 bits) | imm (12 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let r_b = (instr >> 17) & 0x1F;
-        let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-        let y = (instr >> 14) & 3; // offset type: 0 = signed offset, 1 = preinc, 2 = postinc, 3 = reserved
-        let z = (instr >> 12) & 3; // shift amount
-        let imm = instr & 0xFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
-        // shift imm
-        let imm = imm << z;
-
-        if y >= 4 {
-            self.raise_exc_instr();
-            return;
-        };
-
-        // get addr
-        let r_b_out = self.get_reg(r_b);
-        let addr = if y == 2 {
-            r_b_out
-        } else {
-            u32::wrapping_add(r_b_out, imm)
-        }; // check for postincrement
-
-        if is_load {
-            let data = match size {
-                0 => {
-                    // byte
-                    self.mem_read8(addr).map(|v| u32::from(v))
-                }
-                1 => {
-                    // halfword
-                    self.mem_read16(addr).map(|v| u32::from(v))
-                }
-                2 => {
-                    // word
-                    self.mem_read32(addr)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-
-            if let Some(data) = data {
-                self.write_reg(r_a, data);
-            } else {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
-            };
-        } else {
-            // is a store
-            let data = self.get_reg(r_a);
-            let success = match size {
-                0 => {
-                    // byte
-                    self.mem_write8(addr, data as u8)
-                }
-                1 => {
-                    // halfword
-                    self.mem_write16(addr, data as u16)
-                }
-                2 => {
-                    // word
-                    self.mem_write32(addr, data)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-            if !success {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
+        match self.atomic_rmw(addr, op, operand) {
+            Some(prev) => {
+                self.write_reg(r_a, prev);
+                self.advance();
             }
-        }
-
-        if y == 1 || y == 2 {
-            // pre or post increment
-            self.write_reg(r_b, u32::wrapping_add(r_b_out, imm));
-        }
-
-        self.pc += 4;
-    }
-
-    // Execute a memory operation using register-relative addressing.
-    fn mem_relative(&mut self, instr: u32, size: u8) {
-        // instruction format is
-        // 00100aaaaabbbbb?iiiiiiiiiiiiiiii
-        // op (5 bits) | r_a (5 bits) | r_b (5 bits) | op (1 bit) | imm (16 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let r_b = (instr >> 17) & 0x1F;
-        let is_load = ((instr >> 16) & 1) != 0; // is this a load? else is store
-        let imm = instr & 0xFFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFFF0000 * ((imm >> 15) & 1));
-
-        // get addr
-        let r_b_out = self.get_reg(r_b);
-        let addr = u32::wrapping_add(r_b_out, imm);
-
-        // make addr pc-relative
-        let addr = u32::wrapping_add(addr, self.pc);
-        let addr = u32::wrapping_add(addr, 4);
-
-        if is_load {
-            let data = match size {
-                0 => {
-                    // byte
-                    self.mem_read8(addr).map(|v| u32::from(v))
-                }
-                1 => {
-                    // halfword
-                    self.mem_read16(addr).map(|v| u32::from(v))
-                }
-                2 => {
-                    // word
-                    self.mem_read32(addr)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-
-            if let Some(data) = data {
-                self.write_reg(r_a, data);
-            } else {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
-            };
-        } else {
-            // is a store
-            let data = self.get_reg(r_a);
-
-            let success = match size {
-                0 => {
-                    // byte
-                    self.mem_write8(addr, data as u8)
-                }
-                1 => {
-                    // halfword
-                    self.mem_write16(addr, data as u16)
-                }
-                2 => {
-                    // word
-                    self.mem_write32(addr, data)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-
-            if !success {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
-            }
-        }
-
-        self.pc += 4;
-    }
-
-    // Execute a memory operation using an encoded immediate offset.
-    fn mem_imm(&mut self, instr: u32, size: u8) {
-        // instruction format is
-        // 00101aaaaa?iiiiiiiiiiiiiiiiiiiii
-        // op (5 bits) | r_a (5 bits) | op (1 bit) | imm (21 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let is_load = ((instr >> 21) & 1) != 0; // is this a load? else is store
-        let imm = instr & 0x1FFFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFE00000 * ((imm >> 20) & 1));
-
-        // get addr
-        let addr = u32::wrapping_add(imm, self.pc);
-        let addr = u32::wrapping_add(addr, 4);
-
-        if is_load {
-            let data = match size {
-                0 => {
-                    // byte
-                    self.mem_read8(addr).map(|v| u32::from(v))
-                }
-                1 => {
-                    // halfword
-                    self.mem_read16(addr).map(|v| u32::from(v))
-                }
-                2 => {
-                    // word
-                    self.mem_read32(addr)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-
-            if let Some(data) = data {
-                self.write_reg(r_a, data);
-            } else {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
-            };
-        } else {
-            // is a store
-            let data = self.get_reg(r_a);
-
-            let success = match size {
-                0 => {
-                    // byte
-                    self.mem_write8(addr, data as u8)
-                }
-                1 => {
-                    // halfword
-                    self.mem_write16(addr, data as u16)
-                }
-                2 => {
-                    // word
-                    self.mem_write32(addr, data)
-                }
-                _ => {
-                    panic!("invalid size for mem instruction");
-                }
-            };
-
-            if !success {
-                // TLB Miss
-                self.raise_pending_tlb_miss(addr);
-                return;
-            }
-        }
-
-        self.pc += 4;
-    }
-
-    // Execute an atomic operation using an absolute address.
-    fn atomic_absolute(&mut self, instr: u32, type_: u8) {
-        // instruction format is
-        // 10000aaaaabbbbbccccciiiiiiiiiiii - fadd
-        // opcode is 10011 for swap
-        // op (5 bits) | r_a (5 bits) | r_c (5 bits) | r_b (5 bits) | imm (12 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let r_c = (instr >> 17) & 0x1F;
-        let r_b = (instr >> 12) & 0x1F;
-        let imm = instr & 0xFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
-
-        // get addr
-        let r_b_out = self.get_reg(r_b);
-        let r_c_out = self.get_reg(r_c);
-        let addr = u32::wrapping_add(r_b_out, imm);
-
-        let data = match type_ {
-            0 => self.mem_atomic_add32(addr, r_c_out),
-            1 => self.mem_atomic_swap32(addr, r_c_out),
-            _ => panic!("invalid atomic type"),
-        };
-        if let Some(data) = data {
-            self.write_reg(r_a, data);
-        } else {
-            // TLB Miss
-            self.raise_pending_tlb_miss(addr);
-            return;
-        }
-
-        self.pc += 4;
-    }
-
-    // Execute an atomic operation using register-relative addressing.
-    fn atomic_relative(&mut self, instr: u32, type_: u8) {
-        // instruction format is
-        // 10001aaaaabbbbbccccciiiiiiiiiiii
-        // or opcode is 10100
-        // op (5 bits) | r_a (5 bits) | r_c (5 bits) | r_b (5 bits) | imm (12 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let r_c = (instr >> 17) & 0x1F;
-        let r_b = (instr >> 12) & 0x1F;
-        let imm = instr & 0xFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFFFF000 * ((imm >> 11) & 1));
-
-        // get addr
-        let r_b_out = self.get_reg(r_b);
-        let r_c_out = self.get_reg(r_c);
-        let addr = u32::wrapping_add(r_b_out, imm);
-
-        // make addr pc-relative
-        let addr = u32::wrapping_add(addr, self.pc);
-        let addr = u32::wrapping_add(addr, 4);
-
-        let data = match type_ {
-            0 => self.mem_atomic_add32(addr, r_c_out),
-            1 => self.mem_atomic_swap32(addr, r_c_out),
-            _ => panic!("invalid atomic type"),
-        };
-        if let Some(data) = data {
-            self.write_reg(r_a, data);
-        } else {
-            // TLB Miss
-            self.raise_pending_tlb_miss(addr);
-            return;
-        }
-
-        self.pc += 4;
-    }
-
-    // Execute an atomic operation using an encoded immediate offset.
-    fn atomic_imm(&mut self, instr: u32, type_: u8) {
-        // instruction format is
-        // 10010aaaaabbbbbiiiiiiiiiiiiiiiii
-        // or opcode is 10101
-        // op (5 bits) | r_a (5 bits) | r_b (5 bits) | imm (17 bits)
-
-        let r_a = (instr >> 22) & 0x1F;
-        let r_c = (instr >> 17) & 0x1F;
-        let imm = instr & 0x1FFFF;
-
-        // sign extend imm
-        let imm = imm | (0xFFFE0000 * ((imm >> 16) & 1));
-
-        // get addr
-        let r_c_out = self.get_reg(r_c);
-
-        // make addr pc-relative
-        let addr = u32::wrapping_add(imm, self.pc);
-        let addr = u32::wrapping_add(addr, 4);
-
-        let data = match type_ {
-            0 => self.mem_atomic_add32(addr, r_c_out),
-            1 => self.mem_atomic_swap32(addr, r_c_out),
-            _ => panic!("invalid atomic type"),
-        };
-        if let Some(data) = data {
-            self.write_reg(r_a, data);
-        } else {
-            // TLB Miss
-            self.raise_pending_tlb_miss(addr);
-            return;
-        }
-
-        self.pc += 4;
-    }
-
-    // Evaluate the encoded branch condition against the current flags.
-    fn get_branch_condition(&mut self, op: u32) -> Option<bool> {
-        let carry = (self.cregfile[5] & 1) != 0;
-        let zero = (self.cregfile[5] & 2) != 0;
-        let sign = (self.cregfile[5] & 4) != 0;
-        let overflow = (self.cregfile[5] & 8) != 0;
-
-        match op {
-            0 => Some(true),                       // br
-            1 => Some(zero),                       // bz
-            2 => Some(!zero),                      // bnz
-            3 => Some(sign),                       // bs
-            4 => Some(!sign),                      // bns
-            5 => Some(carry),                      // bc
-            6 => Some(!carry),                     // bnc
-            7 => Some(overflow),                   // bo
-            8 => Some(!overflow),                  // bno
-            9 => Some(!zero && !sign),             // bps
-            10 => Some(zero || sign),              // bnps
-            11 => Some(sign == overflow && !zero), // bg
-            12 => Some(sign == overflow),          // bge
-            13 => Some(sign != overflow && !zero), // bl
-            14 => Some(sign != overflow || zero),  // ble
-            15 => Some(!zero && carry),            // ba
-            16 => Some(carry || zero),             // bae
-            17 => Some(!carry && !zero),           // bb
-            18 => Some(!carry || zero),            // bbe
-            _ => {
-                self.raise_exc_instr();
-                return None;
-            }
+            None => self.raise_pending_tlb_miss(addr),
         }
     }
 
-    // Execute a PC-relative branch using its encoded displacement.
+    // Evaluate a branch condition code against FLG; None for undefined codes.
+    fn branch_condition(&self, cond: u32) -> Option<bool> {
+        let flags = self.cregfile[CREG_FLG];
+        let carry = flags & FLAG_CARRY != 0;
+        let zero = flags & FLAG_ZERO != 0;
+        let sign = flags & FLAG_SIGN != 0;
+        let overflow = flags & FLAG_OVERFLOW != 0;
+        Some(match cond {
+            0 => true,                       // br
+            1 => zero,                       // bz
+            2 => !zero,                      // bnz
+            3 => sign,                       // bs
+            4 => !sign,                      // bns
+            5 => carry,                      // bc
+            6 => !carry,                     // bnc
+            7 => overflow,                   // bo
+            8 => !overflow,                  // bno
+            9 => !zero && !sign,             // bps
+            10 => zero || sign,              // bnps
+            11 => sign == overflow && !zero, // bg
+            12 => sign == overflow,          // bge
+            13 => sign != overflow && !zero, // bl
+            14 => sign != overflow || zero,  // ble
+            15 => !zero && carry,            // ba
+            16 => carry || zero,             // bae
+            17 => !carry && !zero,           // bb
+            18 => !carry || zero,            // bbe
+            _ => return None,
+        })
+    }
+
+    // PC-relative branch: target = PC + 4 + sext(imm22) * 4.
     fn branch_imm(&mut self, instr: u32) {
-        // instruction format is
-        // 01100?????iiiiiiiiiiiiiiiiiiiiii
-        // op (5 bits) | op (5 bits) | imm (22 bits)
-        let op = (instr >> 22) & 0x1F;
-        let imm = instr & 0x3FFFFF;
-
-        // sign extend
-        let imm = imm | (0xFFC00000 * ((imm >> 21) & 1));
-
-        if let Some(branch) = self.get_branch_condition(op) {
-            if branch {
-                self.pc =
-                    u32::wrapping_add(self.pc, u32::wrapping_add(4, u32::wrapping_mul(imm, 4)));
-            } else {
-                self.pc += 4;
-            }
+        let Some(taken) = self.branch_condition(field_a(instr)) else {
+            return self.raise_invalid_instruction();
+        };
+        if taken {
+            let offset = alu::sign_extend(instr & 0x3F_FFFF, 22).wrapping_mul(4);
+            self.pc = self.pc.wrapping_add(4).wrapping_add(offset);
         } else {
-            return;
+            self.advance();
         }
     }
 
-    // Execute a branch to the address formed from two registers.
-    fn branch_absolute(&mut self, instr: u32) {
-        // instruction format is
-        // 01101?????xxxxxxxxxxxxaaaaabbbbb
-        // op (5 bits) | op (5 bits) | unused (12 bits) | r_a (5 bits) | r_b (5 bits)
-        let op = (instr >> 22) & 0x1F;
-        let r_a = (instr >> 5) & 0x1F;
-        let r_b = instr & 0x1F;
-
-        // get address
-        let r_b = self.get_reg(r_b);
-
-        if let Some(branch) = self.get_branch_condition(op) {
-            if branch {
-                self.write_reg(r_a, self.pc + 4);
-                self.pc = r_b;
-            } else {
-                self.pc += 4;
-            }
-        } else {
-            return;
+    // Register branch with link: rA <- PC + 4, then PC <- rB (absolute) or
+    // PC + 4 + rB (relative). rB is read before rA is written.
+    fn branch_reg(&mut self, instr: u32, relative: bool) {
+        let target = self.get_reg(instr & 0x1F);
+        let Some(taken) = self.branch_condition(field_a(instr)) else {
+            return self.raise_invalid_instruction();
+        };
+        if !taken {
+            return self.advance();
         }
+        let link = self.pc.wrapping_add(4);
+        self.write_reg((instr >> 5) & 0x1F, link);
+        self.pc = if relative { link.wrapping_add(target) } else { target };
     }
 
-    // Execute a branch using a register-relative target.
-    fn branch_relative(&mut self, instr: u32) {
-        // instruction format is
-        // 01110?????xxxxxxxxxxxxaaaaabbbbb
-        // op (5 bits) | op (5 bits) | unused (12 bits) | r_a (5 bits) | r_b (5 bits)
-        let op = (instr >> 22) & 0x1F;
-        let r_a = (instr >> 5) & 0x1F;
-        let r_b = instr & 0x1F;
-
-        // get address
-        let r_b = self.get_reg(r_b);
-
-        if let Some(branch) = self.get_branch_condition(op) {
-            if branch {
-                self.write_reg(r_a, self.pc + 4);
-                self.pc = u32::wrapping_add(self.pc, u32::wrapping_add(4, r_b));
-            } else {
-                self.pc += 4;
-            }
-        } else {
-            return;
-        }
-    }
-
-    // Enter the trap path for the encoded trap instruction.
+    // trap: enter the trap vector, resuming at the next instruction.
     fn trap_instr(&mut self, instr: u32) {
-        const TRAP_PAYLOAD_MASK: u32 = 0x07FF_FFFF;
-        const TRAP_VECTOR_ADDR: u32 = 0x04;
-
-        if (instr & TRAP_PAYLOAD_MASK) != 0 {
-            // Reserved trap encodings are invalid instructions, not nested
-            // trap+invalid-instruction entries.
-            self.raise_exc_instr();
-            return;
+        if instr & TRAP_RESERVED_MASK != 0 {
+            // Reserved trap encodings are invalid instructions.
+            return self.raise_invalid_instruction();
         }
-
-        // Trap entry resumes at the following instruction, but otherwise
-        // snapshots architectural trap state like any other exception entry.
-        self.save_state();
-        self.cregfile[4] = self.pc.wrapping_add(4);
-        self.psr_inc_checked("trap");
-
-        self.pc = self
-            .mem_read32(TRAP_VECTOR_ADDR)
-            .expect("trap vector read should succeed");
+        self.enter_handler(VEC_TRAP, self.pc.wrapping_add(4), "trap");
     }
 
-    // carry flag handled separately in each alu operation
-    fn update_flags(&mut self, result: u32, lhs: u32, rhs: u32, op: u32) {
-        let result_sign = result >> 31;
-        let lhs_sign = lhs >> 31;
-        let rhs_sign = rhs >> 31;
-
-        let is_sub = op == 16 || op == 17;
-
-        // set the zero flag
-        self.cregfile[5] |= ((result == 0) as u32) << 1;
-        // set the sign flag
-        self.cregfile[5] |= ((result_sign != 0) as u32) << 2;
-        // set the overflow flag
-        self.cregfile[5] |= if is_sub {
-            (((result_sign != lhs_sign) && (lhs_sign != rhs_sign)) as u32) << 3
-        } else {
-            (((result_sign != lhs_sign) && (lhs_sign == rhs_sign)) as u32) << 3
-        }
-    }
-
-    // Dispatch a privileged instruction by its kernel sub-opcode.
+    // Privileged instructions (opcode 31); user mode raises a privilege fault.
     fn kernel_instr(&mut self, instr: u32) {
         if !self.get_kmode() {
-            // exec_priv
-            assert!(self.cregfile[0] == 0);
-
-            if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
-                println!(
-                    "[core {}] exception priv pc=0x{:08X} psr=0x{:08X}",
-                    self.core_id, self.pc, self.cregfile[0]
-                );
-            }
-
-            self.save_state();
-
-            self.psr_inc_checked("priv");
-
-            self.pc = self.mem_read32(0x81 * 4).expect("shouldn't fail");
-            return;
+            return self.raise_exception(VEC_PRIVILEGE, "priv");
         }
-
-        assert!(self.cregfile[0] > 0);
-
-        let op = (instr >> 12) & 0x1F;
-
-        match op {
-            0 => self.tlb_op(instr),
-            1 => self.crmv_op(instr),
-            2 => self.mode_op(instr),
-            3 => {
-                if ((instr >> 11) & 1) != 0 {
-                    self.raise_exc_instr();
-                    return;
+        let sub = (instr >> 10) & 3;
+        match (instr >> 12) & 0x1F {
+            0 => self.tlb_op(instr, sub),
+            1 => self.crmv_op(instr, sub),
+            2 => match sub {
+                0 => self.advance(), // mode run
+                1 => {
+                    // mode sleep: PC stays here until an interrupt wakes the core.
+                    self.asleep = true;
+                    self.sleep_armed = true;
                 }
-                self.rfe(instr)
-            }
+                _ => self.halted = true, // mode halt
+            },
+            3 if (instr >> 11) & 1 == 0 => self.rfe(instr),
             4 => self.ipi_op(instr),
             5 => self.eoi_op(instr),
-            _ => {
-                self.raise_exc_instr();
-                return;
-            }
+            _ => self.raise_invalid_instruction(),
         }
     }
 
-    // Dispatch TLB read, write, and invalidate suboperations.
-    fn tlb_op(&mut self, instr: u32) {
-        let op = (instr >> 10) & 3;
-        let ra = (instr >> 22) & 0x1F;
-        let rb = (instr >> 17) & 0x1F;
-
-        let rb = self.get_reg(rb);
-        // ra has PPN, rb has VPN
-        if op == 0 {
-            // tlbr
-            if ra != 0 {
-                if let Some(val) = self.tlb.read(self.cregfile[1], rb >> 12) {
-                    self.write_reg(ra, val);
-                } else {
-                    self.write_reg(ra, 0);
-                }
+    // tlbr/tlbw/tlbi/tlbc; rB holds the virtual address, rA the entry.
+    fn tlb_op(&mut self, instr: u32, sub: u32) {
+        let pid = self.cregfile[CREG_PID];
+        let vpn = self.get_reg(field_b(instr)) >> 12;
+        match sub {
+            0 => {
+                let value = self.tlb.read(pid, vpn).unwrap_or(0);
+                self.write_reg(field_a(instr), value);
             }
-        } else if op == 1 {
-            // tlbw
-            let ra = self.get_reg(ra);
-            self.tlb.write(self.cregfile[1], rb >> 12, ra & 0x7FFFFFF);
-        } else if op == 2 {
-            // tlbi
-            self.tlb.invalidate(self.cregfile[1], rb >> 12);
-        } else {
-            // tlbc
-            self.tlb.clear();
+            1 => {
+                let value = self.get_reg(field_a(instr)) & TLB_ENTRY_MASK;
+                self.tlb.write(pid, vpn, value);
+            }
+            2 => self.tlb.invalidate(pid, vpn),
+            _ => self.tlb.clear(),
         }
-        self.pc += 4;
+        self.advance();
     }
 
-    // Move data between a general-purpose and control register.
-    fn crmv_op(&mut self, instr: u32) {
-        let op = (instr >> 10) & 3;
-        let ra = (instr >> 22) & 0x1F;
-        let rb = (instr >> 17) & 0x1F;
-
-        // don't use get_reg/write_reg here because
-        // crmv doesn't respect the r31 => kernel stack pointer alias
-
-        if op == 0 {
-            // crmv crA, rB
-            let rb = self.regfile[rb as usize];
-            self.write_creg(ra as usize, rb);
-        } else if op == 1 {
-            // crmv rA, crB
-            if ra != 0 {
-                let rb = self.read_creg(rb as usize);
-                self.regfile[ra as usize] = rb;
-            }
-        } else if op == 2 {
-            // crmv crA, crB
-            let rb = self.read_creg(rb as usize);
-            self.write_creg(ra as usize, rb);
-        } else {
-            // crmv rA, rB
-            if ra != 0 {
-                let rb = self.regfile[rb as usize];
-                self.regfile[ra as usize] = rb;
-            }
+    // crmv between general and control registers. crmv uses the raw register
+    // file, so r31 is not aliased to KSP here.
+    // Control-register numbers past TLBF are not defined by docs/ISA.md; they
+    // raise invalid-instruction (the original model indexed out of bounds and
+    // crashed the emulator).
+    fn crmv_op(&mut self, instr: u32, sub: u32) {
+        let ra = field_a(instr) as usize;
+        let rb = field_b(instr) as usize;
+        let a_is_creg = matches!(sub, 0 | 2);
+        let b_is_creg = matches!(sub, 1 | 2);
+        if (a_is_creg && ra >= CREG_COUNT) || (b_is_creg && rb >= CREG_COUNT) {
+            return self.raise_invalid_instruction();
         }
-        self.pc += 4;
+        match sub {
+            0 => self.write_creg(ra, self.regfile[rb]),
+            1 if ra != 0 => self.regfile[ra] = self.read_creg(rb),
+            2 => self.write_creg(ra, self.read_creg(rb)),
+            3 if ra != 0 => self.regfile[ra] = self.regfile[rb],
+            _ => {}
+        }
+        self.advance();
     }
 
-    // Send an inter-processor interrupt and its mailbox payload.
+    // ipi: send MBO to one core (rA <- 1 on success) or all cores (rA <- mask).
     fn ipi_op(&mut self, instr: u32) {
-        let ra = (instr >> 22) & 0x1F;
-        let all = ((instr >> 11) & 1) != 0;
-        // Payload comes from MBO (cr11).
-        let payload = self.cregfile[11];
-
-        if all {
-            let mask = self.interrupts.send_ipi_all(payload);
-            if ra != 0 {
-                self.write_reg(ra, mask);
-            }
+        let payload = self.cregfile[CREG_MBO];
+        let result = if (instr >> 11) & 1 != 0 {
+            self.interrupts.send_ipi_all(payload)
         } else {
-            let target = (instr & 0x3) as usize;
-            let success = self.interrupts.send_ipi(target, payload);
-            if ra != 0 {
-                self.write_reg(ra, if success { 1 } else { 0 });
-            }
-        }
-
-        self.pc += 4;
+            u32::from(self.interrupts.send_ipi((instr & 0x3) as usize, payload))
+        };
+        self.write_reg(field_a(instr), result);
+        self.advance();
     }
 
-    // Acknowledge selected interrupt-service bits.
+    // eoi: clear one ISR bit (or all of them) and acknowledge the controller.
     fn eoi_op(&mut self, instr: u32) {
-        let all = ((instr >> 11) & 1) != 0;
-        let cleared_mask = if all { u32::MAX } else { 1u32 << (instr & 0xF) };
-        let next_isr = self.cregfile[2] & !cleared_mask;
-        self.write_isr(next_isr);
-        self.pc += 4;
+        let cleared = if (instr >> 11) & 1 != 0 { u32::MAX } else { 1 << (instr & 0xF) };
+        self.write_isr(self.cregfile[CREG_ISR] & !cleared);
+        self.advance();
     }
 
-    // Enter or leave the architectural sleep mode.
-    fn mode_op(&mut self, instr: u32) {
-        let op = (instr >> 10) & 3;
-
-        if op == 0 {
-            // mode run
-            self.pc += 4;
-        } else if op == 1 {
-            // mode sleep
-            self.asleep = true;
-            // Mark as a sleep instruction so interrupts advance PC.
-            self.sleep_armed = true;
-        } else {
-            // mode halt
-            self.halted = true;
-        }
-    }
-
-    // Restore the saved processor state after an exception or interrupt.
+    // rfe: leave the handler, restoring PC and flags and re-enabling interrupts.
     fn rfe(&mut self, instr: u32) {
-        if TRACE_INTERRUPTS.load(Ordering::Relaxed) {
+        if tracing() {
             println!(
                 "[core {}] rfe instr=0x{:08X} pc=0x{:08X}",
                 self.core_id, instr, self.pc
             );
         }
-        // update kernel mode
-        self.psr_dec("rfe");
-
-        // Both trap-return encodings restore the global interrupt-enable bit.
-        self.cregfile[3] |= 0x80000000;
-
-        // restore pc
-        self.pc = self.cregfile[4];
-
-        // restore flags
-        self.cregfile[5] = self.cregfile[6];
+        let old = self.cregfile[CREG_PSR];
+        self.cregfile[CREG_PSR] = old.wrapping_sub(1);
+        if tracing() {
+            println!(
+                "[core {}] psr dec {:08X} -> {:08X} (rfe pc=0x{:08X})",
+                self.core_id, old, self.cregfile[CREG_PSR], self.pc
+            );
+        }
+        self.cregfile[CREG_IMR] |= IMR_GLOBAL_ENABLE;
+        self.pc = self.cregfile[CREG_EPC];
+        self.cregfile[CREG_FLG] = self.cregfile[CREG_EFG];
     }
-}
-
-// Execute one core until it halts, sleeps, faults, or reaches the cycle budget.
-// Returns the core's profile if profiling was enabled.
-fn run_core_loop(
-    mut cpu: Emulator,
-    max_iters: u32,
-    scheduler: Option<Arc<Scheduler>>,
-    shared: Arc<RunShared>,
-    core_id: usize,
-) -> Option<CoreProfile> {
-    cpu.count = 0;
-    loop {
-        if shared.should_stop() {
-            if let Some(sched) = &scheduler {
-                sched.stop();
-            }
-            break;
-        }
-        if let Some(sched) = &scheduler {
-            // Non-free scheduling blocks until this core is chosen.
-            if !sched.wait_turn(core_id) {
-                break;
-            }
-        }
-        if shared.should_stop() {
-            if let Some(sched) = &scheduler {
-                sched.stop();
-            }
-            break;
-        }
-        if cpu.halted {
-            // Any core halting stops the entire system.
-            shared.request_stop();
-            if let Some(sched) = &scheduler {
-                sched.mark_halted(core_id);
-                sched.stop();
-            }
-            break;
-        }
-
-        // Advance one CPU tick per scheduling turn.
-        cpu.tick();
-
-        if cpu.halted {
-            // Any core halting stops the entire system.
-            shared.request_stop();
-            if let Some(sched) = &scheduler {
-                sched.mark_halted(core_id);
-                sched.stop();
-            }
-            break;
-        }
-
-        if max_iters != 0 && cpu.count > max_iters {
-            shared.request_stop();
-            if let Some(sched) = &scheduler {
-                sched.stop();
-            }
-            break;
-        }
-
-        if let Some(sched) = &scheduler {
-            sched.finish_turn(core_id);
-        }
-    }
-
-    shared.record_exit(core_id, cpu.regfile[1]);
-    cpu.profile.take()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::SD_INTERRUPT_BIT as SD_TEST_BIT;
+    use interrupts::TIMER_INTERRUPT_BIT;
+
+    // A single core attached to `cores`-wide interrupt state.
+    fn test_core(cores: usize) -> (Emulator, Arc<InterruptController>) {
+        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
+        let interrupts = InterruptController::new(cores, false);
+        (Emulator::from_shared(memory, Arc::clone(&interrupts), 0), interrupts)
+    }
 
     // Region bounds must match Dioptase-OS/docs/kernel_mem_map.md so trace-mode
     // write warnings name the right region. Checks both edges of every region.
@@ -3322,39 +1099,35 @@ mod tests {
             assert_eq!(Emulator::memmap_region(end - 1), Some(name), "last byte of {name}");
         }
         // The physical frame pool is not a named kernel region.
-        assert_eq!(Emulator::memmap_region(0x0010_0000), None);
+        assert_eq!(Emulator::memmap_region(KERNEL_STACK_END), None);
     }
 
     // Preserve an IPI that becomes pending while software writes ISR state.
     #[test]
     fn write_isr_preserves_concurrently_pending_ipi() {
-        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
-        let interrupts = InterruptController::new(2);
-        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
-
-        cpu.cregfile[2] = TIMER_INTERRUPT_BIT;
-
+        let (mut cpu, interrupts) = test_core(2);
+        cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT;
         assert!(interrupts.send_ipi(0, 0x1234_5678));
 
         cpu.write_isr(0);
 
         assert_eq!(
-            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "writing ISR to clear one interrupt must preserve a concurrently pending IPI",
         );
         assert_eq!(
-            cpu.cregfile[10], 0x1234_5678,
+            cpu.cregfile[CREG_MBI], 0x1234_5678,
             "MBI must reflect the visible pending IPI payload",
         );
 
-        cpu.check_for_interrupts();
+        cpu.collect_interrupts();
 
         assert_eq!(
-            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "taking the queued pending IPI on the next tick must not change the visible ISR bit",
         );
         assert_eq!(
-            cpu.cregfile[10], 0x1234_5678,
+            cpu.cregfile[CREG_MBI], 0x1234_5678,
             "the queued IPI payload must remain stable after the next tick snapshots it",
         );
     }
@@ -3362,9 +1135,7 @@ mod tests {
     // Reject a second IPI until the target acknowledges the outstanding one.
     #[test]
     fn send_ipi_fails_until_target_acknowledges_ipi() {
-        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
-        let interrupts = InterruptController::new(1);
-        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
+        let (mut cpu, interrupts) = test_core(1);
 
         assert!(interrupts.send_ipi(0, 0x1111_2222));
         assert!(
@@ -3372,15 +1143,15 @@ mod tests {
             "a second IPI to the same core must fail while the first payload is pending",
         );
 
-        cpu.check_for_interrupts();
+        cpu.collect_interrupts();
 
         assert_eq!(
-            cpu.cregfile[2] & IPI_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR] & IPI_INTERRUPT_BIT,
             IPI_INTERRUPT_BIT,
             "the first IPI must remain visible in ISR until eoi 5",
         );
         assert_eq!(
-            cpu.cregfile[10], 0x1111_2222,
+            cpu.cregfile[CREG_MBI], 0x1111_2222,
             "a failed second IPI must not overwrite the first payload",
         );
         assert!(
@@ -3392,7 +1163,7 @@ mod tests {
         cpu.eoi_op(eoi_ipi);
 
         assert_eq!(
-            cpu.cregfile[2] & IPI_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR] & IPI_INTERRUPT_BIT,
             0,
             "eoi 5 must clear the active IPI ISR bit",
         );
@@ -3401,10 +1172,10 @@ mod tests {
             "IPI delivery must reopen after the target acknowledges the IPI",
         );
 
-        cpu.check_for_interrupts();
+        cpu.collect_interrupts();
 
         assert_eq!(
-            cpu.cregfile[10], 0x7777_8888,
+            cpu.cregfile[CREG_MBI], 0x7777_8888,
             "the next successful IPI must deliver its own payload",
         );
     }
@@ -3412,7 +1183,7 @@ mod tests {
     // Report only targets that accept an IPI-all broadcast.
     #[test]
     fn ipi_all_reports_only_cores_without_outstanding_ipi() {
-        let interrupts = InterruptController::new(3);
+        let interrupts = InterruptController::new(3, false);
 
         assert!(interrupts.send_ipi(1, 0xAAAA_0001));
 
@@ -3443,18 +1214,15 @@ mod tests {
     // Ignore CRMV writes to the read-only ISR control register.
     #[test]
     fn crmv_write_to_isr_is_ignored() {
-        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
-        let interrupts = InterruptController::new(1);
-        let mut cpu = Emulator::from_shared(memory, interrupts, false, 0);
-
-        cpu.cregfile[2] = TIMER_INTERRUPT_BIT;
+        let (mut cpu, _) = test_core(1);
+        cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT;
         cpu.regfile[1] = 0xFFFF_FFFF;
 
         let instr = (31u32 << 27) | (2u32 << 22) | (1u32 << 17) | (1u32 << 12);
-        cpu.crmv_op(instr);
+        cpu.execute(instr);
 
         assert_eq!(
-            cpu.cregfile[2], TIMER_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR], TIMER_INTERRUPT_BIT,
             "crmv writes to ISR must be ignored so interrupt acknowledgement goes through eoi",
         );
     }
@@ -3462,17 +1230,13 @@ mod tests {
     // Clear only the selected in-service bit for an indexed EOI.
     #[test]
     fn eoi_specific_clears_only_selected_isr_bit() {
-        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
-        let interrupts = InterruptController::new(1);
-        let mut cpu = Emulator::from_shared(memory, interrupts, false, 0);
+        let (mut cpu, _) = test_core(1);
+        cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT | SD_TEST_BIT;
 
-        cpu.cregfile[2] = TIMER_INTERRUPT_BIT | SD_INTERRUPT_BIT;
-
-        let instr = (31u32 << 27) | (5u32 << 12);
-        cpu.eoi_op(instr);
+        cpu.eoi_op((31u32 << 27) | (5u32 << 12));
 
         assert_eq!(
-            cpu.cregfile[2], SD_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR], SD_TEST_BIT,
             "eoi n must clear only the requested ISR bit",
         );
     }
@@ -3480,23 +1244,41 @@ mod tests {
     // Preserve a concurrently arriving IPI while EOI clears existing service state.
     #[test]
     fn eoi_all_preserves_concurrently_pending_ipi() {
-        let memory = Arc::new(Memory::new(HashMap::new(), false, 1));
-        let interrupts = InterruptController::new(2);
-        let mut cpu = Emulator::from_shared(Arc::clone(&memory), Arc::clone(&interrupts), false, 0);
-
-        cpu.cregfile[2] = TIMER_INTERRUPT_BIT | SD_INTERRUPT_BIT;
+        let (mut cpu, interrupts) = test_core(2);
+        cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT | SD_TEST_BIT;
         assert!(interrupts.send_ipi(0, 0xCAFE_BABE));
 
-        let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
-        cpu.eoi_op(instr);
+        cpu.eoi_op((31u32 << 27) | (5u32 << 12) | (1u32 << 11));
 
         assert_eq!(
-            cpu.cregfile[2], IPI_INTERRUPT_BIT,
+            cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "eoi all must clear handled ISR bits without dropping a concurrently pending IPI",
         );
         assert_eq!(
-            cpu.cregfile[10], 0xCAFE_BABE,
+            cpu.cregfile[CREG_MBI], 0xCAFE_BABE,
             "eoi all must expose the visible pending IPI payload in MBI",
         );
+    }
+
+    // A misaligned PC must enter exactly one exception handler. The debugger
+    // step path used to raise a TLB miss on top of the misaligned-PC entry.
+    #[test]
+    fn misaligned_pc_enters_one_handler() {
+        let (mut cpu, _) = test_core(1);
+        cpu.pc = 0x402;
+        assert_eq!(cpu.step_instruction(), StepOutcome::MisalignedPc { pc: 0x402 });
+        assert_eq!(cpu.cregfile[CREG_PSR], 2, "one nested entry from PSR=1");
+        assert_eq!(cpu.cregfile[CREG_EPC], 0x402);
+    }
+
+    // An undefined ALU op must raise invalid-instruction with FLG untouched,
+    // so EFG captures the flags as they were before the instruction.
+    #[test]
+    fn invalid_alu_op_preserves_flags() {
+        let (mut cpu, _) = test_core(1);
+        cpu.cregfile[CREG_FLG] = FLAG_CARRY | FLAG_ZERO;
+        cpu.execute(22 << 5); // register-form ALU op 22 is undefined
+        assert_eq!(cpu.cregfile[CREG_EFG], FLAG_CARRY | FLAG_ZERO);
+        assert_eq!(cpu.cregfile[CREG_PSR], 2);
     }
 }

@@ -1,45 +1,146 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
+// Guest physical memory: RAM below IO_START plus the MMIO devices described
+// in docs/mem_map.md (VGA, PS/2 and UART, PIT, SD DMA, audio, clock divider).
+//
+// Concurrency model (sequentially consistent, per AGENTS.md):
+// - RAM is an array of SeqCst `AtomicU32` words; guest byte i of a word is
+//   bits 8i..8i+7 regardless of host endianness. Aligned word accesses are
+//   single loads/stores, narrower stores are a compare-and-swap on the
+//   containing word, so no access tears and cores never contend on a lock.
+//   CPU accesses are naturally aligned, so none spans two words.
+// - Every guest-visible MMIO access holds `mmio_lock` for its whole duration
+//   (`mmio_transaction`), so multi-byte register accesses are not torn and
+//   device side effects (PS/2 pops, DMA command strobes) are serialized.
+// - Registers read every tick without `mmio_lock` (PIT reload, clock divider)
+//   are atomics that each MMIO transaction updates with a single store, so
+//   lock-free readers never see a partially written value.
+// - The graphics thread reads `VgaState` concurrently. It only writes the
+//   VGA status/frame registers, which are read-only to the guest; every other
+//   VGA register is written only by guest MMIO under `mmio_lock`.
+// - Device tick state that only core 0 advances (PIT countdown, audio sample
+//   countdown) lives in atomics so the per-tick fast path takes no locks.
+// All atomics use SeqCst.
+
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
-
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::u16;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Mutex, RwLock};
 
-pub const PHYSMEM_MAX: u32 = 0x7FFFFFF;
+pub const PHYSMEM_MAX: u32 = 0x7FF_FFFF;
 
+// ---- Device interrupt lines raised by memory-mapped devices -----------------
+pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
+pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
+pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
+pub const AUDIO_INTERRUPT_BIT: u32 = 1 << 7;
+
+// ---- VGA geometry ------------------------------------------------------------
 pub const FRAME_WIDTH: u32 = 640;
 pub const FRAME_HEIGHT: u32 = 480;
 pub const TILE_WIDTH: u32 = 8;
 pub const PIXEL_FRAME_WIDTH: u32 = FRAME_WIDTH / 2;
 pub const PIXEL_FRAME_HEIGHT: u32 = FRAME_HEIGHT / 2;
-// const TILES_NUM: u32 = 256;
-const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH * 2;
+// Bytes per 8x8 tile (16-bit pixels).
+pub const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH * 2;
 pub const SPRITE_WIDTH: u32 = 32;
-// const SPRITES_NUM: u32 = 16;
-const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
+// Bytes per 32x32 sprite (16-bit pixels).
+pub const SPRITE_SIZE: u32 = SPRITE_WIDTH * SPRITE_WIDTH * 2;
+pub const SPRITE_COUNT: usize = 16;
+pub const TILE_FB_WIDTH_TILES: u32 = FRAME_WIDTH / TILE_WIDTH;
+pub const TILE_FB_HEIGHT_TILES: u32 = FRAME_HEIGHT / TILE_WIDTH;
 
-// SD card DMA engine (no data buffer). DMA transfers 4 bytes per device tick.
-const SD_BLOCK_SIZE: usize = 512;
-const SD_BLOCK_SIZE_U32: u32 = SD_BLOCK_SIZE as u32;
-const SD_DMA_BYTES_PER_TICK: u32 = 4;
-pub const SD_INTERRUPT_BIT: u32 = 1 << 3;
-pub const SD2_INTERRUPT_BIT: u32 = 1 << 6;
-pub const VGA_INTERRUPT_BIT: u32 = 1 << 4;
-pub const AUDIO_INTERRUPT_BIT: u32 = 1 << 7;
-
-// Audio output device.
-const AUDIO_RING_BUFFER_START: u32 = 0x7FB8000;
+// ---- MMIO address map (docs/mem_map.md); END bounds are exclusive ------------
+const AUDIO_RING_BUFFER_START: u32 = 0x7FB_8000;
 const AUDIO_RING_BUFFER_SIZE: u32 = 0x4000;
+const AUDIO_RING_BUFFER_END: u32 = AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE;
+// Everything at or above the audio ring is MMIO; RAM ends here.
+const IO_START: u32 = AUDIO_RING_BUFFER_START;
+
+const PIXEL_FRAME_BUFFER_START: u32 = 0x7FC_0000;
+const PIXEL_FRAME_BUFFER_SIZE: u32 = PIXEL_FRAME_WIDTH * PIXEL_FRAME_HEIGHT * 2;
+const PIXEL_FRAME_BUFFER_END: u32 = PIXEL_FRAME_BUFFER_START + PIXEL_FRAME_BUFFER_SIZE;
+// Two bytes per tile entry (index + color) in an 80x60 grid.
+const TILE_FRAME_BUFFER_SIZE: u32 = TILE_FB_WIDTH_TILES * TILE_FB_HEIGHT_TILES * 2;
+// Aligned down to a 4 KiB page below the pixel framebuffer for TLB mappings.
+const TILE_FRAME_BUFFER_START: u32 = (PIXEL_FRAME_BUFFER_START - TILE_FRAME_BUFFER_SIZE) & !0xFFF;
+const TILE_FRAME_BUFFER_END: u32 = TILE_FRAME_BUFFER_START + TILE_FRAME_BUFFER_SIZE;
+
+const PS2_STREAM: u32 = 0x7FE_5800;
+// Reading the PS/2 high byte pops the event (software reads it as a halfword).
+const PS2_STREAM_HIGH: u32 = PS2_STREAM + 1;
+const UART_TX: u32 = 0x7FE_5802;
+const UART_RX: u32 = 0x7FE_5803;
+pub const PIT_START: u32 = 0x7FE_5804;
+const PIT_END: u32 = PIT_START + 4;
+
+const SD_DMA_START: u32 = 0x7FE_5810;
+const SD2_DMA_START: u32 = 0x7FE_5828;
+const SD_DMA_RANGE_SIZE: u32 = 0x18;
+const SD_DMA_END: u32 = SD_DMA_START + SD_DMA_RANGE_SIZE;
+const SD2_DMA_END: u32 = SD2_DMA_START + SD_DMA_RANGE_SIZE;
+
+const AUDIO_REGS_START: u32 = 0x7FE_5840;
+const AUDIO_REGS_END: u32 = AUDIO_REGS_START + 0x14;
+
+// Sprite coordinate registers: per sprite, x then y as signed 16-bit LE values.
+const SPRITE_REGISTERS_START: u32 = 0x7FE_5B00;
+const SPRITE_REGISTERS_END: u32 = SPRITE_REGISTERS_START + 4 * SPRITE_COUNT as u32;
+const TILE_H_SCROLL_START: u32 = 0x7FE_5B40;
+const TILE_V_SCROLL_START: u32 = 0x7FE_5B42;
+// Each tile pixel is repeated 2^n times.
+const TILE_SCALE_REGISTER: u32 = 0x7FE_5B44;
+const VGA_STATUS_REGISTER: u32 = 0x7FE_5B46;
+const VGA_FRAME_REGISTER_START: u32 = 0x7FE_5B48;
+const VGA_FRAME_REGISTER_END: u32 = VGA_FRAME_REGISTER_START + 4;
+const CLK_REG_START: u32 = 0x7FE_5B4C;
+const CLK_REG_END: u32 = CLK_REG_START + 4;
+const PIXEL_H_SCROLL_START: u32 = 0x7FE_5B50;
+const PIXEL_V_SCROLL_START: u32 = 0x7FE_5B52;
+// Each pixel is repeated 2^(n+1) times.
+const PIXEL_SCALE_REGISTER: u32 = 0x7FE_5B54;
+const SPRITE_SCALE_START: u32 = 0x7FE_5B60;
+const SPRITE_SCALE_END: u32 = SPRITE_SCALE_START + SPRITE_COUNT as u32;
+
+const TILE_MAP_START: u32 = 0x7FE_8000;
+const TILE_MAP_SIZE: u32 = 0x8000;
+const TILE_MAP_END: u32 = TILE_MAP_START + TILE_MAP_SIZE;
+const SPRITE_MAP_START: u32 = 0x7FF_0000;
+const SPRITE_MAP_SIZE: u32 = SPRITE_SIZE * SPRITE_COUNT as u32;
+const SPRITE_MAP_END: u32 = SPRITE_MAP_START + SPRITE_MAP_SIZE;
+
+// ---- SD DMA engine (register offsets within one SD block) --------------------
+const SD_BLOCK_SIZE: usize = 512;
+const SD_DMA_BYTES_PER_TICK: u32 = 4;
+const SD_DMA_OFFSET_MEM_ADDR: u32 = 0x0;
+const SD_DMA_OFFSET_SD_BLOCK: u32 = 0x4;
+const SD_DMA_OFFSET_LEN: u32 = 0x8;
+const SD_DMA_OFFSET_CTRL: u32 = 0xC;
+const SD_DMA_OFFSET_STATUS: u32 = 0x10;
+const SD_DMA_CTRL_START: u32 = 1 << 0;
+const SD_DMA_CTRL_DIR_RAM_TO_SD: u32 = 1 << 1;
+const SD_DMA_CTRL_IRQ_ENABLE: u32 = 1 << 2;
+const SD_DMA_CTRL_INIT: u32 = 1 << 3;
+const SD_DMA_CTRL_MASK: u32 =
+    SD_DMA_CTRL_START | SD_DMA_CTRL_DIR_RAM_TO_SD | SD_DMA_CTRL_IRQ_ENABLE | SD_DMA_CTRL_INIT;
+const SD_DMA_STATUS_BUSY: u32 = 1 << 0;
+const SD_DMA_STATUS_DONE: u32 = 1 << 1;
+const SD_DMA_STATUS_ERR: u32 = 1 << 2;
+const SD_DMA_ERR_NONE: u32 = 0;
+const SD_DMA_ERR_BUSY: u32 = 1;
+const SD_DMA_ERR_ZERO_LEN: u32 = 2;
+const SD_DMA_ERR_NOT_INITIALIZED: u32 = 3;
+const SD_INIT_TICKS: u32 = 32;
+
+// ---- Audio device -------------------------------------------------------------
+const AUDIO_OFFSET_CTRL: u32 = 0x0;
+const AUDIO_OFFSET_STATUS: u32 = 0x4;
+const AUDIO_OFFSET_WRITE_IDX: u32 = 0x8;
+const AUDIO_OFFSET_READ_IDX: u32 = 0xC;
+const AUDIO_OFFSET_WATERMARK: u32 = 0x10;
 const AUDIO_SAMPLE_BYTES: u32 = 2;
 pub const AUDIO_SAMPLE_RATE_HZ: u32 = 25_000;
+// Device ticks model a 100 MHz clock.
 const AUDIO_TICKS_PER_SAMPLE: u32 = 100_000_000 / AUDIO_SAMPLE_RATE_HZ;
-const AUDIO_CTRL_START: u32 = 0x7FE5840;
-const AUDIO_STATUS_START: u32 = 0x7FE5844;
-const AUDIO_WRITE_IDX_START: u32 = 0x7FE5848;
-const AUDIO_READ_IDX_START: u32 = 0x7FE584C;
-const AUDIO_WATERMARK_START: u32 = 0x7FE5850;
 const AUDIO_CTRL_ENABLE: u32 = 1 << 0;
 const AUDIO_CTRL_IRQ_ENABLE: u32 = 1 << 1;
 const AUDIO_STATUS_ENABLED: u32 = 1 << 0;
@@ -47,216 +148,25 @@ const AUDIO_STATUS_LOW_WATER: u32 = 1 << 1;
 const AUDIO_STATUS_UNDERRUN: u32 = 1 << 2;
 const AUDIO_STATUS_IRQ_PENDING: u32 = 1 << 3;
 
-const PIXEL_FRAME_BUFFER_START: u32 = 0x7FC0000;
-const PIXEL_FRAME_BUFFER_SIZE: u32 = PIXEL_FRAME_WIDTH * PIXEL_FRAME_HEIGHT * 2;
-const TILE_FRAME_BUFFER_WIDTH_TILES: u32 = FRAME_WIDTH / TILE_WIDTH;
-const TILE_FRAME_BUFFER_HEIGHT_TILES: u32 = FRAME_HEIGHT / TILE_WIDTH;
-// Two bytes per tile entry (index + color) in an 80x60 grid.
-const TILE_FRAME_BUFFER_SIZE: u32 =
-    TILE_FRAME_BUFFER_WIDTH_TILES * TILE_FRAME_BUFFER_HEIGHT_TILES * 2;
-// Align the tile framebuffer to the 4KB page size for TLB mappings.
-const TILE_FRAME_BUFFER_START: u32 = (PIXEL_FRAME_BUFFER_START - TILE_FRAME_BUFFER_SIZE) & !0xFFF;
-const IO_START: u32 = AUDIO_RING_BUFFER_START;
-const RAM_PAGE_SIZE: usize = 4096;
-const RAM_PAGE_SHIFT: u32 = 12;
-const RAM_PAGE_MASK: usize = RAM_PAGE_SIZE - 1;
-const RAM_PAGE_COUNT: usize = (IO_START as usize) / RAM_PAGE_SIZE;
+// Number of 32-bit RAM words below IO_START.
+const RAM_WORDS: usize = (IO_START / 4) as usize;
 
-const PS2_STREAM: u32 = 0x7FE5800;
-const UART_TX: u32 = 0x7FE5802;
-const UART_RX: u32 = 0x7FE5803;
-pub const PIT_START: u32 = 0x7FE5804;
-
-const SD_DMA_MEM_ADDR: u32 = 0x7FE5810;
-const SD2_DMA_MEM_ADDR: u32 = 0x7FE5828;
-
-const SD_DMA_OFFSET_MEM_ADDR: u32 = 0x0;
-const SD_DMA_OFFSET_SD_BLOCK: u32 = 0x4;
-const SD_DMA_OFFSET_LEN: u32 = 0x8;
-const SD_DMA_OFFSET_CTRL: u32 = 0xC;
-const SD_DMA_OFFSET_STATUS: u32 = 0x10;
-const SD_DMA_OFFSET_ERR: u32 = 0x14;
-const SD_DMA_RANGE_SIZE: u32 = 0x18;
-
-const SD_DMA_CTRL_START: u32 = 1 << 0;
-const SD_DMA_CTRL_DIR_RAM_TO_SD: u32 = 1 << 1;
-const SD_DMA_CTRL_IRQ_ENABLE: u32 = 1 << 2;
-const SD_DMA_CTRL_INIT: u32 = 1 << 3;
-
-const SD_DMA_STATUS_BUSY: u32 = 1 << 0;
-const SD_DMA_STATUS_DONE: u32 = 1 << 1;
-const SD_DMA_STATUS_ERR: u32 = 1 << 2;
-
-const SD_DMA_ERR_NONE: u32 = 0;
-const SD_DMA_ERR_BUSY: u32 = 1;
-const SD_DMA_ERR_ZERO_LEN: u32 = 2;
-const SD_DMA_ERR_NOT_INITIALIZED: u32 = 3;
-const SD_INIT_TICKS: u32 = 32;
-
-const SPRITE_COUNT: u32 = 16;
-const SPRITE_REGISTERS_START: u32 = 0x7FE5B00; // every consecutive pair of words correspond to
-const SPRITE_REGISTERS_SIZE: u32 = 0x40; // the y and x coordinates, respectively of a sprite
-
-const TILE_H_SCROLL_START: u32 = 0x7FE5B40;
-const TILE_V_SCROLL_START: u32 = 0x7FE5B42;
-const TILE_SCALE_REGISTER_START: u32 = 0x7FE5B44; // each tile pixel is repeated 2^n times
-
-const PIXEL_H_SCROLL_START: u32 = 0x7FE5B50;
-const PIXEL_V_SCROLL_START: u32 = 0x7FE5B52;
-const PIXEL_SCALE_REGISTER_START: u32 = 0x7FE5B54; // each pixel is repeated 2^(n+1) times
-
-const SPRITE_SCALE_START: u32 = 0x7FE5B60;
-const SPRITE_SCALE_SIZE: u32 = SPRITE_COUNT;
-const VGA_STATUS_REGISTER_START: u32 = 0x7FE5B46;
-const VGA_FRAME_REGISTER_START: u32 = 0x7FE5B48;
-
-pub const CLK_REG_START: u32 = 0x7FE5B4C;
-
-const TILE_MAP_START: u32 = 0x7FE8000;
-const TILE_MAP_SIZE: u32 = 0x8000;
-
-const SPRITE_MAP_START: u32 = 0x7FF0000;
-const SPRITE_MAP_SIZE: u32 = 0x8000;
-
-// Models guest RAM, MMIO devices, and their architecturally visible state.
-pub struct Memory {
-    // Ordinary RAM is sharded by 4KB page so unrelated cores can access
-    // different pages concurrently. Each page lock also guards lazy allocation.
-    ram_pages: Box<[RwLock<RamPage>]>,
-    // Multi-byte MMIO operations must stay tear-free even though device state is
-    // stored behind separate locks, so MMIO accesses share one sequencing lock.
-    mmio_lock: Mutex<()>,
-    pixel_frame_buffer: Arc<RwLock<PixelFrameBuffer>>,
-    tile_frame_buffer: Arc<RwLock<TileFrameBuffer>>,
-    tile_map: Arc<RwLock<TileMap>>,
-    io_buffer: Arc<RwLock<VecDeque<u16>>>,
-    input_pending: Arc<AtomicBool>,
-    tile_vscroll_register: Arc<RwLock<(u8, u8)>>,
-    tile_hscroll_register: Arc<RwLock<(u8, u8)>>,
-    pixel_vscroll_register: Arc<RwLock<(u8, u8)>>,
-    pixel_hscroll_register: Arc<RwLock<(u8, u8)>>,
-    tile_scale_register: Arc<RwLock<u8>>,
-    pixel_scale_register: Arc<RwLock<u8>>,
-    sprite_scale_registers: Arc<RwLock<Vec<u8>>>,
-    vga_status_register: Arc<RwLock<u8>>,
-    vga_frame_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-    clk_register: Arc<RwLock<(u8, u8, u8, u8)>>,
-    pit_reload: Arc<AtomicU32>,
-    pit_countdown: Arc<Mutex<u32>>,
-    sprite_map: Arc<RwLock<SpriteMap>>,
-    sd_card: Arc<RwLock<SdCard>>,
-    sd_card2: Arc<RwLock<SdCard>>,
-    audio: Arc<RwLock<AudioDevice>>,
-    pending_interrupt: Arc<AtomicU32>,
-    use_uart_rx: bool,
+// Byte `offset` (0..=3) of a little-endian register value.
+fn byte_of(value: u32, offset: u32) -> u8 {
+    (value >> (8 * offset)) as u8
 }
 
-// Stores one lazily allocated page of guest RAM.
-struct RamPage {
-    bytes: [u8; RAM_PAGE_SIZE],
+// `value` with byte `offset` (0..=3) replaced by `byte`.
+fn with_byte(value: u32, offset: u32, byte: u8) -> u32 {
+    let shift = 8 * offset;
+    (value & !(0xFF << shift)) | (u32::from(byte) << shift)
 }
 
-// Fixed-format PCM sink exposed through MMIO registers plus a byte ring buffer.
-// Software writes PCM bytes + producer index; the device advances the
-// consumer index at the fixed sample rate and raises an interrupt only when
-// LOW_WATER transitions from false to true while IRQ delivery is enabled.
-// Invariants:
-// - ring length matches AUDIO_RING_BUFFER_SIZE
-// - read_idx always stays normalized to the ring size
-// - UNDERRUN clears automatically when playback is disabled or software
-//   publishes at least one full sample again
-struct AudioDevice {
-    ring: Vec<u8>,
-    ctrl: u32,
-    write_idx: u32,
-    read_idx: u32,
-    watermark: u32,
-    underrun: bool,
-    sample_tick_countdown: u32,
-}
-
-// Tile layer for the VGA output (two bytes per tile entry).
-pub struct TileFrameBuffer {
-    pub width_tiles: u32,  // number of tiles in the x direction
-    pub height_tiles: u32, // number of tiles in the y direction
-    entries: Vec<u8>,
-}
-
-// Pixel layer for the VGA output (16-bit little-endian pixels).
-pub struct PixelFrameBuffer {
-    pub width_pixels: u32,
-    pub height_pixels: u32,
-    bytes: Vec<u8>,
-}
-
-// Stores the tile-layer bytes exposed through VGA MMIO.
-pub struct TileMap {
-    pub tiles: Vec<Tile>,
-}
-
-// Describes one tile entry's index and palette color.
-#[derive(Clone)]
-pub struct Tile {
-    pub pixels: Vec<u8>, // an 8x8 tile of pixels
-}
-
-// Stores the sprite-layer bytes exposed through VGA MMIO.
-pub struct SpriteMap {
-    pub sprites: Vec<Sprite>,
-}
-
-// Describes one sprite entry in the guest sprite map.
-#[derive(Clone)]
-pub struct Sprite {
-    pub x: (u8, u8),
-    pub y: (u8, u8),
-    pub pixels: Vec<u8>, // a 32x32 tile of pixels
-}
-
-impl RamPage {
-    // Allocate a zero-filled guest RAM page.
-    fn new() -> Self {
-        RamPage {
-            bytes: [0; RAM_PAGE_SIZE],
-        }
-    }
-
-    // Read one byte from this lazily allocated RAM page.
-    fn read_byte(&self, offset: usize) -> u8 {
-        self.bytes[offset]
-    }
-
-    // Store one byte in this RAM page.
-    fn write_byte(&mut self, offset: usize, value: u8) {
-        self.bytes[offset] = value;
-    }
-
-    // Read an unaligned little-endian halfword from the page.
-    fn read_u16_le(&self, offset: usize) -> u16 {
-        u16::from_le_bytes([self.bytes[offset], self.bytes[offset + 1]])
-    }
-
-    // Read an unaligned little-endian word from the page.
-    fn read_u32_le(&self, offset: usize) -> u32 {
-        u32::from_le_bytes([
-            self.bytes[offset],
-            self.bytes[offset + 1],
-            self.bytes[offset + 2],
-            self.bytes[offset + 3],
-        ])
-    }
-
-    // Store a little-endian halfword in the page.
-    fn write_u16_le(&mut self, offset: usize, value: u16) {
-        let bytes = value.to_le_bytes();
-        self.bytes[offset..offset + 2].copy_from_slice(&bytes);
-    }
-
-    // Store a little-endian word in the page.
-    fn write_u32_le(&mut self, offset: usize, value: u32) {
-        let bytes = value.to_le_bytes();
-        self.bytes[offset..offset + 4].copy_from_slice(&bytes);
-    }
+// Replace one byte of a 16-bit register. Only called under `mmio_lock`, and
+// no other thread writes these registers, so load+store cannot lose updates.
+fn store_u16_byte(reg: &AtomicU16, offset: u32, byte: u8) {
+    let value = with_byte(u32::from(reg.load(Ordering::SeqCst)), offset, byte);
+    reg.store(value as u16, Ordering::SeqCst);
 }
 
 // Identify which SD card device should receive a host image.
@@ -266,9 +176,83 @@ pub enum SdSlot {
     Sd1,
 }
 
-// SD card storage indexed by block address, plus DMA register state.
-// Dma_remaining > 0 while dma_active is true; dma_status BUSY implies dma_active;
-// image_len tracks the exported raw image length and grows on writes.
+// Allocate `count` zeroed words as atomics. Going through a zeroed `u32`
+// allocation lets the host hand out lazily zeroed pages instead of touching
+// all of guest RAM at startup.
+fn zeroed_atomic_words(count: usize) -> Box<[AtomicU32]> {
+    const _: () = assert!(
+        std::mem::size_of::<AtomicU32>() == std::mem::size_of::<u32>()
+            && std::mem::align_of::<AtomicU32>() == std::mem::align_of::<u32>()
+    );
+    let words: Box<[u32]> = vec![0u32; count].into_boxed_slice();
+    // SAFETY: AtomicU32 has the same size and bit validity as u32 (std docs)
+    // and the assertion above checks the alignment matches, so this
+    // allocation is valid for, and is later freed as, [AtomicU32].
+    unsafe { Box::from_raw(Box::into_raw(words) as *mut [AtomicU32]) }
+}
+
+// Extract `out.len()` guest bytes starting at byte `offset` of `word`.
+fn word_bytes(word: u32, offset: u32, out: &mut [u8]) {
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = byte_of(word, offset + i as u32);
+    }
+}
+
+// Device tick counters advanced every tick by core 0 only. Kept on their own
+// cache line so those writes do not invalidate state other cores read every
+// tick (clock divider, input-pending flag).
+#[repr(align(64))]
+struct DeviceClock {
+    pit_countdown: AtomicU32,
+    audio_sample_countdown: AtomicU32,
+}
+
+// VGA state shared between guest MMIO and the graphics thread.
+pub struct VgaState {
+    pub pixel_frame_buffer: RwLock<Vec<u8>>,
+    pub tile_frame_buffer: RwLock<Vec<u8>>,
+    pub tile_map: RwLock<Vec<u8>>,
+    pub sprite_pixels: RwLock<Vec<u8>>,
+    // Per sprite: x in bits 15:0, y in bits 31:16 (signed 16-bit each).
+    pub sprite_coords: [AtomicU32; SPRITE_COUNT],
+    pub sprite_scales: [AtomicU8; SPRITE_COUNT],
+    pub tile_hscroll: AtomicU16,
+    pub tile_vscroll: AtomicU16,
+    pub pixel_hscroll: AtomicU16,
+    pub pixel_vscroll: AtomicU16,
+    pub tile_scale: AtomicU8,
+    pub pixel_scale: AtomicU8,
+    // Written by the graphics thread only; read-only to the guest.
+    pub status: AtomicU8,
+    pub frame: AtomicU32,
+}
+
+impl VgaState {
+    fn new() -> Self {
+        VgaState {
+            pixel_frame_buffer: RwLock::new(vec![0; PIXEL_FRAME_BUFFER_SIZE as usize]),
+            tile_frame_buffer: RwLock::new(vec![0; TILE_FRAME_BUFFER_SIZE as usize]),
+            tile_map: RwLock::new(vec![0; TILE_MAP_SIZE as usize]),
+            // Sprite pixels reset to 0xFFFF, which is transparent.
+            sprite_pixels: RwLock::new(vec![0xFF; SPRITE_MAP_SIZE as usize]),
+            sprite_coords: std::array::from_fn(|_| AtomicU32::new(0)),
+            sprite_scales: std::array::from_fn(|_| AtomicU8::new(0)),
+            tile_hscroll: AtomicU16::new(0),
+            tile_vscroll: AtomicU16::new(0),
+            pixel_hscroll: AtomicU16::new(0),
+            pixel_vscroll: AtomicU16::new(0),
+            tile_scale: AtomicU8::new(0),
+            pixel_scale: AtomicU8::new(0),
+            status: AtomicU8::new(0),
+            frame: AtomicU32::new(0),
+        }
+    }
+}
+
+// SD card storage indexed by block, plus DMA register state.
+// Invariants: dma_remaining > 0 while dma_active; BUSY status implies a DMA
+// or init sequence is active; image_len is the exported image length and
+// grows when writes land past it.
 struct SdCard {
     storage: HashMap<u32, Vec<u8>>,
     image_len: u64,
@@ -289,10 +273,24 @@ struct SdCard {
     initialized: bool,
 }
 
+// What one SD engine tick asks the memory system to do.
+enum SdTick {
+    Idle,
+    RaiseInterrupt,
+    // Move `bytes` between RAM at `mem_addr` and the card at `sd_offset`;
+    // raise the interrupt afterwards if `irq_after`.
+    Transfer {
+        mem_addr: u32,
+        sd_offset: u64,
+        bytes: u32,
+        to_sd: bool,
+        irq_after: bool,
+    },
+}
+
 impl SdCard {
     // Create an empty SD device with reset DMA state.
     fn new(dma_ticks_per_word: u32) -> Self {
-        let ticks_per_word = dma_ticks_per_word.max(1);
         SdCard {
             storage: HashMap::new(),
             image_len: 0,
@@ -306,7 +304,7 @@ impl SdCard {
             dma_mem_cursor: 0,
             dma_sd_byte_cursor: 0,
             dma_remaining: 0,
-            dma_ticks_per_word: ticks_per_word,
+            dma_ticks_per_word: dma_ticks_per_word.max(1),
             dma_tick_countdown: 0,
             init_active: false,
             init_ticks_remaining: 0,
@@ -314,16 +312,22 @@ impl SdCard {
         }
     }
 
-    // Start an SD initialization sequence using DMA status/error registers.
-    // Updates BUSY/DONE/ERR state and returns true for immediate IRQ.
-    fn start_init(&mut self) -> bool {
-        let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
-        if is_busy {
+    // Report a command issued while busy without disturbing the running one.
+    fn reject_if_busy(&mut self) -> bool {
+        if self.dma_status & SD_DMA_STATUS_BUSY != 0 {
             self.dma_err = SD_DMA_ERR_BUSY;
             self.dma_status |= SD_DMA_STATUS_ERR;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Start the SD initialization sequence; completes after SD_INIT_TICKS.
+    fn start_init(&mut self) -> bool {
+        if self.reject_if_busy() {
             return false;
         }
-
         self.dma_active = false;
         self.dma_remaining = 0;
         self.dma_tick_countdown = 0;
@@ -335,37 +339,30 @@ impl SdCard {
         false
     }
 
-    // Start a DMA transfer using the current register values.
-    // Updates DMA state and returns true if an immediate interrupt is needed.
+    // Start a DMA transfer from the current registers. Returns true if the
+    // command failed immediately and the interrupt should be raised now.
     fn start_dma(&mut self) -> bool {
-        let irq_enable = (self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0;
-        let is_busy = (self.dma_status & SD_DMA_STATUS_BUSY) != 0;
-        if is_busy {
-            self.dma_err = SD_DMA_ERR_BUSY;
-            self.dma_status |= SD_DMA_STATUS_ERR;
+        if self.reject_if_busy() {
             return false;
         }
-
-        let mem_addr = self.dma_mem_addr & !0x3;
-        if !self.initialized {
-            self.dma_err = SD_DMA_ERR_NOT_INITIALIZED;
+        let irq_enable = self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE != 0;
+        // SD_DMA_LEN is in blocks; the engine counts bytes (32-bit truncation).
+        let len_bytes = self.dma_len.wrapping_mul(SD_BLOCK_SIZE as u32);
+        let error = if !self.initialized {
+            Some(SD_DMA_ERR_NOT_INITIALIZED)
+        } else if len_bytes == 0 {
+            Some(SD_DMA_ERR_ZERO_LEN)
+        } else {
+            None
+        };
+        if let Some(err) = error {
+            self.dma_err = err;
             self.dma_status = SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR;
             self.dma_active = false;
             return irq_enable;
         }
-
-        // SD_DMA_LEN is architecturally defined in blocks. Internally the DMA engine
-        // tracks a byte countdown, so convert blocks->bytes with 32-bit truncation.
-        let len_bytes = self.dma_len.wrapping_mul(SD_BLOCK_SIZE_U32);
-        if len_bytes == 0 {
-            self.dma_err = SD_DMA_ERR_ZERO_LEN;
-            self.dma_status = SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR;
-            self.dma_active = false;
-            return irq_enable;
-        }
-
-        self.dma_mem_cursor = mem_addr;
-        self.dma_sd_byte_cursor = (self.dma_sd_block as u64) * (SD_BLOCK_SIZE as u64);
+        self.dma_mem_cursor = self.dma_mem_addr & !0x3;
+        self.dma_sd_byte_cursor = u64::from(self.dma_sd_block) * SD_BLOCK_SIZE as u64;
         self.dma_remaining = len_bytes;
         self.dma_err = SD_DMA_ERR_NONE;
         self.dma_status = SD_DMA_STATUS_BUSY;
@@ -374,39 +371,115 @@ impl SdCard {
         false
     }
 
-    // Clear DONE/ERR status and reset the error code.
-    fn clear_status(&mut self) {
-        self.dma_status &= !SD_DMA_STATUS_DONE;
-        self.dma_status &= !SD_DMA_STATUS_ERR;
-        self.dma_err = SD_DMA_ERR_NONE;
+    // Read one byte of the DMA register block. STATUS.ERR mirrors ERR != 0.
+    fn read_reg_byte(&self, offset: u32) -> u8 {
+        let value = match offset & !3 {
+            SD_DMA_OFFSET_MEM_ADDR => self.dma_mem_addr,
+            SD_DMA_OFFSET_SD_BLOCK => self.dma_sd_block,
+            SD_DMA_OFFSET_LEN => self.dma_len,
+            SD_DMA_OFFSET_CTRL => self.dma_ctrl,
+            SD_DMA_OFFSET_STATUS => {
+                if self.dma_err != SD_DMA_ERR_NONE {
+                    self.dma_status | SD_DMA_STATUS_ERR
+                } else {
+                    self.dma_status & !SD_DMA_STATUS_ERR
+                }
+            }
+            _ => self.dma_err,
+        };
+        byte_of(value, offset & 3)
     }
 
-    // Read a byte from SD storage without allocating missing blocks.
-    // Returns stored byte value or 0 if unmapped.
+    // Write one byte of the DMA register block. CTRL.START/INIT are command
+    // strobes that clear once observed; any write to STATUS clears DONE/ERR.
+    // Returns true when the write requires an immediate interrupt.
+    fn write_reg_byte(&mut self, offset: u32, value: u8) -> bool {
+        let byte = offset & 3;
+        match offset & !3 {
+            SD_DMA_OFFSET_MEM_ADDR => self.dma_mem_addr = with_byte(self.dma_mem_addr, byte, value),
+            SD_DMA_OFFSET_SD_BLOCK => self.dma_sd_block = with_byte(self.dma_sd_block, byte, value),
+            SD_DMA_OFFSET_LEN => self.dma_len = with_byte(self.dma_len, byte, value),
+            SD_DMA_OFFSET_CTRL => {
+                let ctrl = with_byte(self.dma_ctrl, byte, value) & SD_DMA_CTRL_MASK;
+                self.dma_ctrl = ctrl & !(SD_DMA_CTRL_START | SD_DMA_CTRL_INIT);
+                if ctrl & SD_DMA_CTRL_INIT != 0 {
+                    return self.start_init();
+                }
+                if ctrl & SD_DMA_CTRL_START != 0 {
+                    return self.start_dma();
+                }
+            }
+            SD_DMA_OFFSET_STATUS => {
+                self.dma_status &= !(SD_DMA_STATUS_DONE | SD_DMA_STATUS_ERR);
+                self.dma_err = SD_DMA_ERR_NONE;
+            }
+            // SD_DMA_ERR is read-only; writes are ignored.
+            _ => {}
+        }
+        false
+    }
+
+    // Advance the init sequence or DMA engine by one device tick.
+    fn tick(&mut self) -> SdTick {
+        let irq_enable = self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE != 0;
+        if self.init_active {
+            self.init_ticks_remaining = self.init_ticks_remaining.saturating_sub(1);
+            if self.init_ticks_remaining != 0 {
+                return SdTick::Idle;
+            }
+            self.init_active = false;
+            self.initialized = true;
+            self.dma_status = (self.dma_status & !SD_DMA_STATUS_BUSY) | SD_DMA_STATUS_DONE;
+            return if irq_enable { SdTick::RaiseInterrupt } else { SdTick::Idle };
+        }
+        if !self.dma_active {
+            return SdTick::Idle;
+        }
+        if self.dma_tick_countdown > 0 {
+            self.dma_tick_countdown -= 1;
+            return SdTick::Idle;
+        }
+        self.dma_tick_countdown = self.dma_ticks_per_word - 1;
+        let bytes = self.dma_remaining.min(SD_DMA_BYTES_PER_TICK);
+        let (mem_addr, sd_offset) = (self.dma_mem_cursor, self.dma_sd_byte_cursor);
+        self.dma_mem_cursor = self.dma_mem_cursor.wrapping_add(bytes);
+        self.dma_sd_byte_cursor = self.dma_sd_byte_cursor.wrapping_add(u64::from(bytes));
+        self.dma_remaining -= bytes;
+        let done = self.dma_remaining == 0;
+        if done {
+            self.dma_active = false;
+            self.dma_status = (self.dma_status & !SD_DMA_STATUS_BUSY) | SD_DMA_STATUS_DONE;
+            if self.dma_err != SD_DMA_ERR_NONE {
+                self.dma_status |= SD_DMA_STATUS_ERR;
+            }
+        }
+        SdTick::Transfer {
+            mem_addr,
+            sd_offset,
+            bytes,
+            to_sd: self.dma_ctrl & SD_DMA_CTRL_DIR_RAM_TO_SD != 0,
+            irq_after: done && irq_enable,
+        }
+    }
+
+    // Read a byte from storage; unwritten blocks read as 0.
     fn read_storage_byte(&self, byte_offset: u64) -> u8 {
-        let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
-        let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
-        self.storage
-            .get(&block_index)
-            .and_then(|block| block.get(block_offset))
-            .copied()
-            .unwrap_or(0)
+        let block = (byte_offset / SD_BLOCK_SIZE as u64) as u32;
+        let offset = (byte_offset % SD_BLOCK_SIZE as u64) as usize;
+        self.storage.get(&block).map_or(0, |b| b[offset])
     }
 
-    // Write a byte to SD storage, allocating blocks as needed.
+    // Write a byte to storage, allocating its block and growing the image.
     fn write_storage_byte(&mut self, byte_offset: u64, value: u8) {
-        let block_index = (byte_offset / (SD_BLOCK_SIZE as u64)) as u32;
-        let block_offset = (byte_offset % (SD_BLOCK_SIZE as u64)) as usize;
-        let block = self
-            .storage
-            .entry(block_index)
-            .or_insert_with(|| vec![0; SD_BLOCK_SIZE]);
-        block[block_offset] = value;
+        let block = (byte_offset / SD_BLOCK_SIZE as u64) as u32;
+        let offset = (byte_offset % SD_BLOCK_SIZE as u64) as usize;
+        self.storage
+            .entry(block)
+            .or_insert_with(|| vec![0; SD_BLOCK_SIZE])[offset] = value;
         self.image_len = self.image_len.max(byte_offset + 1);
     }
 
-    // Load a raw SD image into storage starting at block 0.
-    // Storage is cleared and replaced with the provided image.
+    // Replace storage with a raw image starting at block 0.
     fn load_image(&mut self, image: &[u8]) {
         self.storage.clear();
         self.image_len = image.len() as u64;
@@ -417,26 +490,41 @@ impl SdCard {
         }
     }
 
-    // Serialize the SD card back into the raw host image format.
-    // Returns contiguous bytes covering [0, image_len), with gaps zero-filled.
+    // Serialize storage as a raw image covering [0, image_len), zero-filling gaps.
     fn dump_image(&self) -> Vec<u8> {
         let len =
-            usize::try_from(self.image_len).expect("sd image length exceeds host address space");
+            usize::try_from(self.image_len).expect("SD: image length exceeds host address space");
         let mut image = vec![0u8; len];
-        for (&block_index, block) in self.storage.iter() {
+        for (&block_index, block) in &self.storage {
             let start = block_index as usize * SD_BLOCK_SIZE;
-            if start >= len {
-                continue;
+            if start < len {
+                let end = (start + SD_BLOCK_SIZE).min(len);
+                image[start..end].copy_from_slice(&block[..end - start]);
             }
-            let end = (start + SD_BLOCK_SIZE).min(len);
-            image[start..end].copy_from_slice(&block[..end - start]);
         }
         image
     }
 }
 
+// Fixed-format PCM sink exposed through MMIO registers plus a byte ring.
+// Software writes PCM bytes and advances WRITE_IDX; the device advances
+// READ_IDX at the sample rate and raises an interrupt only when LOW_WATER
+// goes from false to true while IRQ delivery is enabled.
+// Invariants:
+// - read_idx always stays normalized to the ring size
+// - UNDERRUN clears when playback is disabled or software publishes at least
+//   one full sample again
+struct AudioDevice {
+    ring: Vec<u8>,
+    ctrl: u32,
+    write_idx: u32,
+    read_idx: u32,
+    watermark: u32,
+    underrun: bool,
+}
+
 impl AudioDevice {
-    // Create an audio device with empty ring-buffer state.
+    // Create an audio device with an empty ring.
     fn new() -> Self {
         AudioDevice {
             ring: vec![0; AUDIO_RING_BUFFER_SIZE as usize],
@@ -445,1317 +533,669 @@ impl AudioDevice {
             read_idx: 0,
             watermark: 0,
             underrun: false,
-            sample_tick_countdown: 0,
         }
     }
 
-    // Normalize a ring-buffer index into the device's fixed-size ring.
-    fn normalized_idx(idx: u32) -> u32 {
-        idx % AUDIO_RING_BUFFER_SIZE
-    }
-
-    // Return the number of unread PCM bytes between producer and consumer.
+    // Unread PCM bytes between producer and consumer.
     fn buffered_bytes(&self) -> u32 {
-        let write = Self::normalized_idx(self.write_idx);
-        let read = self.read_idx;
-        if write >= read {
-            write - read
+        let write = self.write_idx % AUDIO_RING_BUFFER_SIZE;
+        if write >= self.read_idx {
+            write - self.read_idx
         } else {
-            AUDIO_RING_BUFFER_SIZE - (read - write)
+            AUDIO_RING_BUFFER_SIZE - (self.read_idx - write)
         }
     }
 
-    // Determine whether the unread audio data is below the watermark.
+    // Whether unread data is at or below the watermark (this is also the
+    // IRQ-pending condition).
     fn low_water(&self) -> bool {
         self.buffered_bytes() <= self.watermark
     }
 
-    // Return whether the audio device currently requests an interrupt.
-    fn irq_pending(&self) -> bool {
-        self.low_water()
+    fn enabled(&self) -> bool {
+        self.ctrl & AUDIO_CTRL_ENABLE != 0
     }
 
-    // Assemble the guest-visible audio status register value.
+    // Whether this change crossed into low water with IRQs enabled.
+    fn low_water_edge(&self, was_low_water: bool) -> bool {
+        !was_low_water && self.low_water() && self.ctrl & AUDIO_CTRL_IRQ_ENABLE != 0
+    }
+
+    // Guest-visible status register.
     fn status(&self) -> u32 {
-        let mut status = 0u32;
-        if (self.ctrl & AUDIO_CTRL_ENABLE) != 0 {
+        let mut status = 0;
+        if self.enabled() {
             status |= AUDIO_STATUS_ENABLED;
         }
         if self.low_water() {
-            status |= AUDIO_STATUS_LOW_WATER;
+            status |= AUDIO_STATUS_LOW_WATER | AUDIO_STATUS_IRQ_PENDING;
         }
         if self.underrun {
             status |= AUDIO_STATUS_UNDERRUN;
         }
-        if self.irq_pending() {
-            status |= AUDIO_STATUS_IRQ_PENDING;
-        }
         status
     }
 
-    // Return whether audio playback is enabled in the control register.
-    fn enabled(&self) -> bool {
-        (self.ctrl & AUDIO_CTRL_ENABLE) != 0
+    // Read one byte of the register window.
+    fn read_reg_byte(&self, offset: u32) -> u8 {
+        let value = match offset & !3 {
+            AUDIO_OFFSET_CTRL => self.ctrl,
+            AUDIO_OFFSET_STATUS => self.status(),
+            AUDIO_OFFSET_WRITE_IDX => self.write_idx,
+            AUDIO_OFFSET_READ_IDX => self.read_idx,
+            _ => self.watermark,
+        };
+        byte_of(value, offset & 3)
     }
 
-    // Read one byte from the audio ring at a guest-visible index.
-    fn read_ring_byte(&self, addr: u32) -> Option<u8> {
-        if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
-            .contains(&addr)
-        {
-            return None;
-        }
-        Some(self.ring[(addr - AUDIO_RING_BUFFER_START) as usize])
-    }
-
-    // Store one byte into the audio ring at a guest-visible index.
-    fn write_ring_byte(&mut self, addr: u32, value: u8) -> bool {
-        if !(AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_START + AUDIO_RING_BUFFER_SIZE)
-            .contains(&addr)
-        {
-            return false;
-        }
-        self.ring[(addr - AUDIO_RING_BUFFER_START) as usize] = value;
-        true
-    }
-
-    // Read one byte from the audio device's register window.
-    fn read_reg_byte(&self, addr: u32) -> Option<u8> {
-        if addr >= AUDIO_CTRL_START && addr < AUDIO_CTRL_START + 4 {
-            return Some(read_reg_byte(self.ctrl, addr, AUDIO_CTRL_START));
-        }
-        if addr >= AUDIO_STATUS_START && addr < AUDIO_STATUS_START + 4 {
-            return Some(read_reg_byte(self.status(), addr, AUDIO_STATUS_START));
-        }
-        if addr >= AUDIO_WRITE_IDX_START && addr < AUDIO_WRITE_IDX_START + 4 {
-            return Some(read_reg_byte(self.write_idx, addr, AUDIO_WRITE_IDX_START));
-        }
-        if addr >= AUDIO_READ_IDX_START && addr < AUDIO_READ_IDX_START + 4 {
-            return Some(read_reg_byte(self.read_idx, addr, AUDIO_READ_IDX_START));
-        }
-        if addr >= AUDIO_WATERMARK_START && addr < AUDIO_WATERMARK_START + 4 {
-            return Some(read_reg_byte(self.watermark, addr, AUDIO_WATERMARK_START));
-        }
-        None
-    }
-
-    // Update one byte of the audio control register.
-    fn write_ctrl_byte(&mut self, addr: u32, value: u8) -> bool {
-        if !(AUDIO_CTRL_START..AUDIO_CTRL_START + 4).contains(&addr) {
-            return false;
-        }
-        let mut next = self.ctrl;
-        write_reg_byte(&mut next, addr, AUDIO_CTRL_START, value);
-        self.ctrl = next & (AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
-        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
-            self.underrun = false;
-        }
-        true
-    }
-
-    // Update one byte of the guest audio producer index.
-    fn write_write_idx_byte(&mut self, addr: u32, value: u8) -> bool {
-        if !(AUDIO_WRITE_IDX_START..AUDIO_WRITE_IDX_START + 4).contains(&addr) {
-            return false;
-        }
-        write_reg_byte(&mut self.write_idx, addr, AUDIO_WRITE_IDX_START, value);
-        true
-    }
-
-    // Update one byte of the low-watermark register.
-    fn write_watermark_byte(&mut self, addr: u32, value: u8) -> bool {
-        if !(AUDIO_WATERMARK_START..AUDIO_WATERMARK_START + 4).contains(&addr) {
-            return false;
-        }
-        write_reg_byte(&mut self.watermark, addr, AUDIO_WATERMARK_START, value);
-        true
-    }
-
-    // Clear an underrun once playback has recovered after a refill.
-    fn clear_underrun_if_recovered(&mut self) {
-        if self.buffered_bytes() >= AUDIO_SAMPLE_BYTES {
-            self.underrun = false;
+    // Write one byte of the register window. STATUS and READ_IDX are
+    // read-only; writing them is a guest bug and stops the emulator.
+    fn write_reg_byte(&mut self, offset: u32, value: u8) {
+        let byte = offset & 3;
+        match offset & !3 {
+            AUDIO_OFFSET_CTRL => {
+                self.ctrl = with_byte(self.ctrl, byte, value)
+                    & (AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+                if !self.enabled() {
+                    self.underrun = false;
+                }
+            }
+            AUDIO_OFFSET_WRITE_IDX => self.write_idx = with_byte(self.write_idx, byte, value),
+            AUDIO_OFFSET_WATERMARK => self.watermark = with_byte(self.watermark, byte, value),
+            reg => panic!(
+                "MMIO: attempting to write read-only audio {} register (0x{:08X})",
+                if reg == AUDIO_OFFSET_STATUS { "status" } else { "read index" },
+                AUDIO_REGS_START + reg
+            ),
         }
     }
 
-    // Read the queued sample at a ring-buffer position.
-    fn sample_at(&self, idx: u32) -> i16 {
-        let lo = self.ring[idx as usize];
-        let hi = self.ring[((idx + 1) % AUDIO_RING_BUFFER_SIZE) as usize];
-        i16::from_le_bytes([lo, hi])
-    }
-
-    // Consume one sample immediately from the MMIO audio device.
-    // This bypasses the 100 MHz device-tick countdown and is
-    // only used by the optional wall-clock host-audio mode.
-    // Returns the exact sample the hardware would output right now, including
-    // signed-zero underrun output while enabled and the buffer is empty.
-    // Invariants:
-    // - READ_IDX advances by exactly one sample when buffered PCM exists
-    // - UNDERRUN latches when enabled playback needs data and the ring is empty
-    // - disabled playback leaves READ_IDX unchanged and outputs silence
+    // Consume one sample now. Disabled playback outputs silence without
+    // moving READ_IDX; enabled playback with an empty ring latches UNDERRUN
+    // and outputs signed zero.
     fn consume_sample_now(&mut self) -> i16 {
-        if (self.ctrl & AUDIO_CTRL_ENABLE) == 0 {
+        if !self.enabled() {
             return 0;
         }
-
         if self.buffered_bytes() < AUDIO_SAMPLE_BYTES {
             self.underrun = true;
             return 0;
         }
-
-        let sample = self.sample_at(self.read_idx);
+        let lo = self.ring[self.read_idx as usize];
+        let hi = self.ring[((self.read_idx + 1) % AUDIO_RING_BUFFER_SIZE) as usize];
         self.read_idx = (self.read_idx + AUDIO_SAMPLE_BYTES) % AUDIO_RING_BUFFER_SIZE;
-        sample
-    }
-
-    // Advance the sample-rate countdown and consume audio when it expires.
-    fn tick_sample_clock(&mut self) -> bool {
-        if self.sample_tick_countdown > 0 {
-            self.sample_tick_countdown -= 1;
-            return false;
-        }
-        self.sample_tick_countdown = AUDIO_TICKS_PER_SAMPLE.saturating_sub(1);
-        true
+        i16::from_le_bytes([lo, hi])
     }
 }
 
-// Extract a little-endian register byte from a 32-bit value.
-// Returns the addressed byte.
-fn read_reg_byte(value: u32, addr: u32, base: u32) -> u8 {
-    let shift = ((addr - base) * 8) as u32;
-    ((value >> shift) & 0xFF) as u8
-}
-
-// Update one byte of a 32-bit MMIO register in little-endian order.
-fn write_reg_byte(reg: &mut u32, addr: u32, base: u32, value: u8) {
-    let shift = ((addr - base) * 8) as u32;
-    let mask = 0xFFu32 << shift;
-    *reg = (*reg & !mask) | ((value as u32) << shift);
-}
-
-// Read a byte from an SD DMA MMIO block.
-// Returns Some(byte) if within the SD block, else None.
-fn read_sd_dma_mmio(addr: u32, base: u32, sd: &SdCard) -> Option<u8> {
-    if addr < base || addr >= base + SD_DMA_RANGE_SIZE {
-        return None;
-    }
-    if addr >= base + SD_DMA_OFFSET_MEM_ADDR && addr < base + SD_DMA_OFFSET_MEM_ADDR + 4 {
-        return Some(read_reg_byte(
-            sd.dma_mem_addr,
-            addr,
-            base + SD_DMA_OFFSET_MEM_ADDR,
-        ));
-    }
-    if addr >= base + SD_DMA_OFFSET_SD_BLOCK && addr < base + SD_DMA_OFFSET_SD_BLOCK + 4 {
-        return Some(read_reg_byte(
-            sd.dma_sd_block,
-            addr,
-            base + SD_DMA_OFFSET_SD_BLOCK,
-        ));
-    }
-    if addr >= base + SD_DMA_OFFSET_LEN && addr < base + SD_DMA_OFFSET_LEN + 4 {
-        return Some(read_reg_byte(sd.dma_len, addr, base + SD_DMA_OFFSET_LEN));
-    }
-    if addr >= base + SD_DMA_OFFSET_CTRL && addr < base + SD_DMA_OFFSET_CTRL + 4 {
-        return Some(read_reg_byte(sd.dma_ctrl, addr, base + SD_DMA_OFFSET_CTRL));
-    }
-    if addr >= base + SD_DMA_OFFSET_STATUS && addr < base + SD_DMA_OFFSET_STATUS + 4 {
-        let mut status = sd.dma_status;
-        if sd.dma_err != SD_DMA_ERR_NONE {
-            status |= SD_DMA_STATUS_ERR;
-        } else {
-            status &= !SD_DMA_STATUS_ERR;
-        }
-        return Some(read_reg_byte(status, addr, base + SD_DMA_OFFSET_STATUS));
-    }
-    Some(read_reg_byte(sd.dma_err, addr, base + SD_DMA_OFFSET_ERR))
+// Guest RAM, MMIO devices, and their architecturally visible state.
+pub struct Memory {
+    ram: Box<[AtomicU32]>,
+    mmio_lock: Mutex<()>,
+    device_clock: DeviceClock,
+    vga: VgaState,
+    // Host key events waiting for the guest; `input_pending` mirrors
+    // "non-empty" so every core can poll it each tick without locking.
+    input: Mutex<VecDeque<u16>>,
+    input_pending: AtomicBool,
+    pit_reload: AtomicU32,
+    clk_divider: AtomicU32,
+    sd_cards: [Mutex<SdCard>; 2],
+    audio: Mutex<AudioDevice>,
+    // Device interrupt bits raised since core 0 last collected them.
+    pending_interrupt: AtomicU32,
+    use_uart_rx: bool,
 }
 
 impl Memory {
-    // Create guest memory and reset all mapped devices.
+    // Create guest memory initialized from a sparse byte image (bytes at or
+    // above IO_START are ignored) with every device reset.
     pub fn new(ram: HashMap<u32, u8>, use_uart_rx: bool, sd_dma_ticks_per_word: u32) -> Memory {
-        let ticks_per_word = sd_dma_ticks_per_word.max(1);
-
+        let mut words = zeroed_atomic_words(RAM_WORDS);
+        for (addr, value) in ram {
+            if addr < IO_START {
+                let word = words[(addr / 4) as usize].get_mut();
+                *word = with_byte(*word, addr % 4, value);
+            }
+        }
         Memory {
-            ram_pages: Self::build_ram_pages(ram),
+            ram: words,
             mmio_lock: Mutex::new(()),
-            pixel_frame_buffer: Arc::new(RwLock::new(PixelFrameBuffer::new(
-                PIXEL_FRAME_WIDTH,
-                PIXEL_FRAME_HEIGHT,
-                PIXEL_FRAME_BUFFER_SIZE,
-            ))),
-            tile_frame_buffer: Arc::new(RwLock::new(TileFrameBuffer::new(
-                FRAME_WIDTH,
-                FRAME_HEIGHT,
-                TILE_FRAME_BUFFER_SIZE,
-            ))),
-            tile_map: Arc::new(RwLock::new(TileMap::new(TILE_MAP_SIZE))),
-            io_buffer: Arc::new(RwLock::new(VecDeque::new())),
-            input_pending: Arc::new(AtomicBool::new(false)),
-            tile_vscroll_register: Arc::new(RwLock::new((0, 0))),
-            tile_hscroll_register: Arc::new(RwLock::new((0, 0))),
-            pixel_vscroll_register: Arc::new(RwLock::new((0, 0))),
-            pixel_hscroll_register: Arc::new(RwLock::new((0, 0))),
-            tile_scale_register: Arc::new(RwLock::new(0)),
-            pixel_scale_register: Arc::new(RwLock::new(0)),
-            sprite_scale_registers: Arc::new(RwLock::new(vec![0; SPRITE_COUNT as usize])),
-            vga_status_register: Arc::new(RwLock::new(0)),
-            vga_frame_register: Arc::new(RwLock::new((0, 0, 0, 0))),
-            clk_register: Arc::new(RwLock::new((0, 0, 0, 0))),
-            pit_reload: Arc::new(AtomicU32::new(0)),
-            pit_countdown: Arc::new(Mutex::new(0)),
-            sprite_map: Arc::new(RwLock::new(SpriteMap::new(SPRITE_MAP_SIZE))),
-            sd_card: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
-            sd_card2: Arc::new(RwLock::new(SdCard::new(ticks_per_word))),
-            audio: Arc::new(RwLock::new(AudioDevice::new())),
-            pending_interrupt: Arc::new(AtomicU32::new(0)),
-            use_uart_rx: use_uart_rx,
+            device_clock: DeviceClock {
+                pit_countdown: AtomicU32::new(0),
+                audio_sample_countdown: AtomicU32::new(0),
+            },
+            vga: VgaState::new(),
+            input: Mutex::new(VecDeque::new()),
+            input_pending: AtomicBool::new(false),
+            pit_reload: AtomicU32::new(0),
+            clk_divider: AtomicU32::new(0),
+            sd_cards: [
+                Mutex::new(SdCard::new(sd_dma_ticks_per_word)),
+                Mutex::new(SdCard::new(sd_dma_ticks_per_word)),
+            ],
+            audio: Mutex::new(AudioDevice::new()),
+            pending_interrupt: AtomicU32::new(0),
+            use_uart_rx,
         }
     }
 
-    // Allocate the fixed page table used for lazily backed guest RAM.
-    fn build_ram_pages(image: HashMap<u32, u8>) -> Box<[RwLock<RamPage>]> {
-        // The kernel's physical frame allocator first-touches nearly every RAM
-        // page during boot, so sparse per-page host allocations make early boot
-        // disproportionately expensive. Keep page-level locking for multicore
-        // safety, but back each page with dense zero-initialized storage.
-        let mut pages: Vec<RwLock<RamPage>> = Vec::with_capacity(RAM_PAGE_COUNT);
-        pages.resize_with(RAM_PAGE_COUNT, || RwLock::new(RamPage::new()));
-        for (addr, value) in image {
-            if addr >= IO_START {
-                continue;
-            }
-            let page = Self::ram_page_index(addr);
-            let offset = Self::ram_page_offset(addr);
-            pages[page].get_mut().unwrap().write_byte(offset, value);
+    // RAM word containing `addr` (which must be below IO_START).
+    fn ram_word(&self, addr: u32) -> &AtomicU32 {
+        &self.ram[(addr / 4) as usize]
+    }
+
+    // Store guest bytes within one RAM word. A full aligned word is a single
+    // store; narrower stores merge into the word with a compare-and-swap so a
+    // concurrent store to the word's other bytes is never lost.
+    fn store_ram_bytes(&self, addr: u32, data: &[u8]) {
+        let word = self.ram_word(addr);
+        if data.len() == 4 {
+            word.store(u32::from_le_bytes(data.try_into().unwrap()), Ordering::SeqCst);
+            return;
         }
-        pages.into_boxed_slice()
-    }
-
-    // Map a guest physical address to its lazily allocated RAM page index.
-    fn ram_page_index(addr: u32) -> usize {
-        (addr >> RAM_PAGE_SHIFT) as usize
-    }
-
-    // Convert a guest address into its offset within a RAM page.
-    fn ram_page_offset(addr: u32) -> usize {
-        (addr as usize) & RAM_PAGE_MASK
-    }
-
-    // Return the sorted unique RAM pages that must be locked for an address set.
-    fn collect_ram_page_indices(addrs: &[u32]) -> Vec<usize> {
-        let mut pages = Vec::new();
-        for addr in addrs {
-            if *addr < IO_START {
-                pages.push(Self::ram_page_index(*addr));
-            }
-        }
-        // Sort lock acquisition so multi-page accesses cannot deadlock.
-        pages.sort_unstable();
-        pages.dedup();
-        pages
-    }
-
-    // Return whether any byte in the range overlaps an MMIO device.
-    fn addr_touches_mmio(addr: u32) -> bool {
-        addr >= IO_START
-    }
-
-    // Test whether an address range overlaps a mapped MMIO region.
-    fn addrs_touch_mmio(addrs: &[u32]) -> bool {
-        addrs.iter().any(|addr| Self::addr_touches_mmio(*addr))
-    }
-
-    // Read or write a range that remains within one RAM page.
-    fn single_ram_page(addrs: &[u32]) -> Option<usize> {
-        let first = *addrs.first()?;
-        if first >= IO_START {
-            return None;
-        }
-        let page = Self::ram_page_index(first);
-        if addrs
-            .iter()
-            .all(|addr| *addr < IO_START && Self::ram_page_index(*addr) == page)
-        {
-            Some(page)
-        } else {
-            None
-        }
-    }
-
-    // Access a RAM range without crossing a page boundary.
-    fn ram_range_within_single_page(addr: u32, width: u32) -> Option<usize> {
-        if width == 0 || addr >= IO_START {
-            return None;
-        }
-        let end = addr.checked_add(width - 1)?;
-        if end >= IO_START {
-            return None;
-        }
-        let page = Self::ram_page_index(addr);
-        if Self::ram_page_index(end) == page {
-            Some(page)
-        } else {
-            None
-        }
-    }
-
-    // Return whether the range covers the contiguous PIT registers.
-    fn addrs_are_contiguous_pit_bytes(addrs: &[u32]) -> bool {
-        let Some(&first) = addrs.first() else {
-            return false;
+        let offset = addr % 4;
+        let merge = |value: u32| {
+            let merged = data
+                .iter()
+                .enumerate()
+                .fold(value, |acc, (i, byte)| with_byte(acc, offset + i as u32, *byte));
+            Some(merged)
         };
-        if !(PIT_START..PIT_START + 4).contains(&first) {
-            return false;
-        }
-        addrs
-            .iter()
-            .enumerate()
-            .all(|(index, addr)| *addr == first + index as u32 && *addr < PIT_START + 4)
+        let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, merge);
     }
 
     // Warn when guest code reads the null physical address.
-    fn maybe_warn_null_read(addr: u32) {
+    fn warn_null_read(addr: u32) {
         if addr == 0 {
             println!("Warning: reading from physical address 0x00000000");
         }
     }
 
     // Warn when guest code writes the null physical address.
-    fn maybe_warn_null_write(addr: u32, data: u8) {
+    fn warn_null_write(addr: u32, data: u8) {
         if addr == 0 {
-            println!(
-                "Warning: writing to physical address 0x00000000: 0x{:08X}",
-                data
-            );
+            println!("Warning: writing to physical address 0x00000000: 0x{:08X}", data);
         }
     }
 
-    // Read a byte from guest RAM, returning zero for an unallocated page.
-    fn read_ram_byte(&self, addr: u32) -> u8 {
-        debug_assert!(addr < IO_START);
-        Self::maybe_warn_null_read(addr);
-        let page = self.ram_pages[Self::ram_page_index(addr)].read().unwrap();
-        page.read_byte(Self::ram_page_offset(addr))
+    // ---- Shared state accessors ------------------------------------------
+
+    // VGA state for the graphics thread.
+    pub fn vga(&self) -> &VgaState {
+        &self.vga
     }
 
-    // Write a byte to guest RAM, allocating its page on demand.
-    fn write_ram_byte(&self, addr: u32, data: u8) {
-        debug_assert!(addr < IO_START);
-        Self::maybe_warn_null_write(addr, data);
-        let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
-        page.write_byte(Self::ram_page_offset(addr), data);
+    // Queue a host key event for the guest (PS/2 stream or UART RX).
+    pub fn push_input(&self, event: u16) {
+        self.input.lock().unwrap().push_back(event);
+        self.input_pending.store(true, Ordering::SeqCst);
     }
 
-    // Read one byte of the PIT reload register.
-    fn read_pit_reload(&self) -> u32 {
-        self.pit_reload.load(Ordering::SeqCst)
+    // Pop the next queued input event (0 if none).
+    fn pop_input(&self) -> u16 {
+        let mut queue = self.input.lock().unwrap();
+        let value = queue.pop_front().unwrap_or(0);
+        self.input_pending.store(!queue.is_empty(), Ordering::SeqCst);
+        value
     }
 
-    // Update one byte of the PIT reload register.
-    fn write_pit_reload_byte(&self, addr: u32, data: u8) {
-        let mut reload = self.read_pit_reload();
-        write_reg_byte(&mut reload, addr, PIT_START, data);
-        self.pit_reload.store(reload, Ordering::SeqCst);
-    }
-
-    // Update the PIT reload register across a byte range.
-    fn write_pit_reload_bytes(&self, addrs: &[u32], data: &[u8]) {
-        let mut reload = self.read_pit_reload();
-        for (addr, byte) in addrs.iter().zip(data.iter()) {
-            write_reg_byte(&mut reload, *addr, PIT_START, *byte);
-        }
-        self.pit_reload.store(reload, Ordering::SeqCst);
-    }
-
-    // Publish an interrupt bit without discarding concurrently pending sources.
-    fn raise_pending_interrupt(&self, interrupt_bit: u32) {
-        self.pending_interrupt
-            .fetch_or(interrupt_bit, Ordering::SeqCst);
-    }
-
-    // Read a physical range without acquiring the outer MMIO lock.
-    fn read_phys_bytes_inner(&self, addrs: &[u32], out: &mut [u8]) {
-        if let Some(page_index) = Self::single_ram_page(addrs) {
-            let page = self.ram_pages[page_index].read().unwrap();
-            for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
-                Self::maybe_warn_null_read(*addr);
-                *slot = page.read_byte(Self::ram_page_offset(*addr));
-            }
-            return;
-        }
-
-        let pages = Self::collect_ram_page_indices(addrs);
-        let page_guards: Vec<_> = pages
-            .iter()
-            .map(|page| self.ram_pages[*page].read().unwrap())
-            .collect();
-        for (slot, addr) in out.iter_mut().zip(addrs.iter()) {
-            if Self::addr_touches_mmio(*addr) {
-                *slot = self.read_mmio_byte(*addr);
-            } else {
-                Self::maybe_warn_null_read(*addr);
-                let page = Self::ram_page_index(*addr);
-                let guard_index = pages.binary_search(&page).unwrap();
-                *slot = page_guards[guard_index].read_byte(Self::ram_page_offset(*addr));
-            }
-        }
-    }
-
-    // Write a physical range without acquiring the outer MMIO lock.
-    fn write_phys_bytes_inner(&self, addrs: &[u32], data: &[u8]) {
-        if Self::addrs_are_contiguous_pit_bytes(addrs) {
-            self.write_pit_reload_bytes(addrs, data);
-            return;
-        }
-
-        if let Some(page_index) = Self::single_ram_page(addrs) {
-            let mut page = self.ram_pages[page_index].write().unwrap();
-            for (addr, byte) in addrs.iter().zip(data.iter()) {
-                Self::maybe_warn_null_write(*addr, *byte);
-                page.write_byte(Self::ram_page_offset(*addr), *byte);
-            }
-            return;
-        }
-
-        let pages = Self::collect_ram_page_indices(addrs);
-        let mut page_guards: Vec<_> = pages
-            .iter()
-            .map(|page| self.ram_pages[*page].write().unwrap())
-            .collect();
-        for (addr, byte) in addrs.iter().zip(data.iter()) {
-            if Self::addr_touches_mmio(*addr) {
-                self.write_mmio_byte(*addr, *byte);
-            } else {
-                Self::maybe_warn_null_write(*addr, *byte);
-                let page = Self::ram_page_index(*addr);
-                let guard_index = pages.binary_search(&page).unwrap();
-                page_guards[guard_index].write_byte(Self::ram_page_offset(*addr), *byte);
-            }
-        }
-    }
-
-    // Expose the shared pixel framebuffer backing the VGA device.
-    pub fn get_pixel_frame_buffer(&self) -> Arc<RwLock<PixelFrameBuffer>> {
-        Arc::clone(&self.pixel_frame_buffer)
-    }
-    // Expose the shared tile framebuffer backing the VGA device.
-    pub fn get_tile_frame_buffer(&self) -> Arc<RwLock<TileFrameBuffer>> {
-        Arc::clone(&self.tile_frame_buffer)
-    }
-    // Expose the shared tile-entry map used by graphics rendering.
-    pub fn get_tile_map(&self) -> Arc<RwLock<TileMap>> {
-        return Arc::clone(&self.tile_map);
-    }
-    // Expose the shared input/MMIO buffer used by the graphics frontend.
-    pub fn get_io_buffer(&self) -> Arc<RwLock<VecDeque<u16>>> {
-        return Arc::clone(&self.io_buffer);
-    }
-    // Expose the flag indicating queued guest input.
-    pub fn get_input_pending(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.input_pending)
-    }
-    // Expose the tile-layer vertical-scroll register.
-    pub fn get_tile_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
-        Arc::clone(&self.tile_vscroll_register)
-    }
-    // Expose the tile-layer horizontal-scroll register.
-    pub fn get_tile_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
-        Arc::clone(&self.tile_hscroll_register)
-    }
-    // Expose the pixel-layer vertical-scroll register.
-    pub fn get_pixel_vscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
-        Arc::clone(&self.pixel_vscroll_register)
-    }
-    // Expose the pixel-layer horizontal-scroll register.
-    pub fn get_pixel_hscroll_register(&self) -> Arc<RwLock<(u8, u8)>> {
-        Arc::clone(&self.pixel_hscroll_register)
-    }
-    // Expose the tile-layer scale register.
-    pub fn get_tile_scale_register(&self) -> Arc<RwLock<u8>> {
-        Arc::clone(&self.tile_scale_register)
-    }
-    // Expose the pixel-layer scale register.
-    pub fn get_pixel_scale_register(&self) -> Arc<RwLock<u8>> {
-        Arc::clone(&self.pixel_scale_register)
-    }
-    // Expose the sprite scale registers used by the renderer.
-    pub fn get_sprite_scale_registers(&self) -> Arc<RwLock<Vec<u8>>> {
-        Arc::clone(&self.sprite_scale_registers)
-    }
-    // Expose the shared sprite map used by graphics rendering.
-    pub fn get_sprite_map(&self) -> Arc<RwLock<SpriteMap>> {
-        return Arc::clone(&self.sprite_map);
-    }
-    // Expose the VGA status register shared with the renderer.
-    pub fn get_vga_status_register(&self) -> Arc<RwLock<u8>> {
-        return Arc::clone(&self.vga_status_register);
-    }
-    // Expose the VGA frame counter register shared with the renderer.
-    pub fn get_vga_frame_register(&self) -> Arc<RwLock<(u8, u8, u8, u8)>> {
-        return Arc::clone(&self.vga_frame_register);
-    }
-    // Expose the pending-device-interrupt flag for the renderer.
-    pub fn get_pending_interrupt(&self) -> Arc<AtomicU32> {
-        return Arc::clone(&self.pending_interrupt);
-    }
-
-    // Return whether keyboard or other input is waiting in the MMIO queue.
+    // Whether input is waiting in the PS/2/UART queue.
     pub fn has_pending_input(&self) -> bool {
         self.input_pending.load(Ordering::SeqCst)
     }
 
-    // Read one byte from RAM or the MMIO device map.
-    pub fn read(&self, addr: u32) -> u8 {
-        if Self::addr_touches_mmio(addr) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            self.read_mmio_byte(addr)
-        } else {
-            self.read_ram_byte(addr)
-        }
+    // Current clock-divider register value (read every tick by every core).
+    pub fn clock_divider(&self) -> u32 {
+        self.clk_divider.load(Ordering::SeqCst)
     }
 
-    // Read an aligned little-endian halfword from RAM or MMIO.
-    pub fn read_u16(&self, addr: u32) -> u16 {
-        let addr = addr & 0xFFFFFFFE;
-        if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
-            Self::maybe_warn_null_read(addr);
-            let page = self.ram_pages[page_index].read().unwrap();
-            return page.read_u16_le(Self::ram_page_offset(addr));
+    // Publish a device interrupt without discarding concurrently raised ones.
+    pub fn raise_pending_interrupt(&self, interrupt_bit: u32) {
+        self.pending_interrupt.fetch_or(interrupt_bit, Ordering::SeqCst);
+    }
+
+    // Take (and clear) the device interrupts raised since the last call.
+    pub fn check_interrupts(&self) -> u32 {
+        // Core 0 calls this every tick; avoid a read-modify-write when idle.
+        if self.pending_interrupt.load(Ordering::SeqCst) == 0 {
+            return 0;
         }
-        let addrs = [addr, addr + 1];
-        let mut bytes = [0u8; 2];
-        self.read_phys_bytes(&addrs, &mut bytes);
+        self.pending_interrupt.swap(0, Ordering::SeqCst)
+    }
+
+    // ---- CPU-facing accesses (naturally aligned) ---------------------------
+
+    // Read one byte from RAM or MMIO.
+    pub fn read(&self, addr: u32) -> u8 {
+        if addr >= IO_START {
+            return self.mmio_transaction(|m| m.read_mmio_byte(addr));
+        }
+        Self::warn_null_read(addr);
+        byte_of(self.ram_word(addr).load(Ordering::SeqCst), addr % 4)
+    }
+
+    // Read an aligned little-endian halfword (the address is aligned down).
+    pub fn read_u16(&self, addr: u32) -> u16 {
+        let mut bytes = [0; 2];
+        self.read_aligned(addr & !1, &mut bytes);
         u16::from_le_bytes(bytes)
     }
 
-    // Read an aligned little-endian word from RAM or MMIO.
+    // Read an aligned little-endian word (the address is aligned down).
     pub fn read_u32(&self, addr: u32) -> u32 {
-        let addr = addr & 0xFFFFFFFC;
-        if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
-            Self::maybe_warn_null_read(addr);
-            let page = self.ram_pages[page_index].read().unwrap();
-            return page.read_u32_le(Self::ram_page_offset(addr));
-        }
-        let addrs = [addr, addr + 1, addr + 2, addr + 3];
-        let mut bytes = [0u8; 4];
-        self.read_phys_bytes(&addrs, &mut bytes);
+        let mut bytes = [0; 4];
+        self.read_aligned(addr & !3, &mut bytes);
         u32::from_le_bytes(bytes)
     }
 
-    // Read specific physical addresses under one lock to avoid tearing.
-    pub fn read_phys_bytes(&self, addrs: &[u32], out: &mut [u8]) {
-        assert_eq!(addrs.len(), out.len());
-        if Self::addrs_touch_mmio(addrs) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            self.read_phys_bytes_inner(addrs, out);
-        } else {
-            self.read_phys_bytes_inner(addrs, out);
+    // Read an aligned 2- or 4-byte value, which is either inside one RAM
+    // word or all MMIO.
+    fn read_aligned(&self, addr: u32, out: &mut [u8]) {
+        if addr >= IO_START {
+            self.mmio_transaction(|m| m.read_mmio_bytes(addr, out));
+            return;
+        }
+        Self::warn_null_read(addr);
+        word_bytes(self.ram_word(addr).load(Ordering::SeqCst), addr % 4, out);
+    }
+
+    // Write one byte to RAM or MMIO.
+    pub fn write(&self, addr: u32, data: u8) {
+        self.write_aligned(addr, &[data]);
+    }
+
+    // Write an aligned little-endian halfword (the address is aligned down).
+    pub fn write_u16(&self, addr: u32, data: u16) {
+        self.write_aligned(addr & !1, &data.to_le_bytes());
+    }
+
+    // Write an aligned little-endian word (the address is aligned down).
+    pub fn write_u32(&self, addr: u32, data: u32) {
+        self.write_aligned(addr & !3, &data.to_le_bytes());
+    }
+
+    // Write an aligned value that is either inside one RAM word or all MMIO.
+    fn write_aligned(&self, addr: u32, data: &[u8]) {
+        if addr >= IO_START {
+            self.mmio_transaction(|m| m.write_mmio_bytes(addr, data));
+            return;
+        }
+        Self::warn_null_write(addr, data[0]);
+        self.store_ram_bytes(addr, data);
+    }
+
+    // Atomically replace the aligned word at `addr` with `update(old)` and
+    // return the old value. RAM uses a compare-and-swap loop (so `update` may
+    // run more than once); MMIO holds `mmio_lock` across the read and write.
+    pub fn atomic_update_u32(&self, addr: u32, update: impl Fn(u32) -> u32) -> u32 {
+        let addr = addr & !3;
+        if addr >= IO_START {
+            return self.mmio_transaction(|m| {
+                let mut prev = [0; 4];
+                m.read_mmio_bytes(addr, &mut prev);
+                let prev = u32::from_le_bytes(prev);
+                m.write_mmio_bytes(addr, &update(prev).to_le_bytes());
+                prev
+            });
+        }
+        self.ram_word(addr)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| Some(update(prev)))
+            .unwrap()
+    }
+
+    // ---- Byte ranges (SD DMA and tests) -------------------------------------
+
+    // Read a contiguous physical range byte by byte (an aligned RAM word is
+    // read with one load). Used by SD DMA, which moves aligned words.
+    pub fn read_phys_range(&self, addr: u32, out: &mut [u8]) {
+        if out.len() == 4 && addr.is_multiple_of(4) && addr < IO_START {
+            word_bytes(self.ram_word(addr).load(Ordering::SeqCst), 0, out);
+            return;
+        }
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.read(addr + i as u32);
         }
     }
 
-    // Execute a 32-bit atomic swap through the memory interface.
-    pub fn atomic_swap_u32(&self, addr: u32, value: u32) -> u32 {
-        let addr = addr & 0xFFFFFFFC;
-        let bytes = value.to_le_bytes();
-        if Self::addr_touches_mmio(addr) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            let mut prev = [0u8; 4];
-            for (offset, slot) in prev.iter_mut().enumerate() {
-                *slot = self.read_mmio_byte(addr + offset as u32);
-            }
-            for (offset, byte) in bytes.iter().enumerate() {
-                self.write_mmio_byte(addr + offset as u32, *byte);
-            }
-            u32::from_le_bytes(prev)
-        } else {
-            let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
-            let mut prev = [0u8; 4];
-            for (offset, slot) in prev.iter_mut().enumerate() {
-                *slot = page.read_byte(Self::ram_page_offset(addr + offset as u32));
-            }
-            for (offset, byte) in bytes.iter().enumerate() {
-                page.write_byte(Self::ram_page_offset(addr + offset as u32), *byte);
-            }
-            u32::from_le_bytes(prev)
+    // Write a contiguous physical range; see `read_phys_range`.
+    pub fn write_phys_range(&self, addr: u32, data: &[u8]) {
+        if data.len() == 4 && addr.is_multiple_of(4) && addr < IO_START {
+            self.store_ram_bytes(addr, data);
+            return;
+        }
+        for (i, byte) in data.iter().enumerate() {
+            self.write(addr + i as u32, *byte);
         }
     }
 
-    // Execute a 32-bit atomic add through the memory interface.
-    pub fn atomic_add_u32(&self, addr: u32, value: u32) -> u32 {
-        let addr = addr & 0xFFFFFFFC;
-        if Self::addr_touches_mmio(addr) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            let mut prev = [0u8; 4];
-            for (offset, slot) in prev.iter_mut().enumerate() {
-                *slot = self.read_mmio_byte(addr + offset as u32);
-            }
-            let prev_u32 = u32::from_le_bytes(prev);
-            let next = prev_u32.wrapping_add(value).to_le_bytes();
-            for (offset, byte) in next.iter().enumerate() {
-                self.write_mmio_byte(addr + offset as u32, *byte);
-            }
-            prev_u32
-        } else {
-            let mut page = self.ram_pages[Self::ram_page_index(addr)].write().unwrap();
-            let mut prev = [0u8; 4];
-            for (offset, slot) in prev.iter_mut().enumerate() {
-                *slot = page.read_byte(Self::ram_page_offset(addr + offset as u32));
-            }
-            let prev_u32 = u32::from_le_bytes(prev);
-            let next = prev_u32.wrapping_add(value).to_le_bytes();
-            for (offset, byte) in next.iter().enumerate() {
-                page.write_byte(Self::ram_page_offset(addr + offset as u32), *byte);
-            }
-            prev_u32
+    // ---- MMIO --------------------------------------------------------------
+
+    // Run one guest-visible MMIO access under `mmio_lock`. Afterwards the
+    // audio device recovers from underrun if refilled and raises its
+    // interrupt if the access crossed into low water, so multi-byte writes are
+    // judged on their final value, never an intermediate byte.
+    fn mmio_transaction<R>(&self, access: impl FnOnce(&Self) -> R) -> R {
+        let _guard = self.mmio_lock.lock().unwrap();
+        let was_low_water = self.audio.lock().unwrap().low_water();
+        let result = access(self);
+        let mut audio = self.audio.lock().unwrap();
+        if audio.buffered_bytes() >= AUDIO_SAMPLE_BYTES {
+            audio.underrun = false;
+        }
+        if audio.low_water_edge(was_low_water) {
+            self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
+        }
+        result
+    }
+
+    // Lock-free register (and its base) containing `addr`, if any.
+    fn lockfree_register(&self, addr: u32) -> Option<(&AtomicU32, u32)> {
+        match addr {
+            PIT_START..PIT_END => Some((&self.pit_reload, PIT_START)),
+            CLK_REG_START..CLK_REG_END => Some((&self.clk_divider, CLK_REG_START)),
+            _ => None,
         }
     }
 
-    // Load a raw SD image into the selected SD device.
-    pub fn load_sd_image(&self, slot: SdSlot, image: &[u8]) {
-        match slot {
-            SdSlot::Sd0 => {
-                let mut sd = self.sd_card.write().unwrap();
-                sd.load_image(image);
-            }
-            SdSlot::Sd1 => {
-                let mut sd = self.sd_card2.write().unwrap();
-                sd.load_image(image);
-            }
+    // Read contiguous MMIO bytes. Caller holds `mmio_lock`.
+    fn read_mmio_bytes(&self, addr: u32, out: &mut [u8]) {
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.read_mmio_byte(addr + i as u32);
         }
     }
 
-    // Export the selected SD device as a raw host image.
-    // Returns contiguous bytes covering the device's tracked image length.
-    pub fn dump_sd_image(&self, slot: SdSlot) -> Vec<u8> {
-        match slot {
-            SdSlot::Sd0 => self.sd_card.read().unwrap().dump_image(),
-            SdSlot::Sd1 => self.sd_card2.read().unwrap().dump_image(),
+    // Write contiguous MMIO bytes. Caller holds `mmio_lock`. Writes that fall
+    // inside one lock-free register are applied with a single store.
+    fn write_mmio_bytes(&self, addr: u32, data: &[u8]) {
+        if let Some((reg, base)) = self.lockfree_register(addr)
+            && addr + data.len() as u32 <= base + 4 {
+                let mut value = reg.load(Ordering::SeqCst);
+                for (i, byte) in data.iter().enumerate() {
+                    value = with_byte(value, addr - base + i as u32, *byte);
+                }
+                reg.store(value, Ordering::SeqCst);
+                return;
+            }
+        for (i, byte) in data.iter().enumerate() {
+            self.write_mmio_byte(addr + i as u32, *byte);
         }
     }
 
-    // Apply an MMIO write to one SD device's DMA register block.
-    // Returns true if the address was handled, false otherwise.
-    fn write_sd_dma_mmio(
-        &self,
-        addr: u32,
-        data: u8,
-        base: u32,
-        sd: &Arc<RwLock<SdCard>>,
-        interrupt_bit: u32,
-    ) -> bool {
-        if addr < base || addr >= base + SD_DMA_RANGE_SIZE {
-            return false;
-        }
-        if addr >= base + SD_DMA_OFFSET_MEM_ADDR && addr < base + SD_DMA_OFFSET_MEM_ADDR + 4 {
-            let mut sd = sd.write().unwrap();
-            write_reg_byte(
-                &mut sd.dma_mem_addr,
-                addr,
-                base + SD_DMA_OFFSET_MEM_ADDR,
-                data,
-            );
-            return true;
-        }
-        if addr >= base + SD_DMA_OFFSET_SD_BLOCK && addr < base + SD_DMA_OFFSET_SD_BLOCK + 4 {
-            let mut sd = sd.write().unwrap();
-            write_reg_byte(
-                &mut sd.dma_sd_block,
-                addr,
-                base + SD_DMA_OFFSET_SD_BLOCK,
-                data,
-            );
-            return true;
-        }
-        if addr >= base + SD_DMA_OFFSET_LEN && addr < base + SD_DMA_OFFSET_LEN + 4 {
-            let mut sd = sd.write().unwrap();
-            write_reg_byte(&mut sd.dma_len, addr, base + SD_DMA_OFFSET_LEN, data);
-            return true;
-        }
-        if addr >= base + SD_DMA_OFFSET_CTRL && addr < base + SD_DMA_OFFSET_CTRL + 4 {
-            let mut sd = sd.write().unwrap();
-            write_reg_byte(&mut sd.dma_ctrl, addr, base + SD_DMA_OFFSET_CTRL, data);
-            sd.dma_ctrl &= SD_DMA_CTRL_START
-                | SD_DMA_CTRL_DIR_RAM_TO_SD
-                | SD_DMA_CTRL_IRQ_ENABLE
-                | SD_DMA_CTRL_INIT;
-            let should_start = (sd.dma_ctrl & SD_DMA_CTRL_START) != 0;
-            let should_init = (sd.dma_ctrl & SD_DMA_CTRL_INIT) != 0;
-            if should_start || should_init {
-                // START/SD_INIT are command strobes and clear after write observation.
-                sd.dma_ctrl &= !(SD_DMA_CTRL_START | SD_DMA_CTRL_INIT);
-                let interrupt = if should_init {
-                    sd.start_init()
+    // Decode one MMIO byte read. Unmapped addresses stop the emulator because
+    // they indicate a guest bug that real hardware would not report.
+    fn read_mmio_byte(&self, addr: u32) -> u8 {
+        let vga = &self.vga;
+        match addr {
+            AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_END => {
+                self.audio.lock().unwrap().ring[(addr - AUDIO_RING_BUFFER_START) as usize]
+            }
+            AUDIO_REGS_START..AUDIO_REGS_END => {
+                self.audio.lock().unwrap().read_reg_byte(addr - AUDIO_REGS_START)
+            }
+            TILE_FRAME_BUFFER_START..TILE_FRAME_BUFFER_END => {
+                vga.tile_frame_buffer.read().unwrap()[(addr - TILE_FRAME_BUFFER_START) as usize]
+            }
+            PIXEL_FRAME_BUFFER_START..PIXEL_FRAME_BUFFER_END => {
+                vga.pixel_frame_buffer.read().unwrap()[(addr - PIXEL_FRAME_BUFFER_START) as usize]
+            }
+            TILE_MAP_START..TILE_MAP_END => {
+                vga.tile_map.read().unwrap()[(addr - TILE_MAP_START) as usize]
+            }
+            SPRITE_MAP_START..SPRITE_MAP_END => {
+                vga.sprite_pixels.read().unwrap()[(addr - SPRITE_MAP_START) as usize]
+            }
+            SPRITE_REGISTERS_START..SPRITE_REGISTERS_END => {
+                let offset = addr - SPRITE_REGISTERS_START;
+                byte_of(vga.sprite_coords[(offset / 4) as usize].load(Ordering::SeqCst), offset % 4)
+            }
+            SD_DMA_START..SD_DMA_END => {
+                self.sd_cards[0].lock().unwrap().read_reg_byte(addr - SD_DMA_START)
+            }
+            SD2_DMA_START..SD2_DMA_END => {
+                self.sd_cards[1].lock().unwrap().read_reg_byte(addr - SD2_DMA_START)
+            }
+            // Software reads the PS/2 stream as a halfword: the low byte
+            // peeks and reading the high byte pops the event.
+            PS2_STREAM if !self.use_uart_rx => {
+                self.input.lock().unwrap().front().copied().unwrap_or(0) as u8
+            }
+            PS2_STREAM_HIGH if !self.use_uart_rx => (self.pop_input() >> 8) as u8,
+            PS2_STREAM | PS2_STREAM_HIGH => 0,
+            UART_TX => panic!("MMIO: attempting to read output port (address {:X})", UART_TX),
+            UART_RX if self.use_uart_rx => {
+                let value = self.pop_input();
+                // Key releases are not delivered over UART.
+                if value & 0xFF00 != 0 { 0 } else { value as u8 }
+            }
+            UART_RX => 0,
+            PIT_START..PIT_END | CLK_REG_START..CLK_REG_END => {
+                let (reg, base) = self.lockfree_register(addr).unwrap();
+                byte_of(reg.load(Ordering::SeqCst), addr - base)
+            }
+            TILE_H_SCROLL_START..TILE_SCALE_REGISTER => {
+                let (reg, base) = if addr < TILE_V_SCROLL_START {
+                    (&vga.tile_hscroll, TILE_H_SCROLL_START)
                 } else {
-                    sd.start_dma()
+                    (&vga.tile_vscroll, TILE_V_SCROLL_START)
                 };
-                if interrupt {
-                    self.raise_pending_interrupt(interrupt_bit);
+                byte_of(u32::from(reg.load(Ordering::SeqCst)), addr - base)
+            }
+            PIXEL_H_SCROLL_START..PIXEL_SCALE_REGISTER => {
+                let (reg, base) = if addr < PIXEL_V_SCROLL_START {
+                    (&vga.pixel_hscroll, PIXEL_H_SCROLL_START)
+                } else {
+                    (&vga.pixel_vscroll, PIXEL_V_SCROLL_START)
+                };
+                byte_of(u32::from(reg.load(Ordering::SeqCst)), addr - base)
+            }
+            TILE_SCALE_REGISTER => vga.tile_scale.load(Ordering::SeqCst),
+            PIXEL_SCALE_REGISTER => vga.pixel_scale.load(Ordering::SeqCst),
+            SPRITE_SCALE_START..SPRITE_SCALE_END => {
+                vga.sprite_scales[(addr - SPRITE_SCALE_START) as usize].load(Ordering::SeqCst)
+            }
+            VGA_STATUS_REGISTER => vga.status.load(Ordering::SeqCst),
+            VGA_FRAME_REGISTER_START..VGA_FRAME_REGISTER_END => {
+                byte_of(vga.frame.load(Ordering::SeqCst), addr - VGA_FRAME_REGISTER_START)
+            }
+            _ => panic!("MMIO: read from unmapped IO address 0x{:08X}", addr),
+        }
+    }
+
+    // Apply one MMIO byte write. Writes to read-only or unmapped registers
+    // stop the emulator because they indicate a guest bug.
+    fn write_mmio_byte(&self, addr: u32, data: u8) {
+        let vga = &self.vga;
+        match addr {
+            AUDIO_RING_BUFFER_START..AUDIO_RING_BUFFER_END => {
+                self.audio.lock().unwrap().ring[(addr - AUDIO_RING_BUFFER_START) as usize] = data
+            }
+            AUDIO_REGS_START..AUDIO_REGS_END => {
+                self.audio.lock().unwrap().write_reg_byte(addr - AUDIO_REGS_START, data)
+            }
+            TILE_FRAME_BUFFER_START..TILE_FRAME_BUFFER_END => {
+                vga.tile_frame_buffer.write().unwrap()[(addr - TILE_FRAME_BUFFER_START) as usize] =
+                    data
+            }
+            PIXEL_FRAME_BUFFER_START..PIXEL_FRAME_BUFFER_END => {
+                vga.pixel_frame_buffer.write().unwrap()
+                    [(addr - PIXEL_FRAME_BUFFER_START) as usize] = data
+            }
+            TILE_MAP_START..TILE_MAP_END => {
+                vga.tile_map.write().unwrap()[(addr - TILE_MAP_START) as usize] = data
+            }
+            SPRITE_MAP_START..SPRITE_MAP_END => {
+                vga.sprite_pixels.write().unwrap()[(addr - SPRITE_MAP_START) as usize] = data
+            }
+            SPRITE_REGISTERS_START..SPRITE_REGISTERS_END => {
+                let offset = addr - SPRITE_REGISTERS_START;
+                let reg = &vga.sprite_coords[(offset / 4) as usize];
+                reg.store(with_byte(reg.load(Ordering::SeqCst), offset % 4, data), Ordering::SeqCst);
+            }
+            SD_DMA_START..SD_DMA_END => {
+                if self.sd_cards[0].lock().unwrap().write_reg_byte(addr - SD_DMA_START, data) {
+                    self.raise_pending_interrupt(SD_INTERRUPT_BIT);
                 }
             }
-            return true;
+            SD2_DMA_START..SD2_DMA_END => {
+                if self.sd_cards[1].lock().unwrap().write_reg_byte(addr - SD2_DMA_START, data) {
+                    self.raise_pending_interrupt(SD2_INTERRUPT_BIT);
+                }
+            }
+            PS2_STREAM => panic!("MMIO: attempting to write input port (address {:X})", PS2_STREAM),
+            UART_TX => {
+                print!("{}", data as char);
+                io::stdout().flush().unwrap();
+            }
+            UART_RX => panic!("MMIO: attempting to write input port (address {:X})", UART_RX),
+            PIT_START..PIT_END | CLK_REG_START..CLK_REG_END => self.write_mmio_bytes(addr, &[data]),
+            TILE_H_SCROLL_START..TILE_V_SCROLL_START => {
+                store_u16_byte(&vga.tile_hscroll, addr - TILE_H_SCROLL_START, data)
+            }
+            TILE_V_SCROLL_START..TILE_SCALE_REGISTER => {
+                store_u16_byte(&vga.tile_vscroll, addr - TILE_V_SCROLL_START, data)
+            }
+            PIXEL_H_SCROLL_START..PIXEL_V_SCROLL_START => {
+                store_u16_byte(&vga.pixel_hscroll, addr - PIXEL_H_SCROLL_START, data)
+            }
+            PIXEL_V_SCROLL_START..PIXEL_SCALE_REGISTER => {
+                store_u16_byte(&vga.pixel_vscroll, addr - PIXEL_V_SCROLL_START, data)
+            }
+            TILE_SCALE_REGISTER => vga.tile_scale.store(data, Ordering::SeqCst),
+            PIXEL_SCALE_REGISTER => vga.pixel_scale.store(data, Ordering::SeqCst),
+            SPRITE_SCALE_START..SPRITE_SCALE_END => {
+                vga.sprite_scales[(addr - SPRITE_SCALE_START) as usize].store(data, Ordering::SeqCst)
+            }
+            VGA_STATUS_REGISTER => panic!(
+                "MMIO: attempting to write read-only VGA status register (0x{:08X})",
+                VGA_STATUS_REGISTER
+            ),
+            VGA_FRAME_REGISTER_START..VGA_FRAME_REGISTER_END => panic!(
+                "MMIO: attempting to write read-only VGA frame register (0x{:08X})",
+                VGA_FRAME_REGISTER_START
+            ),
+            _ => panic!("MMIO: write to unmapped IO address 0x{:08X}", addr),
         }
-        if addr >= base + SD_DMA_OFFSET_STATUS && addr < base + SD_DMA_OFFSET_STATUS + 4 {
-            let mut sd = sd.write().unwrap();
-            sd.clear_status();
-            return true;
+    }
+
+    // ---- SD images -----------------------------------------------------------
+
+    fn sd_card(&self, slot: SdSlot) -> &Mutex<SdCard> {
+        match slot {
+            SdSlot::Sd0 => &self.sd_cards[0],
+            SdSlot::Sd1 => &self.sd_cards[1],
         }
+    }
+
+    // Load a raw SD image into the selected device.
+    pub fn load_sd_image(&self, slot: SdSlot, image: &[u8]) {
+        self.sd_card(slot).lock().unwrap().load_image(image);
+    }
+
+    // Export the selected device as a raw host image.
+    pub fn dump_sd_image(&self, slot: SdSlot) -> Vec<u8> {
+        self.sd_card(slot).lock().unwrap().dump_image()
+    }
+
+    // ---- Device ticks (core 0 only) --------------------------------------------
+
+    // Advance both SD engines by one device tick.
+    pub fn tick_sd_dma(&self) {
+        self.tick_sd_card(0, SD_INTERRUPT_BIT);
+        self.tick_sd_card(1, SD2_INTERRUPT_BIT);
+    }
+
+    // Advance one SD engine, moving at most one DMA word between the card and
+    // guest memory. The card lock is not held across the guest-memory access.
+    fn tick_sd_card(&self, index: usize, interrupt_bit: u32) {
+        let action = self.sd_cards[index].lock().unwrap().tick();
+        let SdTick::Transfer {
+            mem_addr,
+            sd_offset,
+            bytes,
+            to_sd,
+            irq_after,
+        } = action
+        else {
+            if matches!(action, SdTick::RaiseInterrupt) {
+                self.raise_pending_interrupt(interrupt_bit);
+            }
+            return;
+        };
+        let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
+        let buf = &mut buf[..bytes as usize];
+        if to_sd {
+            self.read_phys_range(mem_addr, buf);
+            let mut sd = self.sd_cards[index].lock().unwrap();
+            for (i, byte) in buf.iter().enumerate() {
+                sd.write_storage_byte(sd_offset + i as u64, *byte);
+            }
+        } else {
+            {
+                let sd = self.sd_cards[index].lock().unwrap();
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = sd.read_storage_byte(sd_offset + i as u64);
+                }
+            }
+            self.write_phys_range(mem_addr, buf);
+        }
+        if irq_after {
+            self.raise_pending_interrupt(interrupt_bit);
+        }
+    }
+
+    // Advance the PIT; returns true when the timer interrupt fires. When the
+    // countdown reaches 0 it reloads from PIT_RELOAD (if nonzero) and fires.
+    pub fn tick_pit(&self) -> bool {
+        let countdown = self.device_clock.pit_countdown.load(Ordering::SeqCst);
+        if countdown != 0 {
+            self.device_clock.pit_countdown.store(countdown - 1, Ordering::SeqCst);
+            return false;
+        }
+        let reload = self.pit_reload.load(Ordering::SeqCst);
+        if reload == 0 {
+            return false;
+        }
+        self.device_clock.pit_countdown.store(reload, Ordering::SeqCst);
         true
     }
 
-    // Decode one byte from the mapped MMIO device registers.
-    fn read_mmio_byte(&self, addr: u32) -> u8 {
-        assert!(
-            addr <= PHYSMEM_MAX,
-            "Physical memory address out of bounds: 0x{:08X}",
-            addr
-        );
-
-        if let Some(value) = self.audio.read().unwrap().read_ring_byte(addr) {
-            return value;
-        } else if let Some(value) = self.audio.read().unwrap().read_reg_byte(addr) {
-            return value;
-        } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
-            return self
-                .tile_map
-                .read()
-                .unwrap()
-                .get_tile_byte(addr - TILE_MAP_START);
-        } else if addr >= TILE_FRAME_BUFFER_START
-            && addr < TILE_FRAME_BUFFER_START + TILE_FRAME_BUFFER_SIZE
-        {
-            return self
-                .tile_frame_buffer
-                .read()
-                .unwrap()
-                .get_byte(addr - TILE_FRAME_BUFFER_START);
-        } else if addr >= PIXEL_FRAME_BUFFER_START
-            && addr < PIXEL_FRAME_BUFFER_START + PIXEL_FRAME_BUFFER_SIZE
-        {
-            return self
-                .pixel_frame_buffer
-                .read()
-                .unwrap()
-                .get_byte(addr - PIXEL_FRAME_BUFFER_START);
-        } else if addr >= SD_DMA_MEM_ADDR && addr < SD_DMA_MEM_ADDR + SD_DMA_RANGE_SIZE {
-            let sd = self.sd_card.read().unwrap();
-            return read_sd_dma_mmio(addr, SD_DMA_MEM_ADDR, &sd).unwrap_or(0);
-        } else if addr >= SD2_DMA_MEM_ADDR && addr < SD2_DMA_MEM_ADDR + SD_DMA_RANGE_SIZE {
-            let sd = self.sd_card2.read().unwrap();
-            return read_sd_dma_mmio(addr, SD2_DMA_MEM_ADDR, &sd).unwrap_or(0);
-        } else if addr == PS2_STREAM {
-            // kind of a hack but this assumed people always read a double from ps2 stream
-            if self.use_uart_rx {
-                return 0;
-            }
-            return self.io_buffer.read().unwrap().front().unwrap_or(&0).clone() as u8;
-        } else if addr == PS2_STREAM + 1 {
-            // read of upper byte will cause a pop
-            if self.use_uart_rx {
-                return 0;
-            }
-            let mut io_buffer = self.io_buffer.write().unwrap();
-            let value = io_buffer.pop_front().unwrap_or(0);
-            self.input_pending
-                .store(!io_buffer.is_empty(), Ordering::SeqCst);
-            return (value >> 8) as u8;
-        } else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
-            return self
-                .sprite_map
-                .read()
-                .unwrap()
-                .get_sprite_byte(addr - SPRITE_MAP_START);
-        } else if addr >= SPRITE_REGISTERS_START
-            && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE
-        {
-            return self
-                .sprite_map
-                .read()
-                .unwrap()
-                .get_sprite_reg((addr - SPRITE_REGISTERS_START) as u32);
-        } else if addr == TILE_V_SCROLL_START {
-            return self.tile_vscroll_register.read().unwrap().0;
-        } else if addr == TILE_V_SCROLL_START + 1 {
-            return self.tile_vscroll_register.read().unwrap().1;
-        } else if addr == TILE_H_SCROLL_START {
-            return self.tile_hscroll_register.read().unwrap().0;
-        } else if addr == TILE_H_SCROLL_START + 1 {
-            return self.tile_hscroll_register.read().unwrap().1;
-        } else if addr == TILE_SCALE_REGISTER_START {
-            return *self.tile_scale_register.read().unwrap();
-        } else if addr == PIXEL_V_SCROLL_START {
-            return self.pixel_vscroll_register.read().unwrap().0;
-        } else if addr == PIXEL_V_SCROLL_START + 1 {
-            return self.pixel_vscroll_register.read().unwrap().1;
-        } else if addr == PIXEL_H_SCROLL_START {
-            return self.pixel_hscroll_register.read().unwrap().0;
-        } else if addr == PIXEL_H_SCROLL_START + 1 {
-            return self.pixel_hscroll_register.read().unwrap().1;
-        } else if addr == PIXEL_SCALE_REGISTER_START {
-            return *self.pixel_scale_register.read().unwrap();
-        } else if addr >= SPRITE_SCALE_START && addr < SPRITE_SCALE_START + SPRITE_SCALE_SIZE {
-            let idx = (addr - SPRITE_SCALE_START) as usize;
-            return self.sprite_scale_registers.read().unwrap()[idx];
-        } else if addr == VGA_STATUS_REGISTER_START {
-            return *self.vga_status_register.read().unwrap();
-        } else if addr == VGA_FRAME_REGISTER_START {
-            return self.vga_frame_register.read().unwrap().0;
-        } else if addr == VGA_FRAME_REGISTER_START + 1 {
-            return self.vga_frame_register.read().unwrap().1;
-        } else if addr == VGA_FRAME_REGISTER_START + 2 {
-            return self.vga_frame_register.read().unwrap().2;
-        } else if addr == VGA_FRAME_REGISTER_START + 3 {
-            return self.vga_frame_register.read().unwrap().3;
-        } else if addr == UART_TX {
-            panic!("attempting to read output port (address {:X})", UART_TX);
-        } else if addr == UART_RX {
-            // get value
-            if self.use_uart_rx {
-                let mut io_buffer = self.io_buffer.write().unwrap();
-                let value = io_buffer.pop_front().unwrap_or(0);
-                self.input_pending
-                    .store(!io_buffer.is_empty(), Ordering::SeqCst);
-                if value & 0xFF00 != 0 {
-                    return 0; // ignore keyup
-                }
-                return value as u8;
-            } else {
-                return 0;
-            }
-        } else if addr == PIT_START {
-            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
-        } else if addr == PIT_START + 1 {
-            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
-        } else if addr == PIT_START + 2 {
-            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
-        } else if addr == PIT_START + 3 {
-            return read_reg_byte(self.read_pit_reload(), addr, PIT_START);
-        } else if addr == CLK_REG_START {
-            return self.clk_register.read().unwrap().0;
-        } else if addr == CLK_REG_START + 1 {
-            return self.clk_register.read().unwrap().1;
-        } else if addr == CLK_REG_START + 2 {
-            return self.clk_register.read().unwrap().2;
-        } else if addr == CLK_REG_START + 3 {
-            return self.clk_register.read().unwrap().3;
-        } else if addr == 0 {
-            println!("Warning: reading from physical address 0x00000000");
-        }
-
-        if addr >= IO_START {
-            panic!("read from unmapped IO address 0x{:08X}", addr);
-        }
-
-        self.read_ram_byte(addr)
-    }
-
-    // Write one byte to RAM or the MMIO device map.
-    pub fn write(&self, addr: u32, data: u8) {
-        if Self::addr_touches_mmio(addr) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            self.write_mmio_byte(addr, data);
-        } else {
-            self.write_ram_byte(addr, data);
-        }
-    }
-
-    // Write an aligned little-endian halfword to RAM or MMIO.
-    pub fn write_u16(&self, addr: u32, data: u16) {
-        let addr = addr & 0xFFFFFFFE;
-        if let Some(page_index) = Self::ram_range_within_single_page(addr, 2) {
-            Self::maybe_warn_null_write(addr, data.to_le_bytes()[0]);
-            let mut page = self.ram_pages[page_index].write().unwrap();
-            page.write_u16_le(Self::ram_page_offset(addr), data);
-            return;
-        }
-        let addrs = [addr, addr + 1];
-        let bytes = data.to_le_bytes();
-        self.write_phys_bytes(&addrs, &bytes);
-    }
-
-    // Write an aligned little-endian word to RAM or MMIO.
-    pub fn write_u32(&self, addr: u32, data: u32) {
-        let addr = addr & 0xFFFFFFFC;
-        if let Some(page_index) = Self::ram_range_within_single_page(addr, 4) {
-            Self::maybe_warn_null_write(addr, data.to_le_bytes()[0]);
-            let mut page = self.ram_pages[page_index].write().unwrap();
-            page.write_u32_le(Self::ram_page_offset(addr), data);
-            return;
-        }
-        let addrs = [addr, addr + 1, addr + 2, addr + 3];
-        let bytes = data.to_le_bytes();
-        self.write_phys_bytes(&addrs, &bytes);
-    }
-
-    // Write specific physical addresses under one lock to avoid tearing.
-    pub fn write_phys_bytes(&self, addrs: &[u32], data: &[u8]) {
-        assert_eq!(addrs.len(), data.len());
-        if Self::addrs_touch_mmio(addrs) {
-            let _mmio = self.mmio_lock.lock().unwrap();
-            let was_low_water = self.audio.read().unwrap().low_water();
-            self.write_phys_bytes_inner(addrs, data);
-            let mut audio = self.audio.write().unwrap();
-            audio.clear_underrun_if_recovered();
-            if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
-                self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
-            }
-        } else {
-            self.write_phys_bytes_inner(addrs, data);
-        }
-    }
-
-    // Dispatch one byte write to the mapped MMIO device registers.
-    fn write_mmio_byte(&self, addr: u32, data: u8) {
-        assert!(
-            addr <= PHYSMEM_MAX,
-            "Physical memory address out of bounds: 0x{:08X}",
-            addr
-        );
-
-        let mut handled = false;
-
-        if self.audio.write().unwrap().write_ring_byte(addr, data) {
-            handled = true;
-        } else if self.audio.write().unwrap().write_ctrl_byte(addr, data) {
-            handled = true;
-        } else if self.audio.write().unwrap().write_write_idx_byte(addr, data) {
-            handled = true;
-        } else if self.audio.write().unwrap().write_watermark_byte(addr, data) {
-            handled = true;
-        } else if AUDIO_STATUS_START <= addr && addr < AUDIO_STATUS_START + 4 {
-            panic!(
-                "attempting to write read-only audio status register (0x{:08X})",
-                AUDIO_STATUS_START
-            );
-        } else if AUDIO_READ_IDX_START <= addr && addr < AUDIO_READ_IDX_START + 4 {
-            panic!(
-                "attempting to write read-only audio read index register (0x{:08X})",
-                AUDIO_READ_IDX_START
-            );
-        } else if addr >= TILE_MAP_START && addr < TILE_MAP_START + TILE_MAP_SIZE {
-            self.tile_map
-                .write()
-                .unwrap()
-                .set_tile_byte((addr - TILE_MAP_START) as u32, data);
-            handled = true;
-        } else if addr >= TILE_FRAME_BUFFER_START
-            && addr < TILE_FRAME_BUFFER_START + TILE_FRAME_BUFFER_SIZE
-        {
-            self.tile_frame_buffer
-                .write()
-                .unwrap()
-                .set_byte((addr - TILE_FRAME_BUFFER_START) as u32, data);
-            handled = true;
-        } else if addr >= PIXEL_FRAME_BUFFER_START
-            && addr < PIXEL_FRAME_BUFFER_START + PIXEL_FRAME_BUFFER_SIZE
-        {
-            self.pixel_frame_buffer
-                .write()
-                .unwrap()
-                .set_byte((addr - PIXEL_FRAME_BUFFER_START) as u32, data);
-            handled = true;
-        } else if self.write_sd_dma_mmio(
-            addr,
-            data,
-            SD_DMA_MEM_ADDR,
-            &self.sd_card,
-            SD_INTERRUPT_BIT,
-        ) {
-            return;
-        } else if self.write_sd_dma_mmio(
-            addr,
-            data,
-            SD2_DMA_MEM_ADDR,
-            &self.sd_card2,
-            SD2_INTERRUPT_BIT,
-        ) {
-            return;
-        } else if addr == PS2_STREAM {
-            panic!("attempting to write input port (address {:X})", PS2_STREAM);
-        } else if addr == UART_TX {
-            print!("{}", data as char);
-            io::stdout().flush().unwrap();
-            handled = true;
-        } else if addr == UART_RX {
-            panic!("attempting to write input port (address {:X})", UART_RX);
-        } else if addr == TILE_V_SCROLL_START {
-            self.tile_vscroll_register.write().unwrap().0 = data;
-            handled = true;
-        } else if addr == TILE_V_SCROLL_START + 1 {
-            self.tile_vscroll_register.write().unwrap().1 = data;
-            handled = true;
-        } else if addr == TILE_H_SCROLL_START {
-            self.tile_hscroll_register.write().unwrap().0 = data;
-            handled = true;
-        } else if addr == TILE_H_SCROLL_START + 1 {
-            self.tile_hscroll_register.write().unwrap().1 = data;
-            handled = true;
-        } else if addr == TILE_SCALE_REGISTER_START {
-            *self.tile_scale_register.write().unwrap() = data;
-            handled = true;
-        } else if addr == PIXEL_V_SCROLL_START {
-            self.pixel_vscroll_register.write().unwrap().0 = data;
-            handled = true;
-        } else if addr == PIXEL_V_SCROLL_START + 1 {
-            self.pixel_vscroll_register.write().unwrap().1 = data;
-            handled = true;
-        } else if addr == PIXEL_H_SCROLL_START {
-            self.pixel_hscroll_register.write().unwrap().0 = data;
-            handled = true;
-        } else if addr == PIXEL_H_SCROLL_START + 1 {
-            self.pixel_hscroll_register.write().unwrap().1 = data;
-            handled = true;
-        } else if addr == PIXEL_SCALE_REGISTER_START {
-            *self.pixel_scale_register.write().unwrap() = data;
-            handled = true;
-        } else if addr >= SPRITE_SCALE_START && addr < SPRITE_SCALE_START + SPRITE_SCALE_SIZE {
-            let idx = (addr - SPRITE_SCALE_START) as usize;
-            self.sprite_scale_registers.write().unwrap()[idx] = data;
-            handled = true;
-        } else if addr >= SPRITE_MAP_START && addr < SPRITE_MAP_START + SPRITE_MAP_SIZE {
-            self.sprite_map
-                .write()
-                .unwrap()
-                .set_sprite_byte((addr - SPRITE_MAP_START) as u32, data);
-            handled = true;
-        } else if addr >= SPRITE_REGISTERS_START
-            && addr < SPRITE_REGISTERS_START + SPRITE_REGISTERS_SIZE
-        {
-            self.sprite_map
-                .write()
-                .unwrap()
-                .set_sprite_reg((addr - SPRITE_REGISTERS_START) as u32, data);
-            handled = true;
-        } else if addr == PIT_START {
-            self.write_pit_reload_byte(addr, data);
-            handled = true;
-        } else if addr == PIT_START + 1 {
-            self.write_pit_reload_byte(addr, data);
-            handled = true;
-        } else if addr == PIT_START + 2 {
-            self.write_pit_reload_byte(addr, data);
-            handled = true;
-        } else if addr == PIT_START + 3 {
-            self.write_pit_reload_byte(addr, data);
-            handled = true;
-        } else if addr == CLK_REG_START {
-            self.clk_register.write().unwrap().0 = data;
-            handled = true;
-        } else if addr == CLK_REG_START + 1 {
-            self.clk_register.write().unwrap().1 = data;
-            handled = true;
-        } else if addr == CLK_REG_START + 2 {
-            self.clk_register.write().unwrap().2 = data;
-            handled = true;
-        } else if addr == CLK_REG_START + 3 {
-            self.clk_register.write().unwrap().3 = data;
-            handled = true;
-        } else if addr == VGA_STATUS_REGISTER_START {
-            panic!(
-                "attempting to write read-only VGA status register (0x{:08X})",
-                VGA_STATUS_REGISTER_START
-            );
-        } else if VGA_FRAME_REGISTER_START <= addr && addr < VGA_FRAME_REGISTER_START + 4 {
-            panic!(
-                "attempting to write read-only VGA frame register (0x{:08X})",
-                VGA_FRAME_REGISTER_START
-            );
-        } else if addr == 0 {
-            println!(
-                "Warning: writing to physical address 0x00000000: 0x{:08X}",
-                data
-            );
-        }
-
-        if addr >= IO_START && !handled {
-            panic!("write to unmapped IO address 0x{:08X}", addr);
-        }
-        if !handled {
-            self.write_ram_byte(addr, data);
-        }
-    }
-
-    // Advance the SD DMA engines by one device tick.
-    pub fn tick_sd_dma(&self) {
-        self.tick_sd_dma_device(&self.sd_card, SD_INTERRUPT_BIT);
-        self.tick_sd_dma_device(&self.sd_card2, SD2_INTERRUPT_BIT);
-    }
-
-    // Advance one SD DMA engine by one device tick.
-    // Updates RAM/storage and may raise the device interrupt.
-    fn tick_sd_dma_device(&self, sd: &Arc<RwLock<SdCard>>, interrupt_bit: u32) {
-        let init_irq = {
-            let mut sd = sd.write().unwrap();
-            if !sd.init_active {
-                false
-            } else {
-                if sd.init_ticks_remaining > 0 {
-                    sd.init_ticks_remaining -= 1;
-                }
-                if sd.init_ticks_remaining == 0 {
-                    sd.init_active = false;
-                    sd.initialized = true;
-                    sd.dma_status &= !SD_DMA_STATUS_BUSY;
-                    sd.dma_status |= SD_DMA_STATUS_DONE;
-                    (sd.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0
-                } else {
-                    false
-                }
-            }
-        };
-        if init_irq {
-            self.raise_pending_interrupt(interrupt_bit);
-            return;
-        }
-        {
-            let sd = sd.read().unwrap();
-            if sd.init_active {
-                return;
-            }
-        }
-
-        let (mem_addr, sd_offset, bytes, dir_ram_to_sd, done_after, irq_enable) = {
-            let mut sd = sd.write().unwrap();
-            if !sd.dma_active {
-                return;
-            }
-            if sd.dma_tick_countdown > 0 {
-                sd.dma_tick_countdown -= 1;
-                return;
-            }
-            sd.dma_tick_countdown = sd.dma_ticks_per_word.saturating_sub(1);
-            let bytes = if sd.dma_remaining < SD_DMA_BYTES_PER_TICK {
-                sd.dma_remaining
-            } else {
-                SD_DMA_BYTES_PER_TICK
-            };
-            let mem_addr = sd.dma_mem_cursor;
-            let sd_offset = sd.dma_sd_byte_cursor;
-            let dir_ram_to_sd = (sd.dma_ctrl & SD_DMA_CTRL_DIR_RAM_TO_SD) != 0;
-            sd.dma_mem_cursor = sd.dma_mem_cursor.wrapping_add(bytes);
-            sd.dma_sd_byte_cursor = sd.dma_sd_byte_cursor.wrapping_add(bytes as u64);
-            sd.dma_remaining = sd.dma_remaining.wrapping_sub(bytes);
-            let done_after = sd.dma_remaining == 0;
-            if done_after {
-                sd.dma_active = false;
-                sd.dma_status &= !SD_DMA_STATUS_BUSY;
-                sd.dma_status |= SD_DMA_STATUS_DONE;
-                if sd.dma_err != SD_DMA_ERR_NONE {
-                    sd.dma_status |= SD_DMA_STATUS_ERR;
-                }
-            }
-            let irq_enable = (sd.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE) != 0;
-            (
-                mem_addr,
-                sd_offset,
-                bytes,
-                dir_ram_to_sd,
-                done_after,
-                irq_enable,
-            )
-        };
-
-        if bytes == 0 {
-            return;
-        }
-
-        if dir_ram_to_sd {
-            let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
-            let mut addrs = [0u32; SD_DMA_BYTES_PER_TICK as usize];
-            for i in 0..bytes {
-                addrs[i as usize] = mem_addr + i;
-            }
-            self.read_phys_bytes(&addrs[..bytes as usize], &mut buf[..bytes as usize]);
-            let mut sd = sd.write().unwrap();
-            for i in 0..bytes {
-                sd.write_storage_byte(sd_offset + i as u64, buf[i as usize]);
-            }
-        } else {
-            let mut buf = [0u8; SD_DMA_BYTES_PER_TICK as usize];
-            {
-                let sd = sd.read().unwrap();
-                for i in 0..bytes {
-                    buf[i as usize] = sd.read_storage_byte(sd_offset + i as u64);
-                }
-            }
-            let mut addrs = [0u32; SD_DMA_BYTES_PER_TICK as usize];
-            for i in 0..bytes {
-                addrs[i as usize] = mem_addr + i;
-            }
-            self.write_phys_bytes(&addrs[..bytes as usize], &buf[..bytes as usize]);
-        }
-
-        if done_after && irq_enable {
-            self.raise_pending_interrupt(interrupt_bit);
-        }
-    }
-
-    // Advance the shared PIT countdown by one core-0 tick.
-    // Returns true if a timer interrupt should be raised this tick.
-    pub fn tick_pit(&self) -> bool {
-        let mut countdown = self.pit_countdown.lock().unwrap();
-        if *countdown == 0 {
-            let reload = self.read_pit_reload();
-            if reload != 0 {
-                *countdown = reload;
-                return true;
-            }
-        } else {
-            *countdown -= 1;
-        }
-        false
-    }
-
-    // Advance the fixed-rate PCM audio consumer by one 100 MHz device tick.
-    // May advance AUDIO_READ_IDX, latch UNDERRUN, and return the exact
-    // 16-bit PCM sample for the optional host backend.
+    // Advance the audio sample clock by one 100 MHz device tick. Every
+    // AUDIO_TICKS_PER_SAMPLE ticks, enabled playback consumes one sample
+    // (returned for the host backend) and may raise the low-water interrupt.
+    // Only the expiring tick takes `mmio_lock`.
     pub fn tick_audio(&self) -> Option<i16> {
-        let _mmio = self.mmio_lock.lock().unwrap();
-        let mut audio = self.audio.write().unwrap();
-        let was_low_water = audio.low_water();
-        if !audio.tick_sample_clock() {
+        let countdown = self.device_clock.audio_sample_countdown.load(Ordering::SeqCst);
+        if countdown > 0 {
+            self.device_clock.audio_sample_countdown.store(countdown - 1, Ordering::SeqCst);
             return None;
         }
+        self.device_clock.audio_sample_countdown
+            .store(AUDIO_TICKS_PER_SAMPLE - 1, Ordering::SeqCst);
+        let _guard = self.mmio_lock.lock().unwrap();
+        let mut audio = self.audio.lock().unwrap();
         if !audio.enabled() {
             return None;
         }
+        let was_low_water = audio.low_water();
         let sample = audio.consume_sample_now();
-        if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
+        if audio.low_water_edge(was_low_water) {
             self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
         }
         Some(sample)
     }
 
-    // Drive the optional wall-clock host-audio mode.
-    // Number of 25 kHz samples to emit immediately and a caller-owned
-    // buffer that is reused across batches.
-    // Fills `out` with the PCM samples the MMIO audio device would
-    // output over that wall-clock slice while updating READ_IDX/UNDERRUN state.
+    // Consume `sample_count` samples immediately for wall-clock audio mode,
+    // filling `out` (reused across calls) and updating READ_IDX/UNDERRUN.
     pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
-        let _mmio = self.mmio_lock.lock().unwrap();
-        let mut audio = self.audio.write().unwrap();
+        let _guard = self.mmio_lock.lock().unwrap();
+        let mut audio = self.audio.lock().unwrap();
         let was_low_water = audio.low_water();
         out.clear();
-        if out.capacity() < sample_count {
-            out.reserve(sample_count - out.capacity());
-        }
-        for _ in 0..sample_count {
-            out.push(audio.consume_sample_now());
-        }
-        if !was_low_water && audio.low_water() && (audio.ctrl & AUDIO_CTRL_IRQ_ENABLE) != 0 {
+        out.extend((0..sample_count).map(|_| audio.consume_sample_now()));
+        if audio.low_water_edge(was_low_water) {
             self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
         }
-    }
-
-    // Advance PIT, SD, audio, and input timing by one device tick.
-    pub fn clock() {
-        // do stuff that should happen every clock cycle
-    }
-
-    // Collect interrupt requests currently asserted by the emulated devices.
-    pub fn check_interrupts(&self) -> u32 {
-        self.pending_interrupt.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -1763,8 +1203,11 @@ impl Memory {
 /*
 Summary:
 - Verifies SD image serialization preserves sparse/block-backed state.
-- Verifies RAM pages stay zero-filled until first write and support cross-page access.
-- Verifies PIT reload caching and pending interrupt atomics preserve MMIO behavior.
+- Verifies RAM is zero-filled, byte stores merge into words, and range helpers
+  cross word and page boundaries.
+- Verifies PIT reload and pending interrupt atomics preserve MMIO behavior.
+- Verifies audio interrupt edges are detected for every MMIO write width.
+- Verifies the sprite map holds exactly the 16 sprites from docs/mem_map.md.
 */
 mod tests {
     use super::*;
@@ -1804,9 +1247,9 @@ mod tests {
         assert_eq!(image[600], 0x5A);
     }
 
-    // Return zero when guest RAM reads a page that has never been allocated.
+    // Return zero when guest RAM reads a page that has never been written.
     #[test]
-    fn ram_reads_zero_from_unallocated_pages() {
+    fn ram_reads_zero_from_untouched_memory() {
         let memory = Memory::new(HashMap::new(), false, 1);
 
         assert_eq!(memory.read(0x0000_1234), 0);
@@ -1827,18 +1270,20 @@ mod tests {
         assert_eq!(memory.read(0x0000_1002), 0);
     }
 
-    // Allow physical byte-range helpers to cross from one RAM page to the next.
+    // Range helpers cross word and page boundaries and take the word fast path.
     #[test]
-    fn ram_phys_byte_helpers_span_page_boundaries() {
+    fn ram_phys_range_helpers_span_page_boundaries() {
         let memory = Memory::new(HashMap::new(), false, 1);
-        let addrs = [0x0000_0FFF, 0x0000_1000, 0x0000_1FFF, 0x0000_2000];
         let expected = [0xAA, 0xBB, 0xCC, 0xDD];
 
-        memory.write_phys_bytes(&addrs, &expected);
+        memory.write_phys_range(0x0000_0FFE, &expected);
+        memory.write_phys_range(0x0000_2000, &expected);
+        assert_eq!(memory.read_u32(0x0000_2000), 0xDDCC_BBAA);
 
         let mut actual = [0u8; 4];
-        memory.read_phys_bytes(&addrs, &mut actual);
+        memory.read_phys_range(0x0000_0FFE, &mut actual);
         assert_eq!(actual, expected);
+        assert_eq!(memory.read_u16(0x0000_1000), 0xDDCC);
     }
 
     // Apply the most recently written PIT reload value on the next timer cycle.
@@ -1849,8 +1294,32 @@ mod tests {
         memory.write_u32(PIT_START, 3);
 
         assert!(memory.tick_pit());
-        assert_eq!(*memory.pit_countdown.lock().unwrap(), 3);
+        assert_eq!(memory.device_clock.pit_countdown.load(Ordering::SeqCst), 3);
         assert_eq!(memory.read_u32(PIT_START), 3);
+    }
+
+    // Narrow stores must merge into their word without disturbing neighbors.
+    #[test]
+    fn narrow_ram_stores_merge_into_word() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        memory.write_u32(0x100, 0x1122_3344);
+        memory.write(0x101, 0xAB);
+        memory.write_u16(0x102, 0xCDEF);
+        assert_eq!(memory.read_u32(0x100), 0xCDEF_AB44);
+        assert_eq!(memory.read(0x103), 0xCD);
+        assert_eq!(memory.atomic_update_u32(0x100, |v| v.wrapping_add(1)), 0xCDEF_AB44);
+        assert_eq!(memory.read_u16(0x100), 0xAB45);
+    }
+
+    // The clock divider is read lock-free every tick, so MMIO writes must
+    // reach the atomic the CPU reads.
+    #[test]
+    fn clock_divider_mmio_round_trips() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        memory.write_u32(CLK_REG_START, 0x0102_0304);
+        assert_eq!(memory.clock_divider(), 0x0102_0304);
+        memory.write(CLK_REG_START + 3, 0xFF);
+        assert_eq!(memory.read_u32(CLK_REG_START), 0xFF02_0304);
     }
 
     // Atomically take all pending interrupts and clear the published set.
@@ -1860,11 +1329,17 @@ mod tests {
 
         memory.raise_pending_interrupt(SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT);
 
-        assert_eq!(
-            memory.check_interrupts(),
-            SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT
-        );
+        assert_eq!(memory.check_interrupts(), SD_INTERRUPT_BIT | VGA_INTERRUPT_BIT);
         assert_eq!(memory.check_interrupts(), 0);
+    }
+
+    // Only 16 sprites exist; the map used to allocate 32768 of them.
+    #[test]
+    fn sprite_map_matches_mem_map() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        assert_eq!(memory.vga().sprite_pixels.read().unwrap().len(), 16 * 32 * 32 * 2);
+        memory.write(SPRITE_MAP_END - 1, 0x12);
+        assert_eq!(memory.read(SPRITE_MAP_END - 1), 0x12);
     }
 
     // Map the audio ring immediately below its control-register window.
@@ -1891,49 +1366,43 @@ mod tests {
     #[test]
     fn audio_tick_advances_read_idx_and_recovers_underrun_after_refill() {
         let memory = Memory::new(HashMap::new(), false, 1);
+        let status = AUDIO_REGS_START + AUDIO_OFFSET_STATUS;
 
         memory.write(AUDIO_RING_BUFFER_START, 0x34);
         memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
-        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_CTRL, AUDIO_CTRL_ENABLE);
 
         assert_eq!(
             memory.tick_audio(),
             Some(i16::from_le_bytes([0x34, 0x12])),
             "audio tick must return the PCM sample consumed from the MMIO ring",
         );
-        assert_eq!(memory.read_u32(AUDIO_READ_IDX_START), 2);
-        assert_eq!(
-            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
-            0
-        );
+        assert_eq!(memory.read_u32(AUDIO_REGS_START + AUDIO_OFFSET_READ_IDX), 2);
+        assert_eq!(memory.read_u32(status) & AUDIO_STATUS_UNDERRUN, 0);
 
         let mut underrun_sample = None;
         for _ in 0..AUDIO_TICKS_PER_SAMPLE {
             underrun_sample = memory.tick_audio();
         }
 
-        assert_eq!(
-            underrun_sample,
-            Some(0),
-            "audio underrun must output signed-zero samples",
-        );
+        assert_eq!(underrun_sample, Some(0), "audio underrun must output signed-zero samples");
         assert_ne!(
-            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
+            memory.read_u32(status) & AUDIO_STATUS_UNDERRUN,
             0,
             "enabled playback must latch UNDERRUN after the ring becomes empty",
         );
         assert_eq!(
-            memory.read_u32(AUDIO_READ_IDX_START),
+            memory.read_u32(AUDIO_REGS_START + AUDIO_OFFSET_READ_IDX),
             2,
             "the device must not advance READ_IDX while outputting underrun silence",
         );
 
         memory.write(AUDIO_RING_BUFFER_START + 2, 0x78);
         memory.write(AUDIO_RING_BUFFER_START + 3, 0x56);
-        memory.write_u32(AUDIO_WRITE_IDX_START, 4);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 4);
         assert_eq!(
-            memory.read_u32(AUDIO_STATUS_START) & AUDIO_STATUS_UNDERRUN,
+            memory.read_u32(status) & AUDIO_STATUS_UNDERRUN,
             0,
             "publishing another sample must clear UNDERRUN automatically",
         );
@@ -1946,9 +1415,12 @@ mod tests {
 
         memory.write(AUDIO_RING_BUFFER_START, 0x34);
         memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
-        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
-        memory.write_u32(AUDIO_WATERMARK_START, 0);
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WATERMARK, 0);
+        memory.write_u32(
+            AUDIO_REGS_START + AUDIO_OFFSET_CTRL,
+            AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE,
+        );
 
         assert_eq!(
             memory.check_interrupts(),
@@ -1966,13 +1438,28 @@ mod tests {
         );
     }
 
+    // A byte-wide store that drops the buffered level to the watermark must
+    // raise the interrupt too; only halfword/word stores used to.
+    #[test]
+    fn audio_irq_edge_detected_for_byte_writes() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 8);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WATERMARK, 4);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_CTRL, AUDIO_CTRL_IRQ_ENABLE);
+        assert_eq!(memory.check_interrupts(), 0);
+
+        memory.write(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+
+        assert_eq!(memory.check_interrupts(), AUDIO_INTERRUPT_BIT);
+    }
+
     // Do not synthesize a past low-water edge when interrupts are enabled late.
     #[test]
     fn audio_enabling_irq_while_low_water_is_already_true_does_not_backfill_interrupt() {
         let memory = Memory::new(HashMap::new(), false, 1);
 
-        memory.write_u32(AUDIO_WATERMARK_START, 0);
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_IRQ_ENABLE);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WATERMARK, 0);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_CTRL, AUDIO_CTRL_IRQ_ENABLE);
 
         assert_eq!(
             memory.check_interrupts(),
@@ -1988,9 +1475,12 @@ mod tests {
 
         memory.write(AUDIO_RING_BUFFER_START, 0x34);
         memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
-        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
-        memory.write_u32(AUDIO_WATERMARK_START, 0);
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WATERMARK, 0);
+        memory.write_u32(
+            AUDIO_REGS_START + AUDIO_OFFSET_CTRL,
+            AUDIO_CTRL_ENABLE | AUDIO_CTRL_IRQ_ENABLE,
+        );
 
         assert_eq!(memory.tick_audio(), Some(i16::from_le_bytes([0x34, 0x12])));
         assert_eq!(memory.check_interrupts(), AUDIO_INTERRUPT_BIT);
@@ -2014,8 +1504,8 @@ mod tests {
 
         memory.write(AUDIO_RING_BUFFER_START, 0x34);
         memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
-        memory.write_u32(AUDIO_WRITE_IDX_START, 2);
-        memory.write_u32(AUDIO_CTRL_START, AUDIO_CTRL_ENABLE);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_CTRL, AUDIO_CTRL_ENABLE);
 
         memory.consume_audio_wallclock_samples(1, &mut samples);
 
@@ -2025,205 +1515,9 @@ mod tests {
             "wall-clock audio mode must emit the queued sample immediately",
         );
         assert_eq!(
-            memory.read_u32(AUDIO_READ_IDX_START),
+            memory.read_u32(AUDIO_REGS_START + AUDIO_OFFSET_READ_IDX),
             2,
             "wall-clock audio mode must advance READ_IDX by one sample",
         );
-    }
-}
-
-impl TileFrameBuffer {
-    // Initialize the tile framebuffer with a fixed MMIO byte size.
-    // Returns a zeroed tile buffer; panics if the buffer is too small.
-    pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
-        let width_tiles = width_pixels / TILE_WIDTH;
-        let height_tiles = height_pixels / TILE_WIDTH;
-        let tiles_needed = width_tiles * height_tiles;
-        let bytes_needed = tiles_needed * 2;
-        assert!(
-            size_bytes == bytes_needed,
-            "Tile framebuffer size mismatch: expected {} bytes, got {}",
-            bytes_needed,
-            size_bytes
-        );
-        TileFrameBuffer {
-            width_tiles,
-            height_tiles,
-            entries: vec![0; size_bytes as usize],
-        }
-    }
-
-    // Store one MMIO byte into the tile framebuffer backing store.
-    pub fn set_byte(&mut self, offset: u32, value: u8) {
-        if offset < self.entries.len() as u32 {
-            self.entries[offset as usize] = value;
-        } else {
-            panic!("Tile framebuffer offset out of bounds: {}", offset);
-        }
-    }
-
-    // Read one MMIO byte from the tile framebuffer backing store.
-    // Returns stored byte value at the given offset.
-    pub fn get_byte(&self, offset: u32) -> u8 {
-        if offset < self.entries.len() as u32 {
-            self.entries[offset as usize]
-        } else {
-            panic!("Tile framebuffer offset out of bounds: {}", offset);
-        }
-    }
-
-    // Fetch the tile entry (index + color) at a tile coordinate.
-    // Returns (tile index, color byte).
-    pub fn get_tile_entry(&self, x: u32, y: u32) -> (u8, u8) {
-        if x < self.width_tiles && y < self.height_tiles {
-            let idx: usize = (x + y * self.width_tiles) as usize;
-            let entry_offset = idx * 2;
-            let tile_index = self.entries[entry_offset];
-            let tile_color = self.entries[entry_offset + 1];
-            (tile_index, tile_color)
-        } else {
-            panic!("Tile coordinates out of bounds: ({}, {})", x, y);
-        }
-    }
-}
-
-impl PixelFrameBuffer {
-    // Initialize the pixel framebuffer with a fixed MMIO byte size.
-    // Returns a zeroed pixel buffer; panics if the size doesn't match.
-    pub fn new(width_pixels: u32, height_pixels: u32, size_bytes: u32) -> Self {
-        let expected = width_pixels * height_pixels * 2;
-        assert!(
-            size_bytes == expected,
-            "Pixel framebuffer size mismatch: expected {} bytes, got {}",
-            expected,
-            size_bytes
-        );
-        PixelFrameBuffer {
-            width_pixels,
-            height_pixels,
-            bytes: vec![0; size_bytes as usize],
-        }
-    }
-
-    // Store one MMIO byte into the pixel framebuffer backing store.
-    pub fn set_byte(&mut self, offset: u32, value: u8) {
-        if offset < self.bytes.len() as u32 {
-            self.bytes[offset as usize] = value;
-        } else {
-            panic!("Pixel framebuffer offset out of bounds: {}", offset);
-        }
-    }
-
-    // Read one MMIO byte from the pixel framebuffer backing store.
-    // Returns stored byte value at the given offset.
-    pub fn get_byte(&self, offset: u32) -> u8 {
-        if offset < self.bytes.len() as u32 {
-            self.bytes[offset as usize]
-        } else {
-            panic!("Pixel framebuffer offset out of bounds: {}", offset);
-        }
-    }
-
-    // Fetch the 16-bit pixel at a logical pixel coordinate.
-    // Returns packed 12-bit RGB value stored in 16 bits (little-endian).
-    pub fn get_pixel(&self, x: u32, y: u32) -> u16 {
-        if x < self.width_pixels && y < self.height_pixels {
-            let idx: usize = (x + y * self.width_pixels) as usize;
-            ((u16::from(self.bytes[2 * idx + 1])) << 8) | u16::from(self.bytes[2 * idx])
-        } else {
-            panic!("Pixel coordinates out of bounds: ({}, {})", x, y);
-        }
-    }
-}
-
-impl Tile {
-    // Return the palette entry used for black pixels.
-    pub fn black() -> Tile {
-        Tile {
-            pixels: vec![0; TILE_SIZE as usize],
-        }
-    }
-    // Return the palette entry used for white pixels.
-    pub fn white() -> Tile {
-        Tile {
-            pixels: vec![0xff; TILE_SIZE as usize],
-        }
-    }
-}
-
-impl TileMap {
-    // Create an empty tile map of the guest display dimensions.
-    pub fn new(size: u32) -> TileMap {
-        let tiles = vec![Tile::black(); (size / TILE_SIZE) as usize];
-        TileMap { tiles }
-    }
-
-    // Read a byte from the tile-map backing storage.
-    pub fn get_tile_byte(&self, addr: u32) -> u8 {
-        return self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize];
-    }
-
-    // Update one byte in the tile-map backing storage.
-    pub fn set_tile_byte(&mut self, addr: u32, data: u8) {
-        self.tiles[(addr / TILE_SIZE) as usize].pixels[(addr % TILE_SIZE) as usize] = data;
-    }
-}
-
-impl Sprite {
-    // Return the palette entry used for transparent or invisible pixels.
-    pub fn invisible() -> Sprite {
-        Sprite {
-            x: (0, 0),
-            y: (0, 0),
-            pixels: vec![0xFF; SPRITE_SIZE as usize],
-        }
-    }
-}
-
-impl SpriteMap {
-    // Create an empty sprite map of the guest display dimensions.
-    pub fn new(size: u32) -> SpriteMap {
-        let sprites = vec![Sprite::invisible(); size as usize];
-        SpriteMap { sprites }
-    }
-
-    // Read one byte from sprite pixel storage.
-    pub fn get_sprite_byte(&self, addr: u32) -> u8 {
-        return self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize];
-    }
-
-    // Update one byte in sprite pixel storage.
-    pub fn set_sprite_byte(&mut self, addr: u32, data: u8) {
-        self.sprites[(addr / SPRITE_SIZE) as usize].pixels[(addr % SPRITE_SIZE) as usize] = data;
-    }
-
-    // Read one byte of a sprite's packed x/y coordinate registers.
-    pub fn get_sprite_reg(&self, addr: u32) -> u8 {
-        let addr = addr as usize;
-        let sprite = &self.sprites[addr / 4];
-        if addr % 4 == 0 {
-            return sprite.x.0;
-        } else if addr % 4 == 1 {
-            return sprite.x.1;
-        } else if addr % 4 == 2 {
-            return sprite.y.0;
-        } else {
-            return sprite.y.1;
-        }
-    }
-
-    // sets the either y or x coordinate of the sprite corresponding to the addr/4, addr%4
-    pub fn set_sprite_reg(&mut self, addr: u32, data: u8) {
-        let addr = addr as usize;
-        let sprite = &mut self.sprites[addr / 4];
-        if addr % 4 == 0 {
-            sprite.x.0 = data;
-        } else if addr % 4 == 1 {
-            sprite.x.1 = data;
-        } else if addr % 4 == 2 {
-            sprite.y.0 = data;
-        } else {
-            sprite.y.1 = data;
-        }
     }
 }

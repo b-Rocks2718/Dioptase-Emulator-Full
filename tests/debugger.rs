@@ -1,101 +1,15 @@
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Search for the emulator binary in Cargo's env vars and target dirs.
-fn locate_emulator_bin() -> (Option<PathBuf>, Vec<PathBuf>) {
-    let name = "Dioptase-Emulator-Full";
-    let direct = format!("CARGO_BIN_EXE_{}", name);
-    if let Ok(val) = std::env::var(&direct) {
-        let path = PathBuf::from(val);
-        if path.exists() {
-            return (Some(path), Vec::new());
-        }
-    }
-    let underscored = format!("CARGO_BIN_EXE_{}", name.replace('-', "_"));
-    if let Ok(val) = std::env::var(&underscored) {
-        let path = PathBuf::from(val);
-        if path.exists() {
-            return (Some(path), Vec::new());
-        }
-    }
-
-    let name_candidates = vec![
-        name.to_string(),
-        name.to_ascii_lowercase(),
-        name.replace('-', "_"),
-        name.replace('-', "_").to_ascii_lowercase(),
-    ];
-
-    let mut dirs = Vec::new();
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        dirs.push(PathBuf::from(dir));
-    }
-    if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let manifest = PathBuf::from(dir);
-        dirs.push(manifest.join("target"));
-        if let Some(parent) = Path::new(&manifest).parent() {
-            dirs.push(parent.join("target"));
-        }
-    }
-
-    let mut tried = Vec::new();
-    for dir in dirs {
-        for name in &name_candidates {
-            for suffix in ["", ".exe"] {
-                let candidate = dir.join("debug").join(format!("{}{}", name, suffix));
-                if candidate.exists() {
-                    return (Some(candidate), tried);
-                }
-                tried.push(candidate);
-            }
-        }
-    }
-
-    (None, tried)
-}
-
-// Build the emulator binary once if it isn't found.
-fn build_emulator_bin() {
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-        let status = Command::new("cargo")
-            .args(["build", "--bin", "Dioptase-Emulator-Full"])
-            .current_dir(manifest_dir)
-            .status()
-            .expect("failed to run cargo build");
-        assert!(status.success(), "failed to build emulator binary");
-    });
-}
-
+// Cargo builds the binary before integration tests and exposes its path.
 fn find_emulator_bin() -> PathBuf {
-    let (found, _) = locate_emulator_bin();
-    if let Some(path) = found {
-        return path;
-    }
-
-    // If the test runs without a built binary, compile it on demand.
-    build_emulator_bin();
-    let (found, tried) = locate_emulator_bin();
-    if let Some(path) = found {
-        return path;
-    }
-
-    let tried_list = tried
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    panic!(
-        "Missing emulator binary env var for Dioptase-Emulator-Full\nTried:\n{}",
-        tried_list
-    );
+    PathBuf::from(env!("CARGO_BIN_EXE_Dioptase-Emulator-Full"))
 }
 
+// Write a uniquely named temporary .debug image.
 fn write_temp_debug(contents: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -111,6 +25,7 @@ fn write_temp_debug(contents: &str) -> PathBuf {
     path
 }
 
+// Exercise the common inspection commands once.
 #[test]
 fn debug_repl_smoke() {
     let debug_file = write_temp_debug("@00000100\n00000000\n#label start 00000400\n");
@@ -165,4 +80,50 @@ q
     assert!(stdout.contains("Watchpoint removed at 00000000"));
 
     let _ = fs::remove_file(debug_file);
+}
+
+// Run `--debug` with `commands` on stdin and return stdout.
+fn run_debugger(image: &str, commands: &str) -> String {
+    let debug_file = write_temp_debug(image);
+    let mut child = Command::new(find_emulator_bin())
+        .arg("--debug")
+        .arg(&debug_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start emulator");
+    child
+        .stdin
+        .take()
+        .expect("missing stdin")
+        .write_all(commands.as_bytes())
+        .expect("failed to write commands");
+    let output = child.wait_with_output().expect("failed to wait on emulator");
+    let _ = fs::remove_file(debug_file);
+    assert!(
+        output.status.success(),
+        "emulator failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+// `c` from a breakpoint must resume past it. It used to re-report the same
+// breakpoint forever because the breakpoint check ran before the step.
+// Program: 0x400 add r1, r1, 1; 0x404 add r1, r1, 1; 0x408 mode halt.
+#[test]
+fn continue_resumes_past_current_breakpoint() {
+    let stdout = run_debugger(
+        "@00000100\n0842E001\n0842E001\nF8002800\n",
+        "break 0x404\nr\nc\nq\n",
+    );
+    assert!(stdout.contains("Program halted. r1 = 00000002"), "{stdout}");
+}
+
+// Without a `q`, EOF on stdin must end the session instead of spinning.
+#[test]
+fn eof_ends_debug_session() {
+    let stdout = run_debugger("@00000100\nF8002800\n", "breaks\n");
+    assert!(stdout.contains("No breakpoints set."), "{stdout}");
 }

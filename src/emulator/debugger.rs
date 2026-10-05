@@ -1,61 +1,114 @@
-// Interactive instruction- and C-source-level debugger support.
+// Interactive debuggers: `--debug` (instruction level, labels from `#label`)
+// and `--debugc` (C source level, from `#line`/`#local`/`#data`). Both run a
+// single core with its own memory; `r` reloads the program from scratch.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::disassembler::disassemble;
 use crate::memory::PHYSMEM_MAX;
 
+use super::program::ProgramImage;
 use super::{
-    DebugInfo, DebugLine, DebugLocal, Emulator, LabelMap, WatchAccess, WatchKind, Watchpoint,
-    WatchpointHit, load_program,
+    CREG_COUNT, CREG_NAMES, DebugInfo, DebugLine, DebugLocal, Emulator, LabelMap, StepOutcome,
+    WatchAccess, WatchKind, Watchpoint, WatchpointHit, load_program,
 };
 
-// Parse a debugger address from decimal, hexadecimal, or a source label.
+// Upper bound on instructions per source-level step, so a step on a line
+// that never ends (e.g. a spin loop) returns control to the user.
+const MAX_STEP_INSTRUCTIONS: u32 = 1_000_000;
+// ABI base pointer register (docs/abi.md); C locals are addressed from it.
+const BP_REG: u32 = 30;
+// General-purpose register aliases from docs/abi.md.
+const GPR_ALIASES: [(&str, u32); 3] = [("sp", 31), ("bp", 30), ("ra", 29)];
+
+const ASM_HELP: &str = "\
+  r                 reset and run until break/watchpoint/halt
+  c                 continue execution
+  n                 step one instruction
+  break <label|addr> set breakpoint
+  breaks            list breakpoints
+  delete <label|addr> remove breakpoint
+  watch [r|w|rw] <addr> stop on memory access
+  watchs            list watchpoints
+  unwatch <addr>    remove watchpoint
+  info regs         print all registers
+  info cregs        print control registers + kmode
+  info <reg>        print a single register
+  info tlb          dump TLB maps
+  info p <addr>     print word at physical address
+  info v <addr>     print word + resolved physical address
+  x [v|p] <addr> <len> dump memory range
+  set reg <reg> <value> write a register
+  q                 quit";
+
+const C_HELP: &str = "\
+  r                   reset and run until break/halt
+  c                   continue execution
+  step                step to the next source line
+  next                step over calls to the next source line
+  break <line>         set breakpoint on current file line
+  break <file>:<line>  set breakpoint on file line
+  break <label>        set breakpoint on label
+  break *<addr>        set breakpoint on address
+  breaks              list breakpoints
+  delete <target>     remove breakpoint
+  info locals         print locals for current frame
+  info globals        print global data symbols
+  q                   quit";
+
+// Parse a debugger number: 0x-prefixed hex, decimal, or bare hex digits.
 fn parse_addr(token: &str) -> Option<u32> {
     let s = token.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         return u32::from_str_radix(hex, 16).ok();
     }
-    if let Ok(v) = s.parse::<u32>() {
-        return Some(v);
-    }
-    if s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return u32::from_str_radix(s, 16).ok();
-    }
-    None
+    s.parse::<u32>()
+        .ok()
+        .or_else(|| u32::from_str_radix(s, 16).ok())
 }
 
-// Resolve a debug file path relative to the loaded program when needed.
-fn resolve_source_path(file: &str) -> Result<PathBuf, String> {
-    let path = Path::new(file);
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
+// Print the prompt and read one non-empty command; None on EOF or error.
+fn read_command() -> Option<String> {
+    loop {
+        print!("dbg> ");
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {
+                let line = line.trim();
+                if !line.is_empty() {
+                    return Some(line.to_string());
+                }
+            }
+        }
     }
-    let cwd = env::current_dir().map_err(|err| format!("Failed to resolve cwd: {}", err))?;
-    Ok(cwd.join(file))
 }
 
-// Read and return one source line for debugger display.
-fn read_source_line(path: &Path, line: u32) -> Result<String, String> {
+// Read one source line (1-based) for display.
+fn read_source_line(file: &str, line: u32) -> Result<String, String> {
     if line == 0 {
         return Err("Line numbers start at 1".to_string());
     }
+    let path = Path::new(file);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|err| format!("Failed to resolve cwd: {}", err))?
+            .join(file)
+    };
     let file =
-        File::open(path).map_err(|err| format!("Failed to open {}: {}", path.display(), err))?;
-    let reader = io::BufReader::new(file);
-    for (idx, line_result) in reader.lines().enumerate() {
-        let idx = idx + 1;
-        let text =
-            line_result.map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
-        if idx as u32 == line {
-            return Ok(text);
-        }
+        File::open(&path).map_err(|err| format!("Failed to open {}: {}", path.display(), err))?;
+    match io::BufReader::new(file).lines().nth(line as usize - 1) {
+        Some(Ok(text)) => Ok(text),
+        Some(Err(err)) => Err(format!("Failed to read {}: {}", path.display(), err)),
+        None => Err(format!("File {} has no line {}", path.display(), line)),
     }
-    Err(format!("File {} has no line {}", path.display(), line))
 }
 
 // Invert the label map so every address lists all symbols defined there.
@@ -69,60 +122,17 @@ fn build_labels_by_addr(labels: &LabelMap) -> HashMap<u32, Vec<String>> {
     by_addr
 }
 
-// Reports whether a debugger step executed, slept, or faulted in the TLB.
-enum StepOutcome {
-    Executed { pc: u32, instr: u32 },
-    Sleeping,
-    TlbMiss { pc: u32 },
-}
-
-// Identifies why debugger execution returned control to the user.
-enum RunOutcome {
-    Breakpoint(u32),
-    Halted,
-    Watchpoint(WatchpointHit),
-}
-
-// Continue until halt, sleep, a TLB miss, a breakpoint, or a watchpoint.
-fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>) -> RunOutcome {
-    loop {
-        if cpu.halted {
-            return RunOutcome::Halted;
-        }
-        if breakpoints.contains(&cpu.pc) {
-            return RunOutcome::Breakpoint(cpu.pc);
-        }
-        match cpu.step_instruction() {
-            StepOutcome::Executed { .. } => {}
-            StepOutcome::Sleeping => {}
-            StepOutcome::TlbMiss { .. } => {}
-        }
-        if let Some(hit) = cpu.take_watchpoint_hit() {
-            return RunOutcome::Watchpoint(hit);
-        }
-    }
-}
-
 // Format addresses as a comma-separated list of eight-digit hex values.
 fn format_addr_list(addrs: &[u32]) -> String {
-    let mut parts = Vec::new();
-    for addr in addrs {
-        parts.push(format!("{:08X}", addr));
-    }
-    parts.join(", ")
+    addrs
+        .iter()
+        .map(|addr| format!("{:08X}", addr))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-// Render a breakpoint with its address, condition, and source location.
-fn format_breakpoint(addr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) -> String {
-    if let Some(names) = labels_by_addr.get(&addr) {
-        format!("{:08X} ({})", addr, names.join(", "))
-    } else {
-        format!("{:08X}", addr)
-    }
-}
-
-// Print all currently configured breakpoints.
-fn list_breakpoints(breakpoints: &HashSet<u32>, labels_by_addr: &HashMap<u32, Vec<String>>) {
+// Print breakpoints in address order, each described by `describe`.
+fn list_breakpoints(breakpoints: &HashSet<u32>, describe: impl Fn(u32) -> String) {
     if breakpoints.is_empty() {
         println!("No breakpoints set.");
         return;
@@ -130,11 +140,80 @@ fn list_breakpoints(breakpoints: &HashSet<u32>, labels_by_addr: &HashMap<u32, Ve
     let mut list: Vec<u32> = breakpoints.iter().copied().collect();
     list.sort_unstable();
     for addr in list {
-        println!("{}", format_breakpoint(addr, labels_by_addr));
+        println!("{}", describe(addr));
     }
 }
 
-// Return the display label for a watchpoint access kind.
+// Why debugger execution returned control to the user.
+enum RunOutcome {
+    Breakpoint(u32),
+    Halted,
+    Watchpoint(WatchpointHit),
+}
+
+// Run until halt, a watchpoint, or a breakpoint. When `resume` is set, the
+// breakpoint at the starting PC is ignored until execution leaves that PC,
+// so `c` from a breakpoint makes progress.
+fn run_until_breakpoint(cpu: &mut Emulator, breakpoints: &HashSet<u32>, resume: bool) -> RunOutcome {
+    let start_pc = cpu.pc;
+    let mut skip_start = resume;
+    loop {
+        if cpu.halted {
+            return RunOutcome::Halted;
+        }
+        if cpu.pc != start_pc {
+            skip_start = false;
+        }
+        if breakpoints.contains(&cpu.pc) && !skip_start {
+            return RunOutcome::Breakpoint(cpu.pc);
+        }
+        cpu.step_instruction();
+        if let Some(hit) = cpu.watchpoint_hit.take() {
+            return RunOutcome::Watchpoint(hit);
+        }
+    }
+}
+
+// Program image plus the settings needed to rebuild a fresh core for `r`.
+struct DebugTarget<'a> {
+    image: ProgramImage,
+    use_uart_rx: bool,
+    sd_dma_ticks_per_word: u32,
+    sd0_image: Option<&'a [u8]>,
+    sd1_image: Option<&'a [u8]>,
+}
+
+impl DebugTarget<'_> {
+    // A freshly reset core with the program loaded.
+    fn fresh_cpu(&self) -> Emulator {
+        Emulator::standalone(
+            self.image.bytes.clone(),
+            self.use_uart_rx,
+            self.sd_dma_ticks_per_word,
+            self.sd0_image,
+            self.sd1_image,
+        )
+    }
+}
+
+// Report how a run ended, using `show_stop` to describe a breakpoint stop.
+fn report_run(outcome: RunOutcome, cpu: &mut Emulator, show_stop: impl FnOnce(&mut Emulator, u32)) {
+    match outcome {
+        RunOutcome::Breakpoint(addr) => show_stop(cpu, addr),
+        RunOutcome::Halted => println!("Program halted. r1 = {:08X}", cpu.regfile[1]),
+        RunOutcome::Watchpoint(hit) => println!(
+            "Watchpoint hit ({} at {:08X} = {:02X}) pc {:08X}",
+            if hit.access == WatchAccess::Read { "read" } else { "write" },
+            hit.addr,
+            hit.value,
+            cpu.pc
+        ),
+    }
+}
+
+// ---- Instruction-level debugger helpers -----------------------------------
+
+// Display label for a watchpoint access kind.
 fn watch_kind_label(kind: WatchKind) -> &'static str {
     match kind {
         WatchKind::Read => "r",
@@ -143,15 +222,7 @@ fn watch_kind_label(kind: WatchKind) -> &'static str {
     }
 }
 
-// Return the display label for the access that triggered a watchpoint.
-fn watch_access_label(access: WatchAccess) -> &'static str {
-    match access {
-        WatchAccess::Read => "read",
-        WatchAccess::Write => "write",
-    }
-}
-
-// Parse the debugger's read/write/read-write watchpoint selector.
+// Parse the read/write/read-write watchpoint selector.
 fn parse_watch_kind(token: &str) -> Option<WatchKind> {
     match token {
         "r" => Some(WatchKind::Read),
@@ -161,90 +232,65 @@ fn parse_watch_kind(token: &str) -> Option<WatchKind> {
     }
 }
 
-// Combine a new watchpoint kind with an existing one.
-fn merge_watch_kind(existing: WatchKind, new_kind: WatchKind) -> WatchKind {
-    if existing == new_kind {
-        existing
-    } else {
-        WatchKind::ReadWrite
-    }
-}
-
-// Insert or merge a watchpoint for the requested address range and access kind.
+// Insert a watchpoint, widening an existing one at the same address to
+// read/write if the kinds differ. Returns the resulting kind.
 fn add_watchpoint(list: &mut Vec<Watchpoint>, addr: u32, kind: WatchKind) -> WatchKind {
-    for wp in list.iter_mut() {
-        if wp.addr == addr {
-            wp.kind = merge_watch_kind(wp.kind, kind);
-            return wp.kind;
+    if let Some(wp) = list.iter_mut().find(|wp| wp.addr == addr) {
+        if wp.kind != kind {
+            wp.kind = WatchKind::ReadWrite;
         }
+        return wp.kind;
     }
     list.push(Watchpoint { addr, kind });
     kind
 }
 
-// Remove the watchpoint covering the requested address, if one exists.
-fn remove_watchpoint(list: &mut Vec<Watchpoint>, addr: u32) -> bool {
-    let before = list.len();
-    list.retain(|wp| wp.addr != addr);
-    before != list.len()
-}
-
-// Print all currently configured watchpoints.
-fn list_watchpoints(list: &[Watchpoint]) {
-    if list.is_empty() {
-        println!("No watchpoints set.");
-        return;
+// Resolve a numeric address or a label.
+fn resolve_label_or_addr(target: &str, labels: &LabelMap) -> Result<Vec<u32>, String> {
+    if let Some(addr) = parse_addr(target) {
+        return Ok(vec![addr]);
     }
-    let mut sorted = list.to_vec();
-    sorted.sort_by_key(|wp| wp.addr);
-    for wp in sorted {
-        println!("{:08X} ({})", wp.addr, watch_kind_label(wp.kind));
-    }
+    labels
+        .get(target)
+        .cloned()
+        .ok_or_else(|| format!("Unknown label {}", target))
 }
 
-// Report the triggering access, byte value, and current program counter.
-fn print_watchpoint_hit(hit: WatchpointHit, pc: u32) {
-    println!(
-        "Watchpoint hit ({} at {:08X} = {:02X}) pc {:08X}",
-        watch_access_label(hit.access),
-        hit.addr,
-        hit.value,
-        pc
-    );
-}
-
-// Remove the breakpoint at the requested address or label.
-fn delete_breakpoint(target: &str, breakpoints: &mut HashSet<u32>, labels: &LabelMap) {
-    match resolve_label_or_addr(target, labels) {
-        Ok(addrs) => {
-            if addrs.len() == 1 {
-                let addr = addrs[0];
-                if breakpoints.remove(&addr) {
-                    println!("Breakpoint removed at {:08X}", addr);
-                } else {
-                    println!("No breakpoint set at {:08X}", addr);
-                }
-            } else {
-                println!("Ambiguous label {} -> {}", target, format_addr_list(&addrs));
-            }
-        }
-        Err(msg) => println!("{}", msg),
+// Resolve a target that must name exactly one address.
+fn resolve_single(target: &str, labels: &LabelMap) -> Result<u32, String> {
+    let addrs = resolve_label_or_addr(target, labels)?;
+    match addrs.as_slice() {
+        [addr] => Ok(*addr),
+        _ => Err(format!("Ambiguous label {} -> {}", target, format_addr_list(&addrs))),
     }
 }
 
-fn dump_bytes<F>(base: u32, len: u32, mut read_byte: F)
-where
-    F: FnMut(u32) -> Option<u8>,
-{
+// Print an executed or stopped-at instruction with its labels.
+fn print_step(pc: u32, instr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) {
+    match labels_by_addr.get(&pc) {
+        Some(names) => println!(
+            "{:08X}: {:08X}  {} ({})",
+            pc,
+            instr,
+            disassemble(instr),
+            names.join(", ")
+        ),
+        None => println!("{:08X}: {:08X}  {}", pc, instr, disassemble(instr)),
+    }
+}
+
+// Hex-dump `len` bytes starting at `base`, 16 per row; unreadable bytes are ??.
+fn dump_bytes(base: u32, len: u32, mut read_byte: impl FnMut(u32) -> Option<u8>) {
     if len == 0 {
         println!("(empty range)");
         return;
     }
     for offset in 0..len {
+        let addr = base.wrapping_add(offset);
         if offset % 16 == 0 {
-            print!("{:08X}: ", base.wrapping_add(offset));
+            print!("{:08X}: ", addr);
         }
-        match read_byte(base.wrapping_add(offset)) {
+        match read_byte(addr) {
             Some(val) => print!("{:02X} ", val),
             None => print!("?? "),
         }
@@ -254,52 +300,14 @@ where
     }
 }
 
-// Resolve a debugger location from either a numeric address or a symbol.
-fn resolve_label_or_addr(target: &str, labels: &LabelMap) -> Result<Vec<u32>, String> {
-    if let Some(addr) = parse_addr(target) {
-        return Ok(vec![addr]);
-    }
-    if let Some(addrs) = labels.get(target) {
-        return Ok(addrs.clone());
-    }
-    Err(format!("Unknown label {}", target))
-}
+// ---- C-level debugger helpers ---------------------------------------------
 
-// Print the instruction and source location reached by a single-step stop.
-fn print_step(pc: u32, instr: u32, labels_by_addr: &HashMap<u32, Vec<String>>) {
-    let disasm = disassemble(instr);
-    if let Some(names) = labels_by_addr.get(&pc) {
-        println!(
-            "{:08X}: {:08X}  {} ({})",
-            pc,
-            instr,
-            disasm,
-            names.join(", ")
-        );
-    } else {
-        println!("{:08X}: {:08X}  {}", pc, instr, disasm);
-    }
-}
+// Debug addresses indexed by source file and line (sorted, deduplicated).
+type LineIndex = HashMap<String, HashMap<u32, Vec<u32>>>;
 
-// Print the breakpoint stop reason and the instruction at its address.
-fn print_breakpoint(addr: u32, labels_by_addr: &HashMap<u32, Vec<String>>, cpu: &mut Emulator) {
-    if let Some(instr) = cpu.fetch(addr) {
-        print_step(addr, instr, labels_by_addr);
-    } else {
-        println!("Breakpoint hit at {:08X}", addr);
-    }
-}
-
-// Avoid infinite loops when source lines do not advance.
-const MAX_STEP_INSTRUCTIONS: u32 = 1_000_000;
-// ABI base pointer register (r30).
-const BP_REG: u32 = 30;
-// Debug display uses word-sized (4-byte) reads.
-const DEBUG_WORD_BYTES: u32 = 4;
-
-// Index debug addresses by source file and line, sorting and deduplicating each list.
-fn build_line_index(lines: &[DebugLine]) -> HashMap<String, HashMap<u32, Vec<u32>>> {
-    let mut index: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
+// Build the file -> line -> addresses index.
+fn build_line_index(lines: &[DebugLine]) -> LineIndex {
+    let mut index: LineIndex = HashMap::new();
     for line in lines {
         index
             .entry(line.file.clone())
@@ -308,34 +316,20 @@ fn build_line_index(lines: &[DebugLine]) -> HashMap<String, HashMap<u32, Vec<u32
             .or_default()
             .push(line.addr);
     }
-    for file_map in index.values_mut() {
-        for addrs in file_map.values_mut() {
-            addrs.sort_unstable();
-            addrs.dedup();
-        }
+    for addrs in index.values_mut().flat_map(|file| file.values_mut()) {
+        addrs.sort_unstable();
+        addrs.dedup();
     }
     index
 }
 
-// Requires lines sorted by addr ascending.
-fn line_for_pc<'a>(lines: &'a [DebugLine], pc: u32) -> Option<&'a DebugLine> {
-    if lines.is_empty() {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = lines.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if lines[mid].addr <= pc {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 { None } else { Some(&lines[lo - 1]) }
+// Last line marker at or below `pc`. Requires `lines` sorted by address.
+fn line_for_pc(lines: &[DebugLine], pc: u32) -> Option<&DebugLine> {
+    let idx = lines.partition_point(|line| line.addr <= pc);
+    idx.checked_sub(1).map(|i| &lines[i])
 }
 
-// Return whether two debug locations refer to the same source line.
+// Whether two debug locations refer to the same source line.
 fn same_source_line(a: Option<&DebugLine>, b: Option<&DebugLine>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.line == b.line && a.file == b.file,
@@ -344,49 +338,19 @@ fn same_source_line(a: Option<&DebugLine>, b: Option<&DebugLine>) -> bool {
     }
 }
 
-// Format a debug location as ``file:line``.
-fn format_source_line(line: &DebugLine) -> String {
-    format!("{}:{}", line.file, line.line)
-}
-
-// Print the source line mapped to a PC, including lookup failures inline.
+// Print the source line for `pc`, with lookup failures shown inline.
 fn print_c_location(pc: u32, line: Option<&DebugLine>) {
-    if let Some(line) = line {
-        match resolve_source_path(&line.file) {
-            Ok(path) => match read_source_line(&path, line.line) {
-                Ok(text) => println!("{:08X}: {}:{}: {}", pc, line.file, line.line, text),
-                Err(err) => println!("{:08X}: {}:{}: <{}>", pc, line.file, line.line, err),
-            },
-            Err(err) => println!("{:08X}: {}:{}: <{}>", pc, line.file, line.line, err),
-        }
-    } else {
+    let Some(line) = line else {
         println!("{:08X}: <no line info>", pc);
-    }
-}
-
-// Add a resolved C source location to a breakpoint address when available.
-fn format_breakpoint_c(addr: u32, lines: &[DebugLine]) -> String {
-    if let Some(line) = line_for_pc(lines, addr) {
-        format!("{:08X} ({})", addr, format_source_line(line))
-    } else {
-        format!("{:08X}", addr)
-    }
-}
-
-// Print breakpoints with their resolved C source locations.
-fn list_breakpoints_c(breakpoints: &HashSet<u32>, lines: &[DebugLine]) {
-    if breakpoints.is_empty() {
-        println!("No breakpoints set.");
         return;
-    }
-    let mut list: Vec<u32> = breakpoints.iter().copied().collect();
-    list.sort_unstable();
-    for addr in list {
-        println!("{}", format_breakpoint_c(addr, lines));
+    };
+    match read_source_line(&line.file, line.line) {
+        Ok(text) => println!("{:08X}: {}:{}: {}", pc, line.file, line.line, text),
+        Err(err) => println!("{:08X}: {}:{}: <{}>", pc, line.file, line.line, err),
     }
 }
 
-// Sort local-variable descriptions by function address and stack offset.
+// Locals sorted by their anchor address, each list sorted by bp offset.
 fn build_locals_by_addr(debug: &DebugInfo) -> Vec<(u32, Vec<DebugLocal>)> {
     let mut locals: Vec<(u32, Vec<DebugLocal>)> = debug
         .locals_by_addr
@@ -401,1233 +365,550 @@ fn build_locals_by_addr(debug: &DebugInfo) -> Vec<(u32, Vec<DebugLocal>)> {
     locals
 }
 
-// Heuristic: C function entry markers emit a duplicate .line at the function label.
-// Use lines that appear multiple times and are anchored by a label without '.' in its name.
-fn build_function_entries(
-    line_index: &HashMap<String, HashMap<u32, Vec<u32>>>,
-    labels_by_addr: &HashMap<u32, Vec<String>>,
-) -> Vec<u32> {
-    let mut entries = Vec::new();
-    for file_map in line_index.values() {
-        for addrs in file_map.values() {
-            if addrs.len() < 2 {
-                continue;
-            }
-            let entry_addr = addrs[0];
-            let Some(labels) = labels_by_addr.get(&entry_addr) else {
-                continue;
-            };
-            if labels.iter().any(|name| !name.contains('.')) {
-                entries.push(entry_addr);
-            }
-        }
-    }
+// Heuristic function entries: the compiler emits a duplicate #line at each
+// function label, so a line with several addresses whose first address
+// carries a non-local (no '.') label marks a function start.
+fn build_function_entries(line_index: &LineIndex, labels_by_addr: &HashMap<u32, Vec<String>>) -> Vec<u32> {
+    let mut entries: Vec<u32> = line_index
+        .values()
+        .flat_map(|file| file.values())
+        .filter(|addrs| addrs.len() >= 2)
+        .map(|addrs| addrs[0])
+        .filter(|addr| {
+            labels_by_addr
+                .get(addr)
+                .is_some_and(|names| names.iter().any(|name| !name.contains('.')))
+        })
+        .collect();
     entries.sort_unstable();
     entries.dedup();
     entries
 }
 
-// Requires entries sorted by addr ascending.
-fn function_entry_for_pc(entries: &[u32], pc: u32) -> Option<u32> {
-    if entries.is_empty() {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = entries.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if entries[mid] <= pc {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 { None } else { Some(entries[lo - 1]) }
-}
-
-// Requires entries sorted by addr ascending.
+// [start, end) of the function containing `pc`. Requires sorted `entries`.
 fn function_range_for_pc(entries: &[u32], pc: u32) -> Option<(u32, Option<u32>)> {
-    if entries.is_empty() {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = entries.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if entries[mid] <= pc {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 {
-        return None;
-    }
-    let start = entries[lo - 1];
-    let end = if lo < entries.len() {
-        Some(entries[lo])
-    } else {
-        None
-    };
-    Some((start, end))
+    let idx = entries.partition_point(|&entry| entry <= pc);
+    let start = *entries.get(idx.checked_sub(1)?)?;
+    Some((start, entries.get(idx).copied()))
 }
 
-// Requires locals sorted by addr ascending.
-fn first_locals_addr_in_range(
-    locals: &[(u32, Vec<DebugLocal>)],
-    start: u32,
-    end: Option<u32>,
-) -> Option<u32> {
-    if locals.is_empty() {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = locals.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if locals[mid].0 < start {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo >= locals.len() {
-        return None;
-    }
-    let addr = locals[lo].0;
-    if let Some(end) = end {
-        if addr >= end {
-            return None;
-        }
-    }
-    Some(addr)
-}
-
-// Requires locals sorted by addr ascending.
+// Locals in scope at `pc`: the nearest anchor at or below `pc`, provided it
+// lies inside the current function. Requires sorted inputs.
 fn locals_for_pc<'a>(
     locals: &'a [(u32, Vec<DebugLocal>)],
     func_entries: &[u32],
     pc: u32,
 ) -> Option<&'a Vec<DebugLocal>> {
-    if locals.is_empty() {
-        return None;
+    let idx = locals.partition_point(|(addr, _)| *addr <= pc);
+    let (anchor, list) = &locals[idx.checked_sub(1)?];
+    match function_range_for_pc(func_entries, pc) {
+        Some((func_start, _)) if *anchor < func_start => None,
+        _ => Some(list),
     }
-    let mut lo = 0;
-    let mut hi = locals.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if locals[mid].0 <= pc {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 {
-        None
-    } else {
-        let entry_addr = locals[lo - 1].0;
-        if let Some(func_start) = function_entry_for_pc(func_entries, pc) {
-            if entry_addr < func_start {
-                return None;
-            }
-        }
-        Some(&locals[lo - 1].1)
+}
+
+// First local anchor inside [start, end), used to explain "not yet in scope".
+fn first_locals_addr_in_range(locals: &[(u32, Vec<DebugLocal>)], start: u32, end: Option<u32>) -> Option<u32> {
+    let idx = locals.partition_point(|(addr, _)| *addr < start);
+    let addr = locals.get(idx)?.0;
+    match end {
+        Some(end) if addr >= end => None,
+        _ => Some(addr),
     }
 }
 
 // Strip the compiler's numeric suffix (".N") from local names for display.
 fn display_local_name(name: &str) -> &str {
-    if let Some((base, suffix)) = name.rsplit_once('.') {
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
-            return base;
-        }
+    match name.rsplit_once('.') {
+        Some((base, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => name,
     }
-    name
 }
 
-// Resolve C source locations into concrete breakpoint addresses.
+// Resolve `line`, `file:line`, `*addr`, `0xaddr`, or a label to addresses.
 fn resolve_break_targets_c(
     token: &str,
     labels: &LabelMap,
-    line_index: &HashMap<String, HashMap<u32, Vec<u32>>>,
+    line_index: &LineIndex,
     default_file: Option<&str>,
 ) -> Result<Vec<u32>, String> {
-    if let Some(rest) = token.strip_prefix('*') {
-        let addr = parse_addr(rest).ok_or_else(|| format!("Invalid address {}", rest))?;
-        return Ok(vec![addr]);
-    }
-    if token.starts_with("0x") || token.starts_with("0X") {
-        let addr = parse_addr(token).ok_or_else(|| format!("Invalid address {}", token))?;
-        return Ok(vec![addr]);
-    }
-    if let Some((file, line_str)) = token.rsplit_once(':') {
-        let line_num = line_str
+    let lookup_line = |file: &str, line_str: &str| -> Result<Vec<u32>, String> {
+        let line = line_str
             .parse::<u32>()
             .map_err(|_| format!("Invalid line number {}", line_str))?;
-        let file_map = line_index
+        line_index
             .get(file)
-            .ok_or_else(|| format!("Unknown source file {}", file))?;
-        let addrs = file_map
-            .get(&line_num)
-            .ok_or_else(|| format!("No debug line {} in {}", line_num, file))?;
-        return Ok(addrs.clone());
+            .ok_or_else(|| format!("Unknown source file {}", file))?
+            .get(&line)
+            .cloned()
+            .ok_or_else(|| format!("No debug line {} in {}", line, file))
+    };
+    if let Some(rest) = token.strip_prefix('*') {
+        return parse_addr(rest)
+            .map(|addr| vec![addr])
+            .ok_or_else(|| format!("Invalid address {}", rest));
+    }
+    if token.starts_with("0x") || token.starts_with("0X") {
+        return parse_addr(token)
+            .map(|addr| vec![addr])
+            .ok_or_else(|| format!("Invalid address {}", token));
+    }
+    if let Some((file, line_str)) = token.rsplit_once(':') {
+        return lookup_line(file, line_str);
     }
     if token.chars().all(|c| c.is_ascii_digit()) {
-        let line_num = token
-            .parse::<u32>()
-            .map_err(|_| format!("Invalid line number {}", token))?;
         let file = default_file
             .ok_or_else(|| "No default source file; use break <file>:<line> instead".to_string())?;
-        let file_map = line_index
-            .get(file)
-            .ok_or_else(|| format!("Unknown source file {}", file))?;
-        let addrs = file_map
-            .get(&line_num)
-            .ok_or_else(|| format!("No debug line {} in {}", line_num, file))?;
-        return Ok(addrs.clone());
+        return lookup_line(file, token);
     }
-    if let Some(addrs) = labels.get(token) {
-        return Ok(addrs.clone());
-    }
-    Err(format!("Unknown label {}", token))
+    labels
+        .get(token)
+        .cloned()
+        .ok_or_else(|| format!("Unknown label {}", token))
 }
 
-// Debug reads bypass watchpoints; returns None when the address is unmapped.
-fn read_debug32_virt(cpu: &mut Emulator, addr: u32) -> Option<u32> {
-    let mut value: u32 = 0;
-    for i in 0..DEBUG_WORD_BYTES {
-        let byte = cpu.read_virt8_debug(addr.wrapping_add(i))?;
-        value |= u32::from(byte) << (8 * i);
-    }
-    Some(value)
-}
-
-// Read a virtual debugger range without applying execution watchpoints.
+// Read `size` bytes through translation without triggering watchpoints.
 fn read_debug_bytes_virt(cpu: &mut Emulator, addr: u32, size: u32) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(size as usize);
-    for i in 0..size {
-        let byte = cpu.read_virt8_debug(addr.wrapping_add(i))?;
-        bytes.push(byte);
-    }
-    Some(bytes)
+    (0..size)
+        .map(|i| cpu.read_virt8_debug(addr.wrapping_add(i)))
+        .collect()
 }
 
-// Format bytes as a hex value for small scalars; larger values stay byte-oriented.
+// Show values of up to 4 bytes as little-endian hex, larger ones as bytes.
 fn format_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "<empty>".to_string();
     }
     if bytes.len() <= 4 {
-        let mut value: u32 = 0;
-        for (idx, byte) in bytes.iter().enumerate() {
-            value |= u32::from(*byte) << (8 * idx);
-        }
+        let value = bytes
+            .iter()
+            .rev()
+            .fold(0u32, |acc, byte| (acc << 8) | u32::from(*byte));
         return format!("0x{:0width$X}", value, width = bytes.len() * 2);
     }
-    let mut out = String::new();
-    for (idx, byte) in bytes.iter().enumerate() {
-        if idx != 0 {
-            out.push(' ');
-        }
-        out.push_str(&format!("{:02X}", byte));
-    }
-    format!("[{}]", out)
+    let parts: Vec<String> = bytes.iter().map(|byte| format!("{:02X}", byte)).collect();
+    format!("[{}]", parts.join(" "))
 }
 
 impl Emulator {
-    // Apply debugger watchpoint commands to the emulator's access filters.
-    fn set_watchpoints(&mut self, watchpoints: &[Watchpoint]) {
-        self.watchpoints.clear();
-        self.watchpoints.extend_from_slice(watchpoints);
+    // Read one physical byte for inspection (MMIO reads keep their side effects).
+    fn read_phys8_debug(&self, addr: u32) -> Option<u8> {
+        (addr <= PHYSMEM_MAX).then(|| self.memory.read(addr))
     }
 
-    // Take watchpoint hit.
-    fn take_watchpoint_hit(&mut self) -> Option<WatchpointHit> {
-        self.watchpoint_hit.take()
+    // Read one virtual byte for inspection without triggering watchpoints.
+    fn read_virt8_debug(&mut self, addr: u32) -> Option<u8> {
+        let paddr = self.translate(addr, super::Access::Read);
+        self.pending_tlb_fault = None;
+        paddr.map(|paddr| self.memory.read(paddr))
     }
 
-    // Execute one instruction and report the resulting debugger stop reason.
-    fn step_instruction(&mut self) -> StepOutcome {
-        self.check_for_interrupts();
-        self.handle_interrupts();
-
-        if self.asleep {
-            return StepOutcome::Sleeping;
-        }
-
-        let pc = self.pc;
-        match self.fetch(pc) {
-            Some(instr) => {
-                self.execute(instr);
-                self.count = self.count.wrapping_add(1);
-                StepOutcome::Executed { pc, instr }
-            }
-            None => {
-                self.raise_pending_tlb_miss(pc);
-                self.count = self.count.wrapping_add(1);
-                StepOutcome::TlbMiss { pc }
-            }
-        }
-    }
-
-    // Display all general-purpose registers and their current values.
+    // Print all general-purpose and control registers.
     fn print_regs(&self) {
         println!("pc: {:08X} kmode: {}", self.pc, self.get_kmode());
-        for row in 0..8 {
-            let base = row * 4;
-            let r0 = self.get_reg(base as u32);
-            let r1 = self.get_reg((base + 1) as u32);
-            let r2 = self.get_reg((base + 2) as u32);
-            let r3 = self.get_reg((base + 3) as u32);
-            println!(
-                "r{:02}: {:08X} r{:02}: {:08X} r{:02}: {:08X} r{:02}: {:08X}",
-                base,
-                r0,
-                base + 1,
-                r1,
-                base + 2,
-                r2,
-                base + 3,
-                r3
-            );
+        for row in 0..8u32 {
+            let cells: Vec<String> = (row * 4..row * 4 + 4)
+                .map(|r| format!("r{:02}: {:08X}", r, self.get_reg(r)))
+                .collect();
+            println!("{}", cells.join(" "));
         }
-        println!(
-            "PSR: {:08X} PID: {:08X} ISR: {:08X} IMR: {:08X} EPC: {:08X}",
-            self.read_creg(0),
-            self.read_creg(1),
-            self.read_creg(2),
-            self.read_creg(3),
-            self.read_creg(4)
-        );
-        println!(
-            "FLG: {:08X} EFG: {:08X} TLB: {:08X} KSP: {:08X}",
-            self.read_creg(5),
-            self.read_creg(6),
-            self.read_creg(7),
-            self.read_creg(8)
-        );
-        println!(
-            "CID: {:08X} MBI: {:08X} MBO: {:08X} TLBF: {:08X}",
-            self.read_creg(9),
-            self.read_creg(10),
-            self.read_creg(11),
-            self.read_creg(12)
-        );
+        for row in [0..5, 5..9, 9..CREG_COUNT] {
+            let cells: Vec<String> = row
+                .map(|i| format!("{}: {:08X}", CREG_NAMES[i].to_ascii_uppercase(), self.read_creg(i)))
+                .collect();
+            println!("{}", cells.join(" "));
+        }
     }
 
-    // Display all control registers and their current values.
+    // Print every control register with its name.
     fn print_cregs(&self) {
         println!("kmode: {}", self.get_kmode());
-        println!("cr0 (psr): {:08X}", self.read_creg(0));
-        println!("cr1 (pid): {:08X}", self.read_creg(1));
-        println!("cr2 (isr): {:08X}", self.read_creg(2));
-        println!("cr3 (imr): {:08X}", self.read_creg(3));
-        println!("cr4 (epc): {:08X}", self.read_creg(4));
-        println!("cr5 (flg): {:08X}", self.read_creg(5));
-        println!("cr6 (efg): {:08X}", self.read_creg(6));
-        println!("cr7 (tlb): {:08X}", self.read_creg(7));
-        println!("cr8 (ksp): {:08X}", self.read_creg(8));
-        println!("cr9 (cid): {:08X}", self.read_creg(9));
-        println!("cr10 (mbi): {:08X}", self.read_creg(10));
-        println!("cr11 (mbo): {:08X}", self.read_creg(11));
-        println!("cr12 (tlbf): {:08X}", self.read_creg(12));
+        for (i, name) in CREG_NAMES.iter().enumerate() {
+            println!("cr{} ({}): {:08X}", i, name, self.read_creg(i));
+        }
     }
 
-    // Print one named or numbered register, accepting ABI aliases.
+    // Resolve a register token: "pc", rN, crN, a control-register name, or a
+    // docs/abi.md alias. Returns (label for display, register).
+    fn parse_register(token: &str) -> Option<(String, DebugReg)> {
+        let token = token.to_ascii_lowercase();
+        if token == "pc" {
+            return Some(("pc".to_string(), DebugReg::Pc));
+        }
+        if let Some(&(name, reg)) = GPR_ALIASES.iter().find(|(name, _)| *name == token) {
+            return Some((format!("{} (r{})", name, reg), DebugReg::Gpr(reg)));
+        }
+        if let Some(idx) = CREG_NAMES.iter().position(|name| *name == token) {
+            return Some((format!("{} (cr{})", token, idx), DebugReg::Creg(idx)));
+        }
+        if let Some(idx) = token.strip_prefix("cr").and_then(|n| n.parse::<usize>().ok()) {
+            return (idx < CREG_COUNT).then(|| (token.clone(), DebugReg::Creg(idx)));
+        }
+        if let Some(idx) = token.strip_prefix('r').and_then(|n| n.parse::<u32>().ok()) {
+            return (idx < 32).then(|| (token.clone(), DebugReg::Gpr(idx)));
+        }
+        None
+    }
+
+    // Print one register; false if the token names no register.
     fn print_single_reg(&self, token: &str) -> bool {
-        let token = token.to_ascii_lowercase();
-        match token.as_str() {
-            "pc" => {
-                println!("pc = {:08X}", self.pc);
-                return true;
-            }
-            "sp" => {
-                println!("sp (r31) = {:08X}", self.get_reg(31));
-                return true;
-            }
-            "bp" => {
-                println!("bp (r30) = {:08X}", self.get_reg(30));
-                return true;
-            }
-            "ra" => {
-                println!("ra (r29) = {:08X}", self.get_reg(29));
-                return true;
-            }
-            "ksp" => {
-                println!("ksp (cr8) = {:08X}", self.read_creg(8));
-                return true;
-            }
-            "psr" => {
-                println!("psr (cr0) = {:08X}", self.read_creg(0));
-                return true;
-            }
-            "pid" => {
-                println!("pid (cr1) = {:08X}", self.read_creg(1));
-                return true;
-            }
-            "isr" => {
-                println!("isr (cr2) = {:08X}", self.read_creg(2));
-                return true;
-            }
-            "imr" => {
-                println!("imr (cr3) = {:08X}", self.read_creg(3));
-                return true;
-            }
-            "epc" => {
-                println!("epc (cr4) = {:08X}", self.read_creg(4));
-                return true;
-            }
-            "flg" => {
-                println!("flg (cr5) = {:08X}", self.read_creg(5));
-                return true;
-            }
-            "efg" => {
-                println!("efg (cr6) = {:08X}", self.read_creg(6));
-                return true;
-            }
-            "cdv" => {
-                println!("cdv (cr6) = {:08X}", self.read_creg(6));
-                return true;
-            }
-            "tlb" => {
-                println!("tlb (cr7) = {:08X}", self.read_creg(7));
-                return true;
-            }
-            "cid" => {
-                println!("cid (cr9) = {:08X}", self.read_creg(9));
-                return true;
-            }
-            "mbi" => {
-                println!("mbi (cr10) = {:08X}", self.read_creg(10));
-                return true;
-            }
-            "mbo" => {
-                println!("mbo (cr11) = {:08X}", self.read_creg(11));
-                return true;
-            }
-            "tlbf" => {
-                println!("tlbf (cr12) = {:08X}", self.read_creg(12));
-                return true;
-            }
-            _ => {}
-        }
-
-        if let Some(num) = token.strip_prefix("r") {
-            if let Ok(idx) = num.parse::<u32>() {
-                if idx < 32 {
-                    println!("r{} = {:08X}", idx, self.get_reg(idx));
-                    return true;
-                }
-            }
-        }
-
-        if let Some(num) = token.strip_prefix("cr") {
-            if let Ok(idx) = num.parse::<usize>() {
-                if idx < self.cregfile.len() {
-                    println!("cr{} = {:08X}", idx, self.read_creg(idx));
-                    return true;
-                }
-            }
-        }
-
-        false
+        let Some((label, reg)) = Self::parse_register(token) else {
+            return false;
+        };
+        let value = match reg {
+            DebugReg::Pc => self.pc,
+            DebugReg::Gpr(r) => self.get_reg(r),
+            DebugReg::Creg(i) => self.read_creg(i),
+        };
+        println!("{} = {:08X}", label, value);
+        true
     }
 
-    // Parse and write a new value to the selected general-purpose register.
+    // Write one register; false if the token names no register.
     fn set_reg_value(&mut self, token: &str, value: u32) -> bool {
-        let token = token.to_ascii_lowercase();
-        match token.as_str() {
-            "pc" => {
-                self.pc = value;
-                return true;
-            }
-            "sp" => {
-                self.write_reg(31, value);
-                return true;
-            }
-            "bp" => {
-                self.write_reg(30, value);
-                return true;
-            }
-            "ra" => {
-                self.write_reg(29, value);
-                return true;
-            }
-            "psr" => {
-                self.write_creg(0, value);
-                return true;
-            }
-            "pid" => {
-                self.write_creg(1, value);
-                return true;
-            }
-            "isr" => {
-                self.write_creg(2, value);
-                return true;
-            }
-            "imr" => {
-                self.write_creg(3, value);
-                return true;
-            }
-            "epc" => {
-                self.write_creg(4, value);
-                return true;
-            }
-            "flg" => {
-                self.write_creg(5, value);
-                return true;
-            }
-            "efg" => {
-                self.write_creg(6, value);
-                return true;
-            }
-            "cdv" => {
-                self.write_creg(6, value);
-                return true;
-            }
-            "tlb" => {
-                self.write_creg(7, value);
-                return true;
-            }
-            "ksp" => {
-                self.write_creg(8, value);
-                return true;
-            }
-            "isp" => {
-                self.write_creg(12, value);
-                return true;
-            }
-            "tlbf" => {
-                self.write_creg(12, value);
-                return true;
-            }
-            "cid" => {
-                self.write_creg(9, value);
-                return true;
-            }
-            "mbi" => {
-                self.write_creg(10, value);
-                return true;
-            }
-            "mbo" => {
-                self.write_creg(11, value);
-                return true;
-            }
-            _ => {}
+        match Self::parse_register(token) {
+            Some((_, DebugReg::Pc)) => self.pc = value,
+            Some((_, DebugReg::Gpr(r))) => self.write_reg(r, value),
+            Some((_, DebugReg::Creg(i))) => self.write_creg(i, value),
+            None => return false,
         }
-
-        if let Some(num) = token.strip_prefix("r") {
-            if let Ok(idx) = num.parse::<u32>() {
-                if idx < 32 {
-                    self.write_reg(idx, value);
-                    return true;
-                }
-            }
-        }
-
-        if let Some(num) = token.strip_prefix("cr") {
-            if let Ok(idx) = num.parse::<usize>() {
-                if idx < self.cregfile.len() {
-                    self.write_creg(idx, value);
-                    return true;
-                }
-            }
-        }
-
-        false
+        true
     }
 
-    // Display private and global TLB entries with their permissions.
-    fn print_tlb(&self) {
-        self.tlb.debug_dump();
-    }
-
-    // Display bytes read from a physical address range.
-    fn print_phys(&mut self, addr: u32) {
-        if addr > PHYSMEM_MAX {
+    // Print the aligned physical word containing `addr`.
+    fn print_phys(&self, addr: u32) {
+        if addr > PHYSMEM_MAX - 3 {
             println!("Warning: physical address out of range 0x{:08X}", addr);
             return;
         }
-        match self.read_phys32(addr) {
-            Some(word) => println!("paddr {:08X} = {:08X}", addr, word),
-            None => println!("Warning: physical address out of range 0x{:08X}", addr),
-        }
+        println!("paddr {:08X} = {:08X}", addr, self.memory.read_u32(addr));
     }
 
-    // Display bytes read through virtual-address translation.
+    // Translate `addr` and print the word there.
     fn print_virt(&mut self, addr: u32) {
-        match self.convert_mem_address(addr, 0) {
-            Some(paddr) => match self.read_phys32(paddr) {
-                Some(word) => println!("vaddr {:08X} -> paddr {:08X} = {:08X}", addr, paddr, word),
-                None => println!("Warning: physical address out of range 0x{:08X}", paddr),
-            },
+        let paddr = self.translate(addr, super::Access::Read);
+        self.pending_tlb_fault = None;
+        match paddr {
+            Some(paddr) if paddr <= PHYSMEM_MAX - 3 => println!(
+                "vaddr {:08X} -> paddr {:08X} = {:08X}",
+                addr,
+                paddr,
+                self.memory.read_u32(paddr)
+            ),
+            Some(paddr) => println!("Warning: physical address out of range 0x{:08X}", paddr),
             None => println!("Warning: no TLB mapping for vaddr 0x{:08X}", addr),
         }
     }
 
-    // Run the interactive debugger command loop.
+    // Run the instruction-level debugger command loop; returns the final core
+    // so the caller can export SD images.
     pub fn debug(
         path: String,
         use_uart_rx: bool,
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
         sd1_image: Option<&[u8]>,
-    ) -> Emulator {
-        let image = load_program(&path);
-        let labels_by_addr = build_labels_by_addr(&image.labels);
-        let mut breakpoints: HashSet<u32> = HashSet::new();
-        let mut watchpoints: Vec<Watchpoint> = Vec::new();
-        let mut cpu = Emulator::from_instructions(
-            image.instructions.clone(),
+    ) -> Result<Emulator, String> {
+        let target = DebugTarget {
+            image: load_program(&path)?,
             use_uart_rx,
             sd_dma_ticks_per_word,
             sd0_image,
             sd1_image,
-        );
-        cpu.set_watchpoints(&watchpoints);
+        };
+        let labels = &target.image.labels;
+        let labels_by_addr = build_labels_by_addr(labels);
+        let mut breakpoints: HashSet<u32> = HashSet::new();
+        let mut watchpoints: Vec<Watchpoint> = Vec::new();
+        let mut cpu = target.fresh_cpu();
+        let show_breakpoint = |cpu: &mut Emulator, addr: u32| match cpu.peek_instruction(addr) {
+            Some(instr) => print_step(addr, instr, &labels_by_addr),
+            None => println!("Breakpoint hit at {:08X}", addr),
+        };
 
-        println!("Debug mode:");
-        println!("  r                 reset and run until break/watchpoint/halt");
-        println!("  c                 continue execution");
-        println!("  n                 step one instruction");
-        println!("  break <label|addr> set breakpoint");
-        println!("  breaks            list breakpoints");
-        println!("  delete <label|addr> remove breakpoint");
-        println!("  watch [r|w|rw] <addr> stop on memory access");
-        println!("  watchs            list watchpoints");
-        println!("  unwatch <addr>    remove watchpoint");
-        println!("  info regs         print all registers");
-        println!("  info cregs        print control registers + kmode");
-        println!("  info <reg>        print a single register");
-        println!("  info tlb          dump TLB maps");
-        println!("  info p <addr>     print word at physical address");
-        println!("  info v <addr>     print word + resolved physical address");
-        println!("  x [v|p] <addr> <len> dump memory range");
-        println!("  set reg <reg> <value> write a register");
-        println!("  q                 quit");
-
-        loop {
-            print!("dbg> ");
-            io::stdout().flush().unwrap();
-
-            let mut line = String::new();
-            if io::stdin().read_line(&mut line).is_err() {
-                break;
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
+        println!("Debug mode:\n{}", ASM_HELP);
+        while let Some(line) = read_command() {
             let mut parts = line.split_whitespace();
             let cmd = parts.next().unwrap();
-
+            let usage = |text: &str| println!("Usage: {}", text);
             match cmd {
                 "q" | "quit" => break,
-                "h" | "help" => {
-                    println!("Commands:");
-                    println!("  r                 reset and run until break/watchpoint/halt");
-                    println!("  c                 continue execution");
-                    println!("  n                 step one instruction");
-                    println!("  break <label|addr> set breakpoint");
-                    println!("  breaks            list breakpoints");
-                    println!("  delete <label|addr> remove breakpoint");
-                    println!("  watch [r|w|rw] <addr> stop on memory access");
-                    println!("  watchs            list watchpoints");
-                    println!("  unwatch <addr>    remove watchpoint");
-                    println!("  info regs         print all registers");
-                    println!("  info cregs        print control registers + kmode");
-                    println!("  info <reg>        print a single register");
-                    println!("  info tlb          dump TLB maps");
-                    println!("  info p <addr>     print word at physical address");
-                    println!("  info v <addr>     print word + resolved physical address");
-                    println!("  x [v|p] <addr> <len> dump memory range");
-                    println!("  set reg <reg> <value> write a register");
-                    println!("  q                 quit");
+                "h" | "help" => println!("Commands:\n{}", ASM_HELP),
+                "r" | "c" => {
+                    if cmd == "r" {
+                        cpu = target.fresh_cpu();
+                        cpu.watchpoints = watchpoints.clone();
+                    }
+                    let outcome = run_until_breakpoint(&mut cpu, &breakpoints, cmd == "c");
+                    report_run(outcome, &mut cpu, show_breakpoint);
                 }
-                "r" => {
-                    cpu = Emulator::from_instructions(
-                        image.instructions.clone(),
-                        use_uart_rx,
-                        sd_dma_ticks_per_word,
-                        sd0_image,
-                        sd1_image,
-                    );
-                    cpu.set_watchpoints(&watchpoints);
-                    match run_until_breakpoint(&mut cpu, &breakpoints) {
-                        RunOutcome::Breakpoint(addr) => {
-                            print_breakpoint(addr, &labels_by_addr, &mut cpu);
-                        }
-                        RunOutcome::Halted => {
-                            println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
-                        }
-                        RunOutcome::Watchpoint(hit) => {
-                            print_watchpoint_hit(hit, cpu.pc);
-                        }
-                    }
-                }
-                "c" => match run_until_breakpoint(&mut cpu, &breakpoints) {
-                    RunOutcome::Breakpoint(addr) => {
-                        print_breakpoint(addr, &labels_by_addr, &mut cpu);
-                    }
-                    RunOutcome::Halted => {
-                        println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
-                    }
-                    RunOutcome::Watchpoint(hit) => {
-                        print_watchpoint_hit(hit, cpu.pc);
-                    }
-                },
                 "n" => {
                     if cpu.halted {
                         println!("Program already halted.");
                         continue;
                     }
-
                     match cpu.step_instruction() {
                         StepOutcome::Executed { pc, instr } => {
                             print_step(pc, instr, &labels_by_addr);
-                            if let Some(hit) = cpu.take_watchpoint_hit() {
-                                print_watchpoint_hit(hit, cpu.pc);
+                            if let Some(hit) = cpu.watchpoint_hit.take() {
+                                report_run(RunOutcome::Watchpoint(hit), &mut cpu, show_breakpoint);
                             }
                             if cpu.halted {
                                 println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
                             }
                         }
-                        StepOutcome::Sleeping => {
-                            println!("CPU sleeping; waiting for interrupt.");
-                        }
-                        StepOutcome::TlbMiss { pc } => {
-                            println!("TLB miss at {:08X}", pc);
-                        }
+                        StepOutcome::Sleeping => println!("CPU sleeping; waiting for interrupt."),
+                        StepOutcome::TlbMiss { pc } => println!("TLB miss at {:08X}", pc),
+                        StepOutcome::MisalignedPc { pc } => println!("Misaligned PC {:08X}", pc),
                     }
                 }
-                "break" | "b" => {
-                    let target = parts.next();
-                    if target.is_none() {
-                        println!("Usage: break <label|addr>");
-                        continue;
+                "break" | "b" => match parts.next().map(|t| resolve_single(t, labels)) {
+                    None => usage("break <label|addr>"),
+                    Some(Ok(addr)) => {
+                        breakpoints.insert(addr);
+                        println!("Breakpoint set at {:08X}", addr);
                     }
-                    let target = target.unwrap();
-                    match resolve_label_or_addr(target, &image.labels) {
-                        Ok(addrs) => {
-                            if addrs.len() == 1 {
-                                let addr = addrs[0];
-                                breakpoints.insert(addr);
-                                println!("Breakpoint set at {:08X}", addr);
-                            } else {
-                                println!(
-                                    "Ambiguous label {} -> {}",
-                                    target,
-                                    format_addr_list(&addrs)
-                                );
-                            }
-                        }
-                        Err(msg) => println!("{}", msg),
+                    Some(Err(msg)) => println!("{}", msg),
+                },
+                "breaks" => list_breakpoints(&breakpoints, |addr| match labels_by_addr.get(&addr) {
+                    Some(names) => format!("{:08X} ({})", addr, names.join(", ")),
+                    None => format!("{:08X}", addr),
+                }),
+                "delete" | "del" => match parts.next().map(|t| resolve_single(t, labels)) {
+                    None => usage("delete <label|addr>"),
+                    Some(Ok(addr)) if breakpoints.remove(&addr) => {
+                        println!("Breakpoint removed at {:08X}", addr)
                     }
-                }
-                "breaks" => {
-                    list_breakpoints(&breakpoints, &labels_by_addr);
-                }
-                "delete" | "del" => {
-                    let target = parts.next();
-                    if target.is_none() {
-                        println!("Usage: delete <label|addr>");
-                        continue;
-                    }
-                    delete_breakpoint(target.unwrap(), &mut breakpoints, &image.labels);
-                }
+                    Some(Ok(addr)) => println!("No breakpoint set at {:08X}", addr),
+                    Some(Err(msg)) => println!("{}", msg),
+                },
                 "watch" => {
-                    let mut kind = WatchKind::ReadWrite;
-                    let mut addr_token = parts.next();
-                    if let Some(token) = addr_token {
-                        if let Some(parsed) = parse_watch_kind(token) {
-                            kind = parsed;
-                            addr_token = parts.next();
-                        }
+                    let mut token = parts.next();
+                    let kind = token.and_then(parse_watch_kind);
+                    if kind.is_some() {
+                        token = parts.next();
                     }
-                    let Some(addr_str) = addr_token else {
-                        println!("Usage: watch [r|w|rw] <addr>");
+                    let Some(addr_str) = token else {
+                        usage("watch [r|w|rw] <addr>");
                         continue;
                     };
                     let Some(addr) = parse_addr(addr_str) else {
                         println!("Invalid address {}", addr_str);
                         continue;
                     };
-                    let final_kind = add_watchpoint(&mut watchpoints, addr, kind);
-                    cpu.set_watchpoints(&watchpoints);
-                    println!(
-                        "Watchpoint set at {:08X} ({})",
-                        addr,
-                        watch_kind_label(final_kind)
-                    );
+                    let kind = add_watchpoint(&mut watchpoints, addr, kind.unwrap_or(WatchKind::ReadWrite));
+                    cpu.watchpoints = watchpoints.clone();
+                    println!("Watchpoint set at {:08X} ({})", addr, watch_kind_label(kind));
                 }
                 "watchs" | "watchpoints" => {
-                    list_watchpoints(&watchpoints);
+                    if watchpoints.is_empty() {
+                        println!("No watchpoints set.");
+                    }
+                    let mut sorted = watchpoints.clone();
+                    sorted.sort_by_key(|wp| wp.addr);
+                    for wp in sorted {
+                        println!("{:08X} ({})", wp.addr, watch_kind_label(wp.kind));
+                    }
                 }
                 "unwatch" => {
                     let Some(addr_str) = parts.next() else {
-                        println!("Usage: unwatch <addr>");
+                        usage("unwatch <addr>");
                         continue;
                     };
                     let Some(addr) = parse_addr(addr_str) else {
                         println!("Invalid address {}", addr_str);
                         continue;
                     };
-                    if remove_watchpoint(&mut watchpoints, addr) {
-                        cpu.set_watchpoints(&watchpoints);
+                    let before = watchpoints.len();
+                    watchpoints.retain(|wp| wp.addr != addr);
+                    if watchpoints.len() != before {
+                        cpu.watchpoints = watchpoints.clone();
                         println!("Watchpoint removed at {:08X}", addr);
                     } else {
                         println!("No watchpoint set at {:08X}", addr);
                     }
                 }
                 "x" => {
-                    let mut mode = "v";
-                    let mut addr_token = parts.next();
-                    if let Some(token) = addr_token {
-                        if token == "v" || token == "p" {
-                            mode = token;
-                            addr_token = parts.next();
-                        }
+                    let mut token = parts.next();
+                    let physical = token == Some("p");
+                    if matches!(token, Some("v" | "p")) {
+                        token = parts.next();
                     }
-                    let Some(addr_str) = addr_token else {
-                        println!("Usage: x [v|p] <addr> <len>");
+                    let (Some(addr_str), Some(len_str)) = (token, parts.next()) else {
+                        usage("x [v|p] <addr> <len>");
                         continue;
                     };
-                    let Some(len_str) = parts.next() else {
-                        println!("Usage: x [v|p] <addr> <len>");
+                    let (Some(addr), Some(len)) = (parse_addr(addr_str), parse_addr(len_str)) else {
+                        println!("Invalid address or length: {} {}", addr_str, len_str);
                         continue;
                     };
-                    let Some(addr) = parse_addr(addr_str) else {
-                        println!("Invalid address {}", addr_str);
-                        continue;
-                    };
-                    let Some(len) = parse_addr(len_str) else {
-                        println!("Invalid length {}", len_str);
-                        continue;
-                    };
-                    if mode == "p" {
+                    if physical {
                         dump_bytes(addr, len, |a| cpu.read_phys8_debug(a));
                     } else {
                         dump_bytes(addr, len, |a| cpu.read_virt8_debug(a));
                     }
                 }
                 "set" => {
-                    let sub = parts.next();
-                    if sub != Some("reg") {
-                        println!("Usage: set reg <reg> <value>");
-                        continue;
-                    }
-                    let Some(reg_name) = parts.next() else {
-                        println!("Usage: set reg <reg> <value>");
+                    let (Some("reg"), Some(reg), Some(value_str)) = (parts.next(), parts.next(), parts.next())
+                    else {
+                        usage("set reg <reg> <value>");
                         continue;
                     };
-                    let Some(value_str) = parts.next() else {
-                        println!("Usage: set reg <reg> <value>");
-                        continue;
-                    };
-                    let Some(value) = parse_addr(value_str) else {
-                        println!("Invalid value {}", value_str);
-                        continue;
-                    };
-                    if !cpu.set_reg_value(reg_name, value) {
-                        println!("Unknown register {}", reg_name);
+                    match parse_addr(value_str) {
+                        None => println!("Invalid value {}", value_str),
+                        Some(value) if !cpu.set_reg_value(reg, value) => {
+                            println!("Unknown register {}", reg)
+                        }
+                        Some(_) => {}
                     }
                 }
                 "info" => match parts.next() {
                     Some("regs") => cpu.print_regs(),
                     Some("cregs") => cpu.print_cregs(),
-                    Some("tlb") => cpu.print_tlb(),
-                    Some("p") => {
-                        if let Some(arg) = parts.next() {
-                            if let Some(addr) = parse_addr(arg) {
-                                cpu.print_phys(addr);
-                            } else {
-                                println!("Invalid address {}", arg);
-                            }
-                        } else {
-                            println!("Usage: info p <addr>");
-                        }
-                    }
-                    Some("v") => {
-                        if let Some(arg) = parts.next() {
-                            if let Some(addr) = parse_addr(arg) {
-                                cpu.print_virt(addr);
-                            } else {
-                                println!("Invalid address {}", arg);
-                            }
-                        } else {
-                            println!("Usage: info v <addr>");
-                        }
-                    }
+                    Some("tlb") => cpu.tlb.debug_dump(),
+                    Some(space @ ("p" | "v")) => match parts.next() {
+                        None => usage(&format!("info {} <addr>", space)),
+                        Some(arg) => match parse_addr(arg) {
+                            None => println!("Invalid address {}", arg),
+                            Some(addr) if space == "p" => cpu.print_phys(addr),
+                            Some(addr) => cpu.print_virt(addr),
+                        },
+                    },
                     Some(token) => {
                         if !cpu.print_single_reg(token) {
                             println!("Unknown info target {}", token);
                         }
                     }
-                    None => println!("Usage: info <regs|cregs|tlb|p|v|reg>"),
+                    None => usage("info <regs|cregs|tlb|p|v|reg>"),
                 },
                 _ => println!("Unknown command: {}", cmd),
             }
         }
-
-        cpu
+        Ok(cpu)
     }
 
-    // Run the C-source-oriented debugger command loop.
+    // Run the C-source-level debugger command loop.
     pub fn debug_c(
         path: String,
         use_uart_rx: bool,
         sd_dma_ticks_per_word: u32,
         sd0_image: Option<&[u8]>,
         sd1_image: Option<&[u8]>,
-    ) -> Emulator {
-        let image = load_program(&path);
-        let mut lines = image.debug.lines.clone();
-        lines.sort_by_key(|line| line.addr);
-        let line_index = build_line_index(&lines);
-        let labels_by_addr = build_labels_by_addr(&image.labels);
-        let function_entries = build_function_entries(&line_index, &labels_by_addr);
-        let locals_by_addr = build_locals_by_addr(&image.debug);
-        let mut globals = image.debug.globals.clone();
-        globals.sort_by(|a, b| a.name.cmp(&b.name).then(a.addr.cmp(&b.addr)));
-        globals.dedup_by(|a, b| a.name == b.name && a.addr == b.addr);
-
-        if lines.is_empty() {
-            println!("Warning: no C debug line info found; break/next/step will be limited.");
-        }
-        if image.debug.missing_line_addrs {
-            println!(
-                "Warning: some #line entries lack addresses; rebuild with the updated assembler."
-            );
-        }
-        if locals_by_addr.is_empty() {
-            println!("Warning: no C local debug info found; info locals will be empty.");
-        }
-        if image.debug.missing_local_addrs {
-            println!(
-                "Warning: some #local entries lack addresses; rebuild with the updated assembler."
-            );
-        }
-        if image.debug.missing_local_sizes {
-            println!("Warning: some #local entries lack sizes; defaulting to 4-byte reads.");
-        }
-
-        let mut breakpoints: HashSet<u32> = HashSet::new();
-        let mut cpu = Emulator::from_instructions(
-            image.instructions.clone(),
+    ) -> Result<Emulator, String> {
+        let target = DebugTarget {
+            image: load_program(&path)?,
             use_uart_rx,
             sd_dma_ticks_per_word,
             sd0_image,
             sd1_image,
-        );
+        };
+        let debug = &target.image.debug;
+        let labels = &target.image.labels;
+        let mut lines = debug.lines.clone();
+        lines.sort_by_key(|line| line.addr);
+        let line_index = build_line_index(&lines);
+        let labels_by_addr = build_labels_by_addr(labels);
+        let function_entries = build_function_entries(&line_index, &labels_by_addr);
+        let locals_by_addr = build_locals_by_addr(debug);
+        let mut globals = debug.globals.clone();
+        globals.sort_by(|a, b| a.name.cmp(&b.name).then(a.addr.cmp(&b.addr)));
+        globals.dedup_by(|a, b| a.name == b.name && a.addr == b.addr);
 
-        println!("C debug mode:");
-        println!("  r                   reset and run until break/halt");
-        println!("  c                   continue execution");
-        println!("  step                step to the next source line");
-        println!("  next                step over calls to the next source line");
-        println!("  break <line>         set breakpoint on current file line");
-        println!("  break <file>:<line>  set breakpoint on file line");
-        println!("  break <label>        set breakpoint on label");
-        println!("  break *<addr>        set breakpoint on address");
-        println!("  breaks              list breakpoints");
-        println!("  delete <target>     remove breakpoint");
-        println!("  info locals         print locals for current frame");
-        println!("  info globals        print global data symbols");
-        println!("  q                   quit");
-
-        loop {
-            print!("dbg> ");
-            io::stdout().flush().unwrap();
-
-            let mut line = String::new();
-            if io::stdin().read_line(&mut line).is_err() {
-                break;
+        let warnings = [
+            (lines.is_empty(), "no C debug line info found; break/next/step will be limited."),
+            (debug.missing_line_addrs, "some #line entries lack addresses; rebuild with the updated assembler."),
+            (locals_by_addr.is_empty(), "no C local debug info found; info locals will be empty."),
+            (debug.missing_local_addrs, "some #local entries lack addresses; rebuild with the updated assembler."),
+            (debug.missing_local_sizes, "some #local entries lack sizes; defaulting to 4-byte reads."),
+        ];
+        for (present, text) in warnings {
+            if present {
+                println!("Warning: {}", text);
             }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        }
 
+        let mut breakpoints: HashSet<u32> = HashSet::new();
+        let mut cpu = target.fresh_cpu();
+        let show_location = |_: &mut Emulator, addr: u32| print_c_location(addr, line_for_pc(&lines, addr));
+        // Breakpoint line numbers without a file refer to the current file, or
+        // to the only file when there is exactly one.
+        let default_file = |pc: u32| {
+            line_for_pc(&lines, pc).map(|line| line.file.clone()).or_else(|| {
+                (line_index.len() == 1).then(|| line_index.keys().next().unwrap().clone())
+            })
+        };
+
+        println!("C debug mode:\n{}", C_HELP);
+        while let Some(line) = read_command() {
             let mut parts = line.split_whitespace();
             let cmd = parts.next().unwrap();
-
             match cmd {
                 "q" | "quit" => break,
-                "h" | "help" => {
-                    println!("Commands:");
-                    println!("  r                   reset and run until break/halt");
-                    println!("  c                   continue execution");
-                    println!("  step                step to the next source line");
-                    println!("  next                step over calls to the next source line");
-                    println!("  break <line>         set breakpoint on current file line");
-                    println!("  break <file>:<line>  set breakpoint on file line");
-                    println!("  break <label>        set breakpoint on label");
-                    println!("  break *<addr>        set breakpoint on address");
-                    println!("  breaks              list breakpoints");
-                    println!("  delete <target>     remove breakpoint");
-                    println!("  info locals         print locals for current frame");
-                    println!("  info globals        print global data symbols");
-                    println!("  q                   quit");
+                "h" | "help" => println!("Commands:\n{}", C_HELP),
+                "r" | "c" => {
+                    if cmd == "r" {
+                        cpu = target.fresh_cpu();
+                    }
+                    let outcome = run_until_breakpoint(&mut cpu, &breakpoints, cmd == "c");
+                    report_run(outcome, &mut cpu, show_location);
                 }
-                "r" => {
-                    cpu = Emulator::from_instructions(
-                        image.instructions.clone(),
-                        use_uart_rx,
-                        sd_dma_ticks_per_word,
-                        sd0_image,
-                        sd1_image,
-                    );
-                    match run_until_breakpoint(&mut cpu, &breakpoints) {
-                        RunOutcome::Breakpoint(addr) => {
-                            print_c_location(addr, line_for_pc(&lines, addr));
-                        }
-                        RunOutcome::Halted => {
-                            println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
-                        }
-                        RunOutcome::Watchpoint(_) => {
-                            println!("Watchpoints are not supported in C debug mode.");
-                        }
-                    }
-                }
-                "c" => match run_until_breakpoint(&mut cpu, &breakpoints) {
-                    RunOutcome::Breakpoint(addr) => {
-                        print_c_location(addr, line_for_pc(&lines, addr));
-                    }
-                    RunOutcome::Halted => {
-                        println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
-                    }
-                    RunOutcome::Watchpoint(_) => {
-                        println!("Watchpoints are not supported in C debug mode.");
-                    }
-                },
-                "step" | "s" => {
+                "step" | "s" | "next" | "n" => {
                     if cpu.halted {
                         println!("Program already halted.");
                         continue;
                     }
-                    let start_line = line_for_pc(&lines, cpu.pc);
-                    let mut steps = 0;
-                    loop {
-                        if steps >= MAX_STEP_INSTRUCTIONS {
-                            println!(
-                                "Warning: step limit reached without leaving the current line."
-                            );
-                            break;
-                        }
-                        match cpu.step_instruction() {
-                            StepOutcome::Executed { .. } => {}
-                            StepOutcome::Sleeping => {
-                                println!("CPU sleeping; waiting for interrupt.");
-                                break;
-                            }
-                            StepOutcome::TlbMiss { pc } => {
-                                println!("TLB miss at {:08X}", pc);
-                                break;
-                            }
-                        }
-                        steps += 1;
-                        if breakpoints.contains(&cpu.pc) {
-                            break;
-                        }
-                        let next_line = line_for_pc(&lines, cpu.pc);
-                        if start_line.is_none() || !same_source_line(start_line, next_line) {
-                            break;
-                        }
-                        if cpu.halted {
-                            break;
-                        }
-                    }
+                    let step_over = matches!(cmd, "next" | "n");
+                    step_source_line(&mut cpu, &lines, &breakpoints, step_over);
                     if cpu.halted {
                         println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
                     } else {
                         print_c_location(cpu.pc, line_for_pc(&lines, cpu.pc));
                     }
                 }
-                "next" | "n" => {
-                    if cpu.halted {
-                        println!("Program already halted.");
-                        continue;
-                    }
-                    let start_line = line_for_pc(&lines, cpu.pc);
-                    let start_bp = cpu.get_reg(BP_REG);
-                    let mut steps = 0;
-                    loop {
-                        if steps >= MAX_STEP_INSTRUCTIONS {
-                            println!(
-                                "Warning: step limit reached without leaving the current line."
-                            );
-                            break;
-                        }
-                        match cpu.step_instruction() {
-                            StepOutcome::Executed { .. } => {}
-                            StepOutcome::Sleeping => {
-                                println!("CPU sleeping; waiting for interrupt.");
-                                break;
-                            }
-                            StepOutcome::TlbMiss { pc } => {
-                                println!("TLB miss at {:08X}", pc);
-                                break;
-                            }
-                        }
-                        steps += 1;
-                        if breakpoints.contains(&cpu.pc) {
-                            break;
-                        }
-                        if cpu.get_reg(BP_REG) != start_bp {
-                            continue;
-                        }
-                        let next_line = line_for_pc(&lines, cpu.pc);
-                        if start_line.is_none() || !same_source_line(start_line, next_line) {
-                            break;
-                        }
-                        if cpu.halted {
-                            break;
-                        }
-                    }
-                    if cpu.halted {
-                        println!("Program halted. r1 = {:08X}", cpu.regfile[1]);
-                    } else {
-                        print_c_location(cpu.pc, line_for_pc(&lines, cpu.pc));
-                    }
-                }
-                "break" | "b" => {
-                    let Some(target) = parts.next() else {
-                        println!("Usage: break <line|file:line|label|*addr>");
+                "break" | "b" | "delete" | "del" => {
+                    let adding = matches!(cmd, "break" | "b");
+                    let Some(token) = parts.next() else {
+                        println!("Usage: {} <line|file:line|label|*addr>", if adding { "break" } else { "delete" });
                         continue;
                     };
-                    let current_line = line_for_pc(&lines, cpu.pc);
-                    let default_file = current_line.map(|line| line.file.as_str()).or_else(|| {
-                        if line_index.len() == 1 {
-                            line_index.keys().next().map(|name| name.as_str())
-                        } else {
-                            None
-                        }
-                    });
-                    match resolve_break_targets_c(target, &image.labels, &line_index, default_file)
-                    {
+                    let file = default_file(cpu.pc);
+                    match resolve_break_targets_c(token, labels, &line_index, file.as_deref()) {
                         Ok(addrs) => {
-                            let mut added = 0;
-                            for addr in addrs {
-                                if breakpoints.insert(addr) {
-                                    added += 1;
-                                }
-                            }
-                            if added == 0 {
-                                println!("No new breakpoints set.");
-                            } else {
-                                println!("Breakpoints set: {}", added);
+                            let changed = addrs
+                                .into_iter()
+                                .filter(|addr| {
+                                    if adding { breakpoints.insert(*addr) } else { breakpoints.remove(addr) }
+                                })
+                                .count();
+                            match (adding, changed) {
+                                (true, 0) => println!("No new breakpoints set."),
+                                (true, n) => println!("Breakpoints set: {}", n),
+                                (false, 0) => println!("No matching breakpoints."),
+                                (false, n) => println!("Breakpoints removed: {}", n),
                             }
                         }
                         Err(msg) => println!("{}", msg),
                     }
                 }
-                "breaks" => {
-                    list_breakpoints_c(&breakpoints, &lines);
-                }
-                "delete" | "del" => {
-                    let Some(target) = parts.next() else {
-                        println!("Usage: delete <line|file:line|label|*addr>");
-                        continue;
-                    };
-                    let current_line = line_for_pc(&lines, cpu.pc);
-                    let default_file = current_line.map(|line| line.file.as_str()).or_else(|| {
-                        if line_index.len() == 1 {
-                            line_index.keys().next().map(|name| name.as_str())
-                        } else {
-                            None
-                        }
-                    });
-                    match resolve_break_targets_c(target, &image.labels, &line_index, default_file)
-                    {
-                        Ok(addrs) => {
-                            let mut removed = 0;
-                            for addr in addrs {
-                                if breakpoints.remove(&addr) {
-                                    removed += 1;
-                                }
-                            }
-                            if removed == 0 {
-                                println!("No matching breakpoints.");
-                            } else {
-                                println!("Breakpoints removed: {}", removed);
-                            }
-                        }
-                        Err(msg) => println!("{}", msg),
-                    }
-                }
+                "breaks" => list_breakpoints(&breakpoints, |addr| match line_for_pc(&lines, addr) {
+                    Some(line) => format!("{:08X} ({}:{})", addr, line.file, line.line),
+                    None => format!("{:08X}", addr),
+                }),
                 "info" => match parts.next() {
-                    Some("locals") => {
-                        let Some(locals) =
-                            locals_for_pc(&locals_by_addr, &function_entries, cpu.pc)
-                        else {
-                            if let Some((start, end)) =
-                                function_range_for_pc(&function_entries, cpu.pc)
-                            {
-                                if let Some(first_addr) =
-                                    first_locals_addr_in_range(&locals_by_addr, start, end)
-                                {
-                                    if cpu.pc < first_addr {
-                                        println!(
-                                            "Locals are not available yet; enter the function body (after prologue at {:08X}).",
-                                            first_addr
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            println!("No local variables found for current location.");
-                            continue;
-                        };
-                        let bp = cpu.get_reg(BP_REG) as i64;
-                        for local in locals {
-                            let addr = bp + local.offset as i64;
-                            if addr < 0 || addr > u32::MAX as i64 {
-                                println!(
-                                    "{} @ <invalid> (offset {:+}, size {})",
-                                    display_local_name(&local.name),
-                                    local.offset,
-                                    local.size
-                                );
-                                continue;
-                            }
-                            let addr = addr as u32;
-                            match read_debug_bytes_virt(&mut cpu, addr, local.size) {
-                                Some(bytes) => {
-                                    let value = format_bytes(&bytes);
-                                    println!(
-                                        "{} @ {:08X} (offset {:+}, size {}) = {}",
-                                        display_local_name(&local.name),
-                                        addr,
-                                        local.offset,
-                                        local.size,
-                                        value
-                                    );
-                                }
-                                None => println!(
-                                    "{} @ {:08X} (offset {:+}, size {}) = <unmapped>",
-                                    display_local_name(&local.name),
-                                    addr,
-                                    local.offset,
-                                    local.size
-                                ),
-                            }
-                        }
-                    }
+                    Some("locals") => print_locals(&mut cpu, &locals_by_addr, &function_entries),
                     Some("globals") => {
                         if globals.is_empty() {
                             println!("No global debug symbols found.");
-                            continue;
                         }
                         for global in &globals {
-                            match read_debug32_virt(&mut cpu, global.addr) {
-                                Some(value) => println!(
+                            match read_debug_bytes_virt(&mut cpu, global.addr, 4) {
+                                Some(bytes) => println!(
                                     "{} @ {:08X} = {:08X}",
-                                    global.name, global.addr, value
+                                    global.name,
+                                    global.addr,
+                                    u32::from_le_bytes(bytes.try_into().unwrap())
                                 ),
-                                None => {
-                                    println!("{} @ {:08X} = <unmapped>", global.name, global.addr)
-                                }
+                                None => println!("{} @ {:08X} = <unmapped>", global.name, global.addr),
                             }
                         }
                     }
@@ -1636,8 +917,72 @@ impl Emulator {
                 _ => println!("Unknown command: {}", cmd),
             }
         }
+        Ok(cpu)
+    }
+}
 
-        cpu
+// Register selected by a debugger register token.
+#[derive(Clone, Copy)]
+enum DebugReg {
+    Pc,
+    Gpr(u32),
+    Creg(usize),
+}
+
+// Step until the source line changes, a breakpoint or halt is reached, or the
+// core sleeps/faults. With `step_over`, instructions executed in a deeper
+// frame (bp differs from the starting bp) never end the step.
+fn step_source_line(cpu: &mut Emulator, lines: &[DebugLine], breakpoints: &HashSet<u32>, step_over: bool) {
+    let start_line = line_for_pc(lines, cpu.pc);
+    let start_bp = cpu.get_reg(BP_REG);
+    for _ in 0..MAX_STEP_INSTRUCTIONS {
+        match cpu.step_instruction() {
+            StepOutcome::Executed { .. } => {}
+            StepOutcome::Sleeping => return println!("CPU sleeping; waiting for interrupt."),
+            StepOutcome::TlbMiss { pc } => return println!("TLB miss at {:08X}", pc),
+            StepOutcome::MisalignedPc { pc } => return println!("Misaligned PC {:08X}", pc),
+        }
+        if breakpoints.contains(&cpu.pc) {
+            return;
+        }
+        if step_over && cpu.get_reg(BP_REG) != start_bp {
+            continue;
+        }
+        if start_line.is_none() || !same_source_line(start_line, line_for_pc(lines, cpu.pc)) || cpu.halted {
+            return;
+        }
+    }
+    println!("Warning: step limit reached without leaving the current line.");
+}
+
+// Print the C locals in scope at the current PC, read relative to bp.
+fn print_locals(cpu: &mut Emulator, locals_by_addr: &[(u32, Vec<DebugLocal>)], function_entries: &[u32]) {
+    let Some(locals) = locals_for_pc(locals_by_addr, function_entries, cpu.pc) else {
+        let first = function_range_for_pc(function_entries, cpu.pc)
+            .and_then(|(start, end)| first_locals_addr_in_range(locals_by_addr, start, end));
+        match first {
+            Some(first_addr) if cpu.pc < first_addr => println!(
+                "Locals are not available yet; enter the function body (after prologue at {:08X}).",
+                first_addr
+            ),
+            _ => println!("No local variables found for current location."),
+        }
+        return;
+    };
+    let bp = i64::from(cpu.get_reg(BP_REG));
+    for local in locals {
+        let name = display_local_name(&local.name);
+        let addr = bp + i64::from(local.offset);
+        let Ok(addr) = u32::try_from(addr) else {
+            println!("{} @ <invalid> (offset {:+}, size {})", name, local.offset, local.size);
+            continue;
+        };
+        let value = read_debug_bytes_virt(cpu, addr, local.size)
+            .map_or("<unmapped>".to_string(), |bytes| format_bytes(&bytes));
+        println!(
+            "{} @ {:08X} (offset {:+}, size {}) = {}",
+            name, addr, local.offset, local.size, value
+        );
     }
 }
 
@@ -1673,5 +1018,26 @@ mod tests {
         assert_eq!(parse_watch_kind("rw"), Some(WatchKind::ReadWrite));
         assert_eq!(parse_watch_kind("wr"), Some(WatchKind::ReadWrite));
         assert_eq!(parse_watch_kind("x"), None);
+    }
+
+    // Register tokens resolve through the shared CREG_NAMES table; the old
+    // `isp` alias (which wrote TLBF) and `cdv` alias are gone.
+    #[test]
+    fn register_tokens_resolve_from_creg_table() {
+        assert!(matches!(Emulator::parse_register("ksp"), Some((_, DebugReg::Creg(8)))));
+        assert!(matches!(Emulator::parse_register("TLBF"), Some((_, DebugReg::Creg(12)))));
+        assert!(matches!(Emulator::parse_register("sp"), Some((_, DebugReg::Gpr(31)))));
+        assert!(matches!(Emulator::parse_register("cr12"), Some((_, DebugReg::Creg(12)))));
+        assert!(Emulator::parse_register("cr13").is_none());
+        assert!(Emulator::parse_register("isp").is_none());
+    }
+
+    // Binary-search helpers find the nearest entry at or below a PC.
+    #[test]
+    fn function_range_brackets_pc() {
+        let entries = [0x100, 0x200, 0x300];
+        assert_eq!(function_range_for_pc(&entries, 0x0FF), None);
+        assert_eq!(function_range_for_pc(&entries, 0x100), Some((0x100, Some(0x200))));
+        assert_eq!(function_range_for_pc(&entries, 0x3FF), Some((0x300, None)));
     }
 }

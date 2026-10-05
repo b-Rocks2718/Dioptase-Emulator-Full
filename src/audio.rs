@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use crate::memory::AUDIO_SAMPLE_RATE_HZ;
+use crate::memory::{AUDIO_SAMPLE_RATE_HZ, Memory};
 
 // Flush in larger chunks because the emulator produces bursty audio writes and
 // ffplay is more reliable when it can buffer a modest amount of PCM.
@@ -219,11 +220,10 @@ impl Drop for AudioOutput {
     fn drop(&mut self) {
         let buffered = self.writer_thread.is_some();
         self.sink.take();
-        if buffered {
-            if let Some(child) = self.child.as_mut() {
+        if buffered
+            && let Some(child) = self.child.as_mut() {
                 let _ = child.kill();
             }
-        }
         if let Some(writer_thread) = self.writer_thread.take() {
             let _ = writer_thread.join();
         }
@@ -298,6 +298,121 @@ fn ffplay_args() -> Vec<String> {
         "-i".to_string(),
         "pipe:0".to_string(),
     ]
+}
+
+// Host audio policy for emulator runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioMode {
+    // Do not start a host audio player. The MMIO audio device still advances on
+    // emulated device ticks so guest-visible timing stays intact.
+    Disabled,
+    // Mirror the emulated device output to the host player as core 0 advances
+    // the shared device tick.
+    Emulated,
+    // Drive the MMIO audio device from wall-clock time on a helper thread so
+    // host playback stays intelligible even when emulation is slow. This is an
+    // opt-in debugging mode because it changes guest-visible timing.
+    Fast,
+}
+
+// Wall-clock audio is consumed in 10 ms batches.
+const FAST_AUDIO_BATCH_SAMPLES: usize = (AUDIO_SAMPLE_RATE_HZ as usize) / 100;
+// Cap catch-up after a host stall so the worker never builds unbounded work.
+const FAST_AUDIO_MAX_CATCH_UP_BATCHES: usize = 8;
+
+// Owns the host player for a run and, in fast mode, the worker thread that
+// consumes the MMIO audio device on wall-clock time. Dropping it stops and
+// joins the worker before closing the player.
+pub struct AudioPlayback {
+    output: AudioOutput,
+    worker: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+}
+
+impl AudioPlayback {
+    // Start host playback for `requested_mode`. Returns the mode actually in
+    // effect: if the player cannot start, audio falls back to Disabled.
+    pub fn start(requested_mode: AudioMode, memory: Arc<Memory>) -> (AudioMode, Option<Self>) {
+        if requested_mode == AudioMode::Disabled {
+            return (AudioMode::Disabled, None);
+        }
+        let fast = requested_mode == AudioMode::Fast;
+        let output = match AudioOutput::start(fast) {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Warning: failed to start host audio output: {}", err);
+                return (AudioMode::Disabled, None);
+            }
+        };
+        let worker = fast.then(|| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn_fast_audio_worker(memory, output.shared_sink(), Arc::clone(&stop));
+            (stop, handle)
+        });
+        (requested_mode, Some(AudioPlayback { output, worker }))
+    }
+
+    // Sink that core 0 feeds on emulated ticks; None in wall-clock mode.
+    pub fn emulated_sink(&self) -> Option<Arc<AudioSink>> {
+        if self.worker.is_some() {
+            None
+        } else {
+            Some(self.output.shared_sink())
+        }
+    }
+}
+
+impl Drop for AudioPlayback {
+    fn drop(&mut self) {
+        if let Some((stop, handle)) = self.worker.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+    }
+}
+
+// Duration of `batch_count` wall-clock audio batches.
+fn audio_batch_duration(batch_count: usize) -> Duration {
+    Duration::from_nanos(
+        ((FAST_AUDIO_BATCH_SAMPLES as u64) * (batch_count as u64) * 1_000_000_000u64)
+            / (AUDIO_SAMPLE_RATE_HZ as u64),
+    )
+}
+
+// Consume MMIO audio samples in 10 ms wall-clock batches until `stop`.
+// Invariants:
+// - only this thread advances the audio consumer in fast mode (core 0 skips
+//   its emulated-tick audio path while this runs)
+// - catch-up is capped at FAST_AUDIO_MAX_CATCH_UP_BATCHES per wake-up
+fn spawn_fast_audio_worker(
+    memory: Arc<Memory>,
+    sink: Arc<AudioSink>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let batch_duration = audio_batch_duration(1);
+        let mut next_deadline = Instant::now() + batch_duration;
+        let mut batch =
+            Vec::with_capacity(FAST_AUDIO_BATCH_SAMPLES * FAST_AUDIO_MAX_CATCH_UP_BATCHES);
+
+        while !stop.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now < next_deadline {
+                thread::sleep(next_deadline.duration_since(now));
+                continue;
+            }
+            let late_batches = (now.duration_since(next_deadline).as_nanos()
+                / batch_duration.as_nanos().max(1)) as usize;
+            let mut batch_count = 1 + late_batches;
+            if batch_count > FAST_AUDIO_MAX_CATCH_UP_BATCHES {
+                batch_count = FAST_AUDIO_MAX_CATCH_UP_BATCHES;
+                next_deadline = now + batch_duration;
+            } else {
+                next_deadline += audio_batch_duration(batch_count);
+            }
+            memory.consume_audio_wallclock_samples(batch_count * FAST_AUDIO_BATCH_SAMPLES, &mut batch);
+            sink.write_samples(&batch);
+        }
+    })
 }
 
 #[cfg(test)]

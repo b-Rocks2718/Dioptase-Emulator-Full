@@ -14,7 +14,7 @@ use crate::memory::PHYSMEM_MAX;
 use super::program::ProgramImage;
 use super::{
     CREG_COUNT, CREG_NAMES, DebugInfo, DebugLine, DebugLocal, Emulator, LabelMap, StepOutcome,
-    WatchAccess, WatchKind, Watchpoint, WatchpointHit, load_program,
+    WatchAccess, WatchKind, Watchpoint, WatchpointHit, creg_defined, load_program,
 };
 
 // Upper bound on instructions per source-level step, so a step on a line
@@ -514,7 +514,8 @@ impl Emulator {
         }
         for row in [0..5, 5..9, 9..CREG_COUNT] {
             let cells: Vec<String> = row
-                .map(|i| format!("{}: {:08X}", CREG_NAMES[i].to_ascii_uppercase(), self.read_creg(i)))
+                .filter_map(|i| CREG_NAMES[i].map(|name| (i, name)))
+                .map(|(i, name)| format!("{}: {:08X}", name.to_ascii_uppercase(), self.read_creg(i)))
                 .collect();
             println!("{}", cells.join(" "));
         }
@@ -524,7 +525,9 @@ impl Emulator {
     fn print_cregs(&self) {
         println!("kmode: {}", self.get_kmode());
         for (i, name) in CREG_NAMES.iter().enumerate() {
-            println!("cr{} ({}): {:08X}", i, name, self.read_creg(i));
+            if let Some(name) = name {
+                println!("cr{} ({}): {:08X}", i, name, self.read_creg(i));
+            }
         }
     }
 
@@ -538,11 +541,11 @@ impl Emulator {
         if let Some(&(name, reg)) = GPR_ALIASES.iter().find(|(name, _)| *name == token) {
             return Some((format!("{} (r{})", name, reg), DebugReg::Gpr(reg)));
         }
-        if let Some(idx) = CREG_NAMES.iter().position(|name| *name == token) {
+        if let Some(idx) = CREG_NAMES.iter().position(|name| *name == Some(token.as_str())) {
             return Some((format!("{} (cr{})", token, idx), DebugReg::Creg(idx)));
         }
         if let Some(idx) = token.strip_prefix("cr").and_then(|n| n.parse::<usize>().ok()) {
-            return (idx < CREG_COUNT).then(|| (token.clone(), DebugReg::Creg(idx)));
+            return creg_defined(idx).then(|| (token.clone(), DebugReg::Creg(idx)));
         }
         if let Some(idx) = token.strip_prefix('r').and_then(|n| n.parse::<u32>().ok()) {
             return (idx < 32).then(|| (token.clone(), DebugReg::Gpr(idx)));
@@ -1029,6 +1032,8 @@ mod tests {
         assert!(matches!(Emulator::parse_register("sp"), Some((_, DebugReg::Gpr(31)))));
         assert!(matches!(Emulator::parse_register("cr12"), Some((_, DebugReg::Creg(12)))));
         assert!(Emulator::parse_register("cr13").is_none());
+        assert!(Emulator::parse_register("cr10").is_none(), "cr10 is reserved");
+        assert!(Emulator::parse_register("mbo").is_none(), "the IPI mailboxes were removed");
         assert!(Emulator::parse_register("isp").is_none());
     }
 

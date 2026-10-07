@@ -342,12 +342,11 @@ fn disassemble_kernel(instr: u32) -> String {
             }
         }
         4 => {
-            let r_a = (instr >> 22) & 0x1F;
             let all = ((instr >> 11) & 1) != 0;
             if all {
-                format!("ipi {}, all", reg_name(r_a))
+                "ipi all".to_string()
             } else {
-                format!("ipi {}, {}", reg_name(r_a), instr & 0x3)
+                format!("ipi {}", instr & 0x3)
             }
         }
         5 => {
@@ -391,6 +390,13 @@ mod tests {
     fn disassembles_eoi_specific() {
         let instr = (OPC_PRIVILEGED << 27) | (5u32 << 12) | 6u32;
         assert_eq!(disassemble(instr), "eoi 6");
+    }
+
+    // ipi has no result register, so rA must not appear in the output.
+    #[test]
+    fn disassembles_ipi_without_result_register() {
+        assert_eq!(disassemble((OPC_PRIVILEGED << 27) | (4 << 12) | 2), "ipi 2");
+        assert_eq!(disassemble((OPC_PRIVILEGED << 27) | (4 << 12) | (1 << 11)), "ipi all");
     }
 
     // Decode the EOI-all control bit as the dedicated mnemonic form.

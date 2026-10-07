@@ -73,14 +73,21 @@ const CREG_EFG: usize = 6;
 const CREG_TLB: usize = 7;
 const CREG_KSP: usize = 8;
 const CREG_CID: usize = 9;
-const CREG_MBI: usize = 10;
-const CREG_MBO: usize = 11;
 const CREG_TLBF: usize = 12;
+// One past the highest architectural control register; cr10 and cr11 are
+// reserved holes inside this range.
 const CREG_COUNT: usize = 13;
-// Debugger names for each control register, by index.
-const CREG_NAMES: [&str; CREG_COUNT] = [
-    "psr", "pid", "isr", "imr", "epc", "flg", "efg", "tlb", "ksp", "cid", "mbi", "mbo", "tlbf",
+// Debugger names for each control register, by index. `None` marks a reserved
+// number (cr10/cr11, formerly the IPI mailboxes) that crmv rejects.
+const CREG_NAMES: [Option<&str>; CREG_COUNT] = [
+    Some("psr"), Some("pid"), Some("isr"), Some("imr"), Some("epc"), Some("flg"),
+    Some("efg"), Some("tlb"), Some("ksp"), Some("cid"), None, None, Some("tlbf"),
 ];
+
+// Whether `idx` names a control register defined by docs/ISA.md.
+fn creg_defined(idx: usize) -> bool {
+    CREG_NAMES.get(idx).is_some_and(|name| name.is_some())
+}
 
 // IMR[31] globally enables interrupts.
 const IMR_GLOBAL_ENABLE: u32 = 1 << 31;
@@ -371,9 +378,6 @@ impl Emulator {
         let core = self.core_id as usize;
         let old = self.cregfile[CREG_ISR];
         let pending = self.interrupts.peek_pending(core);
-        if pending & IPI_INTERRUPT_BIT != 0 {
-            self.cregfile[CREG_MBI] = self.interrupts.read_ipi_payload(core);
-        }
         self.cregfile[CREG_ISR] = value | pending;
         let cleared = old & !self.cregfile[CREG_ISR];
         if cleared != 0 {
@@ -459,10 +463,6 @@ impl Emulator {
         }
         let pending = self.interrupts.take_pending(core);
         if pending != 0 {
-            // IPI payloads are copied into the core-local MBI register.
-            if pending & IPI_INTERRUPT_BIT != 0 {
-                self.cregfile[CREG_MBI] = self.interrupts.read_ipi_payload(core);
-            }
             self.cregfile[CREG_ISR] |= pending;
         }
     }
@@ -1010,15 +1010,15 @@ impl Emulator {
 
     // crmv between general and control registers. crmv uses the raw register
     // file, so r31 is not aliased to KSP here.
-    // Control-register numbers past TLBF are not defined by docs/ISA.md; they
-    // raise invalid-instruction (the original model indexed out of bounds and
-    // crashed the emulator).
+    // Control-register numbers past TLBF, and the reserved cr10/cr11, are not
+    // defined by docs/ISA.md; they raise invalid-instruction (the original
+    // model indexed out of bounds and crashed the emulator).
     fn crmv_op(&mut self, instr: u32, sub: u32) {
         let ra = field_a(instr) as usize;
         let rb = field_b(instr) as usize;
         let a_is_creg = matches!(sub, 0 | 2);
         let b_is_creg = matches!(sub, 1 | 2);
-        if (a_is_creg && ra >= CREG_COUNT) || (b_is_creg && rb >= CREG_COUNT) {
+        if (a_is_creg && !creg_defined(ra)) || (b_is_creg && !creg_defined(rb)) {
             return self.raise_invalid_instruction();
         }
         match sub {
@@ -1031,15 +1031,14 @@ impl Emulator {
         self.advance();
     }
 
-    // ipi: send MBO to one core (rA <- 1 on success) or all cores (rA <- mask).
+    // ipi: interrupt one core or all cores. IPIs carry no payload, always
+    // succeed, and write no register; the rA field is ignored.
     fn ipi_op(&mut self, instr: u32) {
-        let payload = self.cregfile[CREG_MBO];
-        let result = if (instr >> 11) & 1 != 0 {
-            self.interrupts.send_ipi_all(payload)
+        if (instr >> 11) & 1 != 0 {
+            self.interrupts.send_ipi_all();
         } else {
-            u32::from(self.interrupts.send_ipi((instr & 0x3) as usize, payload))
-        };
-        self.write_reg(field_a(instr), result);
+            self.interrupts.send_ipi((instr & 0x3) as usize);
+        }
         self.advance();
     }
 
@@ -1112,17 +1111,13 @@ mod tests {
     fn write_isr_preserves_concurrently_pending_ipi() {
         let (mut cpu, interrupts) = test_core(2);
         cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT;
-        assert!(interrupts.send_ipi(0, 0x1234_5678));
+        interrupts.send_ipi(0);
 
         cpu.write_isr(0);
 
         assert_eq!(
             cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "writing ISR to clear one interrupt must preserve a concurrently pending IPI",
-        );
-        assert_eq!(
-            cpu.cregfile[CREG_MBI], 0x1234_5678,
-            "MBI must reflect the visible pending IPI payload",
         );
 
         cpu.collect_interrupts();
@@ -1131,89 +1126,91 @@ mod tests {
             cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "taking the queued pending IPI on the next tick must not change the visible ISR bit",
         );
-        assert_eq!(
-            cpu.cregfile[CREG_MBI], 0x1234_5678,
-            "the queued IPI payload must remain stable after the next tick snapshots it",
-        );
     }
 
-    // Reject a second IPI until the target acknowledges the outstanding one.
+    // A second IPI before eoi merges into the first: the handler sees one
+    // interrupt, and eoi clears both. An IPI after eoi raises a new one.
     #[test]
-    fn send_ipi_fails_until_target_acknowledges_ipi() {
+    fn ipi_merges_until_target_acknowledges() {
         let (mut cpu, interrupts) = test_core(1);
 
-        assert!(interrupts.send_ipi(0, 0x1111_2222));
-        assert!(
-            !interrupts.send_ipi(0, 0x3333_4444),
-            "a second IPI to the same core must fail while the first payload is pending",
-        );
-
+        interrupts.send_ipi(0);
+        cpu.collect_interrupts();
+        interrupts.send_ipi(0);
         cpu.collect_interrupts();
 
         assert_eq!(
             cpu.cregfile[CREG_ISR] & IPI_INTERRUPT_BIT,
             IPI_INTERRUPT_BIT,
-            "the first IPI must remain visible in ISR until eoi 5",
-        );
-        assert_eq!(
-            cpu.cregfile[CREG_MBI], 0x1111_2222,
-            "a failed second IPI must not overwrite the first payload",
-        );
-        assert!(
-            !interrupts.send_ipi(0, 0x5555_6666),
-            "IPI delivery must remain busy after the target snapshots ISR but before eoi",
+            "an IPI sent while the IPI bit is active must merge, not fail or queue",
         );
 
-        let eoi_ipi = (OPC_PRIVILEGED << 27) | (5u32 << 12) | 5;
-        cpu.eoi_op(eoi_ipi);
+        cpu.eoi_op((OPC_PRIVILEGED << 27) | (5u32 << 12) | 5);
 
         assert_eq!(
             cpu.cregfile[CREG_ISR] & IPI_INTERRUPT_BIT,
             0,
-            "eoi 5 must clear the active IPI ISR bit",
-        );
-        assert!(
-            interrupts.send_ipi(0, 0x7777_8888),
-            "IPI delivery must reopen after the target acknowledges the IPI",
+            "eoi 5 must clear the merged IPI as a single interrupt",
         );
 
+        interrupts.send_ipi(0);
         cpu.collect_interrupts();
 
         assert_eq!(
-            cpu.cregfile[CREG_MBI], 0x7777_8888,
-            "the next successful IPI must deliver its own payload",
+            cpu.cregfile[CREG_ISR] & IPI_INTERRUPT_BIT,
+            IPI_INTERRUPT_BIT,
+            "an IPI sent after eoi must raise a new interrupt",
         );
     }
 
-    // Report only targets that accept an IPI-all broadcast.
+    // ipi all reaches every core, including the sender and cores that already
+    // have an IPI pending; ipi to a nonexistent core is dropped.
     #[test]
-    fn ipi_all_reports_only_cores_without_outstanding_ipi() {
+    fn ipi_all_reaches_every_core_and_missing_target_is_dropped() {
         let interrupts = InterruptController::new(3, false);
 
-        assert!(interrupts.send_ipi(1, 0xAAAA_0001));
+        interrupts.send_ipi(1);
+        interrupts.send_ipi_all();
+        interrupts.send_ipi(3);
 
-        let mask = interrupts.send_ipi_all(0xBBBB_0002);
+        for core in 0..3 {
+            assert_eq!(
+                interrupts.take_pending(core),
+                IPI_INTERRUPT_BIT,
+                "ipi all must leave exactly the IPI bit pending on core {core}",
+            );
+        }
+    }
 
-        assert_eq!(
-            mask,
-            (1u32 << 0) | (1u32 << 2),
-            "ipi all must report success only for cores without an outstanding IPI",
-        );
-        assert_eq!(
-            interrupts.read_ipi_payload(1),
-            0xAAAA_0001,
-            "ipi all must not overwrite the payload for a core whose IPI is still pending",
-        );
-        assert_eq!(
-            interrupts.read_ipi_payload(0),
-            0xBBBB_0002,
-            "ipi all must deliver to available cores, including core 0",
-        );
-        assert_eq!(
-            interrupts.read_ipi_payload(2),
-            0xBBBB_0002,
-            "ipi all must deliver the payload to every other available core",
-        );
+    // ipi writes no register, so a nonzero rA field must leave that register
+    // unchanged (encodings from the old `ipi rA, n` form still decode).
+    #[test]
+    fn ipi_ignores_ra_field() {
+        let (mut cpu, interrupts) = test_core(2);
+        cpu.regfile[3] = 0xDEAD_BEEF;
+
+        cpu.execute((OPC_PRIVILEGED << 27) | (3u32 << 22) | (4u32 << 12) | 1);
+
+        assert_eq!(cpu.regfile[3], 0xDEAD_BEEF, "ipi must not write rA");
+        assert_eq!(interrupts.peek_pending(1), IPI_INTERRUPT_BIT, "ipi 1 must reach core 1");
+    }
+
+    // cr10 and cr11 (the removed IPI mailboxes) are reserved, so crmv to or
+    // from them must raise invalid-instruction rather than act as scratch.
+    #[test]
+    fn crmv_reserved_creg_raises_invalid_instruction() {
+        for (creg, sub) in [(10u32, 0u32), (11, 0), (10, 1), (11, 1)] {
+            let (mut cpu, _) = test_core(1);
+            cpu.pc = 0x400;
+            let (a, b) = if sub == 0 { (creg, 1) } else { (1, creg) };
+            let instr = (OPC_PRIVILEGED << 27) | (a << 22) | (b << 17) | (1u32 << 12) | (sub << 10);
+            cpu.execute(instr);
+            assert_eq!(
+                (cpu.cregfile[CREG_PSR], cpu.cregfile[CREG_EPC]),
+                (2, 0x400),
+                "crmv sub {sub} on reserved cr{creg} must enter the invalid-instruction handler",
+            );
+        }
     }
 
     // Ignore CRMV writes to the read-only ISR control register.
@@ -1251,17 +1248,13 @@ mod tests {
     fn eoi_all_preserves_concurrently_pending_ipi() {
         let (mut cpu, interrupts) = test_core(2);
         cpu.cregfile[CREG_ISR] = TIMER_INTERRUPT_BIT | SD_TEST_BIT;
-        assert!(interrupts.send_ipi(0, 0xCAFE_BABE));
+        interrupts.send_ipi(0);
 
         cpu.eoi_op((OPC_PRIVILEGED << 27) | (5u32 << 12) | (1u32 << 11));
 
         assert_eq!(
             cpu.cregfile[CREG_ISR], IPI_INTERRUPT_BIT,
             "eoi all must clear handled ISR bits without dropping a concurrently pending IPI",
-        );
-        assert_eq!(
-            cpu.cregfile[CREG_MBI], 0xCAFE_BABE,
-            "eoi all must expose the visible pending IPI payload in MBI",
         );
     }
 

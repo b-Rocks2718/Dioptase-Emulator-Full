@@ -23,7 +23,7 @@ core0:
   swa  r0 [r6, 0]
 
   # Wake core1 so both cores race on the counter update.
-  ipi  r7, 1
+  ipi  1
 
   # Load counter, then signal ready0.
   lwa  r8 [r4, 0]

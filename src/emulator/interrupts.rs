@@ -1,12 +1,11 @@
 // Interrupt controller shared by all cores: per-core pending bits, IPI
-// mailboxes, and round-robin routing of device interrupts.
+// delivery, and round-robin routing of device interrupts.
 //
-// Concurrency: `pending`, `ipi_payload`, and `ipi_inflight` are lock-free
-// per-core atomics. Any core may set bits for any core; only the owning core
+// Concurrency: `pending` is a lock-free per-core atomic. Any core may set bits for any core; only the owning core
 // takes (clears) its own pending bits. Routing cursors live behind `routes`.
 // All atomics use SeqCst.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::memory::{AUDIO_INTERRUPT_BIT, SD2_INTERRUPT_BIT, SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT};
@@ -65,17 +64,14 @@ struct RouteState {
     input_inflight: Option<usize>,
 }
 
-// Per-core pending-interrupt state and inter-processor interrupt mailboxes.
+// Per-core pending-interrupt state and inter-processor interrupt delivery.
+// IPIs carry no payload and always succeed; one sent while the target's IPI
+// bit is already set merges into it (docs/ISA.md "Inter-processor interrupts").
 pub(super) struct InterruptController {
     cores: usize,
     // Keyboard or UART line, fixed for the run by `--uart`.
     input_bit: u32,
     pending: Vec<CacheLine<AtomicU32>>,
-    // Payload copied into the target's MBI when the IPI becomes visible.
-    ipi_payload: Vec<AtomicU32>,
-    // One outstanding IPI per target: set on a successful send, cleared when
-    // the target acknowledges the IPI ISR bit.
-    ipi_inflight: Vec<AtomicBool>,
     routes: Mutex<RouteState>,
 }
 
@@ -86,8 +82,6 @@ impl InterruptController {
             cores,
             input_bit: if use_uart_rx { UART_INTERRUPT_BIT } else { KB_INTERRUPT_BIT },
             pending: (0..cores).map(|_| CacheLine(AtomicU32::new(0))).collect(),
-            ipi_payload: (0..cores).map(|_| AtomicU32::new(0)).collect(),
-            ipi_inflight: (0..cores).map(|_| AtomicBool::new(false)).collect(),
             routes: Mutex::new(RouteState {
                 next_device: [0; ROUTED_DEVICE_BITS.len()],
                 next_input: 0,
@@ -116,34 +110,19 @@ impl InterruptController {
         slot.swap(0, Ordering::SeqCst)
     }
 
-    // Payload of the IPI most recently sent to `core`.
-    pub(super) fn read_ipi_payload(&self, core: usize) -> u32 {
-        self.ipi_payload[core].load(Ordering::SeqCst)
+    // Raise the IPI line on one target. A target past the configured core
+    // count does not exist, so the IPI is dropped.
+    pub(super) fn send_ipi(&self, target: usize) {
+        if target < self.cores {
+            self.set_pending_bits(target, IPI_INTERRUPT_BIT);
+        }
     }
 
-    // Queue an IPI for one target. Fails if the target is out of range or
-    // still has an unacknowledged IPI, in which case its payload is untouched.
-    pub(super) fn send_ipi(&self, target: usize, value: u32) -> bool {
-        if target >= self.cores {
-            return false;
+    // Raise the IPI line on every core, including the sender.
+    pub(super) fn send_ipi_all(&self) {
+        for core in 0..self.cores {
+            self.set_pending_bits(core, IPI_INTERRUPT_BIT);
         }
-        if self.ipi_inflight[target]
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return false;
-        }
-        // The payload must be visible before the ISR bit that announces it.
-        self.ipi_payload[target].store(value, Ordering::SeqCst);
-        self.set_pending_bits(target, IPI_INTERRUPT_BIT);
-        true
-    }
-
-    // Queue an IPI for every core and return the mask of cores that accepted.
-    pub(super) fn send_ipi_all(&self, value: u32) -> u32 {
-        (0..self.cores)
-            .filter(|&core| self.send_ipi(core, value))
-            .fold(0, |mask, core| mask | (1 << core))
     }
 
     // Route the input interrupt to the next core while input is queued and no
@@ -184,17 +163,14 @@ impl InterruptController {
         }
     }
 
-    // Record that `core` cleared ISR bits, reopening input routing and IPI
-    // delivery for that core when their bits were among the cleared ones.
+    // Record that `core` cleared ISR bits, reopening input routing for that
+    // core when the input bit was among the cleared ones.
     pub(super) fn acknowledge(&self, core: usize, cleared_bits: u32) {
         if cleared_bits & self.input_bit != 0 {
             let mut routes = self.routes.lock().unwrap();
             if routes.input_inflight == Some(core) {
                 routes.input_inflight = None;
             }
-        }
-        if cleared_bits & IPI_INTERRUPT_BIT != 0 {
-            self.ipi_inflight[core].store(false, Ordering::SeqCst);
         }
     }
 }

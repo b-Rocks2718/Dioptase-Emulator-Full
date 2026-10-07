@@ -21,7 +21,7 @@ core0:
   swa  r0 [r5, 0]
 
   # Wake core1 so both cores perform atomic adds.
-  ipi  r6, 1
+  ipi  1
 
   # Atomic increment of the shared counter.
   add  r7 r0 1

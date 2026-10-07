@@ -190,7 +190,7 @@ _start:
   # core 0 does some initialization
 
   # wake up other cores
-  ipi  r0, all
+  ipi  all
 
   # set timer
   movi r4, PIT_ADDR

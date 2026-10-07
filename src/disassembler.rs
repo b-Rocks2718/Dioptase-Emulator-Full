@@ -1,5 +1,7 @@
 // Decode Dioptase instruction words into canonical assembler syntax.
 
+use crate::isa::*;
+
 // Sign-extend the low `bits` bits of `value`.
 fn sign_extend(value: u32, bits: u8) -> i32 {
     let shift = 32 - bits;
@@ -27,13 +29,13 @@ fn fmt_imm_signed(value: i32) -> String {
 }
 
 // Map the encoded ALU operation index to its mnemonic (docs/ISA.md ALU ops).
-// Immediate forms only exist for ops 0..=17.
+// Immediate forms only exist for ops up to `OP_SUBB`.
 fn alu_op_name(op: u32, imm_form: bool) -> Option<&'static str> {
-    const OPS: [&str; 22] = [
+    const OPS: [&str; OP_TNCD as usize + 1] = [
         "and", "nand", "or", "nor", "xor", "xnor", "not", "lsl", "lsr", "asr", "rotl", "rotr",
         "lslc", "lsrc", "add", "addc", "sub", "subb", "sxtb", "sxtd", "tncb", "tncd",
     ];
-    if imm_form && op > 17 {
+    if imm_form && op > OP_SUBB {
         return None;
     }
     OPS.get(op as usize).copied()
@@ -41,7 +43,7 @@ fn alu_op_name(op: u32, imm_form: bool) -> Option<&'static str> {
 
 // Single-source ALU ops print as `op rA, rC`.
 fn is_unary_alu_op(op: u32) -> bool {
-    op == 6 || (18..=21).contains(&op)
+    op == OP_NOT || (OP_SXTB..=OP_TNCD).contains(&op)
 }
 
 // Map the encoded relative-branch condition to its mnemonic.
@@ -65,11 +67,11 @@ fn branch_abs_name(op: u32) -> Option<&'static str> {
 // Format the ALU immediate: byte-lane hex for bitwise ops, a 5-bit amount
 // for shifts, and signed decimal for arithmetic.
 fn decode_alu_imm(op: u32, imm: u32) -> String {
-    if op <= 6 {
+    if op <= OP_NOT {
         let shift = 8 * ((imm >> 8) & 3);
         return fmt_imm_hex((imm & 0xFF) << shift);
     }
-    if op <= 13 {
+    if op <= OP_LSRC {
         return format!("{}", imm & 0x1F);
     }
     fmt_imm_signed(sign_extend(imm & 0xFFF, 12))
@@ -90,7 +92,7 @@ fn disassemble_alu_reg(instr: u32) -> String {
         return format!("{} {}, {}", name, reg_name(r_a), reg_name(r_c));
     }
 
-    if op == 16 && r_a == 0 {
+    if op == OP_SUB && r_a == 0 {
         return format!("cmp {}, {}", reg_name(r_b), reg_name(r_c));
     }
 
@@ -116,11 +118,11 @@ fn disassemble_alu_imm(instr: u32) -> String {
 
     let imm_str = decode_alu_imm(op, imm);
 
-    if op == 6 {
+    if op == OP_NOT {
         return format!("{} {}, {}", name, reg_name(r_a), imm_str);
     }
 
-    if op == 16 && r_a == 0 {
+    if op == OP_SUB && r_a == 0 {
         return format!("cmp {}, {}", reg_name(r_b), imm_str);
     }
 
@@ -136,7 +138,7 @@ fn disassemble_lui(instr: u32) -> String {
 
 // Disassemble a load or store instruction and select its addressing form.
 fn disassemble_mem(opcode: u32, instr: u32) -> String {
-    let group = opcode - 3;
+    let group = opcode - OPC_MEM_WORD_ABS;
     let width_type = group / 3;
     let addr_type = group % 3;
 
@@ -253,9 +255,9 @@ fn disassemble_trap(instr: u32) -> String {
 
 // Disassemble an atomic arithmetic or swap instruction.
 fn disassemble_atomic(opcode: u32, instr: u32) -> String {
-    let is_fadd = opcode <= 18;
-    let is_absolute = opcode == 16 || opcode == 19;
-    let is_imm = opcode == 18 || opcode == 21;
+    let is_fadd = opcode <= OPC_FETCH_ADD_IMM;
+    let is_absolute = opcode == OPC_FETCH_ADD_ABS || opcode == OPC_SWAP_ABS;
+    let is_imm = opcode == OPC_FETCH_ADD_IMM || opcode == OPC_SWAP_IMM;
 
     let mnemonic = if is_fadd {
         if is_absolute { "fada" } else { "fad" }
@@ -364,17 +366,17 @@ fn disassemble_kernel(instr: u32) -> String {
 pub fn disassemble(instr: u32) -> String {
     let opcode = instr >> 27;
     match opcode {
-        0 => disassemble_alu_reg(instr),
-        1 => disassemble_alu_imm(instr),
-        2 => disassemble_lui(instr),
-        3..=11 => disassemble_mem(opcode, instr),
-        12 => disassemble_branch_imm(instr),
-        13 => disassemble_branch_abs(instr),
-        14 => disassemble_branch_rel(instr),
-        15 => disassemble_trap(instr),
-        22 => disassemble_adpc(instr),
-        16..=21 => disassemble_atomic(opcode, instr),
-        31 => disassemble_kernel(instr),
+        OPC_ALU => disassemble_alu_reg(instr),
+        OPC_ALU_IMM => disassemble_alu_imm(instr),
+        OPC_LUI => disassemble_lui(instr),
+        OPC_MEM_WORD_ABS..=OPC_MEM_BYTE_IMM => disassemble_mem(opcode, instr),
+        OPC_BRANCH_IMM => disassemble_branch_imm(instr),
+        OPC_BRANCH_ABS_REG => disassemble_branch_abs(instr),
+        OPC_BRANCH_REL_REG => disassemble_branch_rel(instr),
+        OPC_TRAP => disassemble_trap(instr),
+        OPC_ADPC => disassemble_adpc(instr),
+        OPC_FETCH_ADD_ABS..=OPC_SWAP_IMM => disassemble_atomic(opcode, instr),
+        OPC_PRIVILEGED => disassemble_kernel(instr),
         _ => format!("data {}", fmt_imm_hex(instr)),
     }
 }
@@ -382,33 +384,34 @@ pub fn disassemble(instr: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::disassemble;
+    use crate::isa::{OPC_PRIVILEGED, OP_SXTB, OP_TNCD};
 
     // Decode an indexed EOI without confusing it with the all-sources form.
     #[test]
     fn disassembles_eoi_specific() {
-        let instr = (31u32 << 27) | (5u32 << 12) | 6u32;
+        let instr = (OPC_PRIVILEGED << 27) | (5u32 << 12) | 6u32;
         assert_eq!(disassemble(instr), "eoi 6");
     }
 
     // Decode the EOI-all control bit as the dedicated mnemonic form.
     #[test]
     fn disassembles_eoi_all() {
-        let instr = (31u32 << 27) | (5u32 << 12) | (1u32 << 11);
+        let instr = (OPC_PRIVILEGED << 27) | (5u32 << 12) | (1u32 << 11);
         assert_eq!(disassemble(instr), "eoi all");
     }
 
     // Name the sign-extend/truncate ops (op 18 used to print as `mul`).
     #[test]
     fn disassembles_extend_and_truncate_ops() {
-        assert_eq!(disassemble((2 << 22) | 3 | (18 << 5)), "sxtb r2, r3");
-        assert_eq!(disassemble((2 << 22) | 3 | (21 << 5)), "tncd r2, r3");
+        assert_eq!(disassemble((2 << 22) | 3 | (OP_SXTB << 5)), "sxtb r2, r3");
+        assert_eq!(disassemble((2 << 22) | 3 | (OP_TNCD << 5)), "tncd r2, r3");
         assert_eq!(disassemble(0x08812000), "data 0x08812000");
     }
 
     // Keep the reserved alternate RFE encoding visible as raw data.
     #[test]
     fn disassembles_reserved_alt_rfe_encoding_as_data() {
-        let instr = (31u32 << 27) | (3u32 << 12) | (1u32 << 11);
+        let instr = (OPC_PRIVILEGED << 27) | (3u32 << 12) | (1u32 << 11);
         assert_eq!(disassemble(instr), "data 0xF8003800");
     }
 }

@@ -15,13 +15,12 @@
 // Zero/sign/overflow are derived by the caller from the result (see
 // `overflow`), so they are not part of `AluOutput`.
 
-// Highest register-form ALU op (tncd); docs/ISA.md lists ops 0..=21.
-const MAX_REG_OP: u32 = 21;
-// Highest immediate-form ALU op (subb); docs/ISA.md lists ops 0..=17.
-const MAX_IMM_OP: u32 = 17;
+use crate::isa::*;
 
-pub(super) const OP_SUB: u32 = 16;
-pub(super) const OP_SUBB: u32 = 17;
+// Highest register-form ALU op.
+const MAX_REG_OP: u32 = OP_TNCD;
+// Highest immediate-form ALU op.
+const MAX_IMM_OP: u32 = OP_SUBB;
 
 // Value written back plus the carry flag the operation produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +41,9 @@ pub(super) fn sign_extend(value: u32, bits: u32) -> u32 {
 // form, which must raise an invalid-instruction exception.
 pub(super) fn decode_imm(op: u32, imm: u32) -> Option<u32> {
     match op {
-        0..=6 => Some((imm & 0xFF) << (8 * ((imm >> 8) & 3))),
-        7..=13 => Some(imm & 0x1F),
-        14..=MAX_IMM_OP => Some(sign_extend(imm & 0xFFF, 12)),
+        OP_AND..=OP_NOT => Some((imm & 0xFF) << (8 * ((imm >> 8) & 3))),
+        OP_LSL..=OP_LSRC => Some(imm & 0x1F),
+        OP_ADD..=OP_SUBB => Some(sign_extend(imm & 0xFFF, 12)),
         _ => None,
     }
 }
@@ -91,49 +90,49 @@ pub(super) fn evaluate(op: u32, lhs: u32, rhs: u32, carry_in: bool, imm_form: bo
     let c = u32::from(carry_in);
     let plain = |value: u32| AluOutput { value, carry: false };
     let out = match op {
-        0 => plain(lhs & rhs),
-        1 => plain(!(lhs & rhs)),
-        2 => plain(lhs | rhs),
-        3 => plain(!(lhs | rhs)),
-        4 => plain(lhs ^ rhs),
-        5 => plain(!(lhs ^ rhs)),
-        6 => plain(!rhs),
-        7 => AluOutput {
+        OP_AND => plain(lhs & rhs),
+        OP_NAND => plain(!(lhs & rhs)),
+        OP_OR => plain(lhs | rhs),
+        OP_NOR => plain(!(lhs | rhs)),
+        OP_XOR => plain(lhs ^ rhs),
+        OP_XNOR => plain(!(lhs ^ rhs)),
+        OP_NOT => plain(!rhs),
+        OP_LSL => AluOutput {
             value: shl(lhs, rhs),
             carry: lost_left(lhs, rhs),
         },
-        8 => AluOutput {
+        OP_LSR => AluOutput {
             value: shr(lhs, rhs),
             carry: lost_right(lhs, rhs),
         },
-        9 => AluOutput {
+        OP_ASR => AluOutput {
             value: ((lhs as i32) >> rhs.min(31)) as u32,
             carry: lost_right(lhs, rhs),
         },
-        10 => AluOutput {
+        OP_ROTL => AluOutput {
             value: lhs.rotate_left(rhs % 32),
             carry: lost_left(lhs, rhs % 32),
         },
-        11 => AluOutput {
+        OP_ROTR => AluOutput {
             value: lhs.rotate_right(rhs % 32),
             carry: lost_right(lhs, rhs % 32),
         },
-        12 => {
+        OP_LSLC => {
             let carry_bit = if (1..=32).contains(&rhs) { c << (rhs - 1) } else { 0 };
             AluOutput {
                 value: shl(lhs, rhs) | carry_bit,
                 carry: lost_left(lhs, rhs),
             }
         }
-        13 => {
+        OP_LSRC => {
             let carry_bit = if (1..=32).contains(&rhs) { c << (32 - rhs) } else { 0 };
             AluOutput {
                 value: shr(lhs, rhs) | carry_bit,
                 carry: lost_right(lhs, rhs),
             }
         }
-        14 | 15 => {
-            let carry_add = if op == 15 { u64::from(c) } else { 0 };
+        OP_ADD | OP_ADDC => {
+            let carry_add = if op == OP_ADDC { u64::from(c) } else { 0 };
             let wide = u64::from(lhs) + u64::from(rhs) + carry_add;
             AluOutput {
                 value: wide as u32,
@@ -148,10 +147,11 @@ pub(super) fn evaluate(op: u32, lhs: u32, rhs: u32, carry_in: bool, imm_form: bo
                 subtract(lhs, rhs, borrow_in)
             }
         }
-        18 => plain(sign_extend(rhs & 0xFF, 8)),
-        19 => plain(sign_extend(rhs & 0xFFFF, 16)),
-        20 => plain(rhs & 0xFF),
-        _ => plain(rhs & 0xFFFF),
+        OP_SXTB => plain(sign_extend(rhs & 0xFF, 8)),
+        OP_SXTD => plain(sign_extend(rhs & 0xFFFF, 16)),
+        OP_TNCB => plain(rhs & 0xFF),
+        OP_TNCD => plain(rhs & 0xFFFF),
+        _ => unreachable!("alu: op {op} passed the MAX_REG_OP/MAX_IMM_OP bound check but has no match arm"),
     };
     Some(out)
 }
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn shift_by_zero_is_identity_with_clear_carry() {
-        for op in 7..=13 {
+        for op in OP_LSL..=OP_LSRC {
             for carry_in in [false, true] {
                 let out = evaluate(op, 0x8000_0010, 0, carry_in, false).unwrap();
                 assert_eq!(out.value, 0x8000_0010, "op {op} by 0 must not change the value");
@@ -201,48 +201,48 @@ mod tests {
 
     #[test]
     fn carry_reflects_any_shifted_out_bit() {
-        assert!(reg(7, 0x4000_0000, 2).carry);
-        assert!(!reg(7, 0x2000_0000, 2).carry);
-        assert!(reg(8, 0b10, 2).carry);
-        assert!(!reg(8, 0b100, 2).carry);
-        assert!(reg(9, 0x8000_0001, 1).carry, "asr carry comes from shifted-out low bits");
-        assert!(!reg(9, 0x8000_0000, 1).carry, "asr carry must not just copy bit 0 of a wider shift");
-        assert!(reg(10, 0x8000_0000, 1).carry);
-        assert!(reg(11, 1, 1).carry);
+        assert!(reg(OP_LSL, 0x4000_0000, 2).carry);
+        assert!(!reg(OP_LSL, 0x2000_0000, 2).carry);
+        assert!(reg(OP_LSR, 0b10, 2).carry);
+        assert!(!reg(OP_LSR, 0b100, 2).carry);
+        assert!(reg(OP_ASR, 0x8000_0001, 1).carry, "asr carry comes from shifted-out low bits");
+        assert!(!reg(OP_ASR, 0x8000_0000, 1).carry, "asr carry must not just copy bit 0 of a wider shift");
+        assert!(reg(OP_ROTL, 0x8000_0000, 1).carry);
+        assert!(reg(OP_ROTR, 1, 1).carry);
     }
 
     #[test]
     fn logical_shifts_of_32_or_more_produce_zero() {
         for amount in [32, 33, 40, u32::MAX] {
-            assert_eq!(reg(7, 0xFFFF_FFFF, amount), AluOutput { value: 0, carry: true });
-            assert_eq!(reg(8, 0xFFFF_FFFF, amount), AluOutput { value: 0, carry: true });
-            assert_eq!(reg(7, 0, amount), AluOutput { value: 0, carry: false });
+            assert_eq!(reg(OP_LSL, 0xFFFF_FFFF, amount), AluOutput { value: 0, carry: true });
+            assert_eq!(reg(OP_LSR, 0xFFFF_FFFF, amount), AluOutput { value: 0, carry: true });
+            assert_eq!(reg(OP_LSL, 0, amount), AluOutput { value: 0, carry: false });
         }
         // The incoming carry still lands in range for an amount of exactly 32.
-        assert_eq!(evaluate(12, 0, 32, true, false).unwrap().value, 0x8000_0000);
-        assert_eq!(evaluate(13, 0, 32, true, false).unwrap().value, 1);
-        assert_eq!(evaluate(12, 0, 33, true, false).unwrap().value, 0);
-        assert_eq!(evaluate(13, 0, 33, true, false).unwrap().value, 0);
+        assert_eq!(evaluate(OP_LSLC, 0, 32, true, false).unwrap().value, 0x8000_0000);
+        assert_eq!(evaluate(OP_LSRC, 0, 32, true, false).unwrap().value, 1);
+        assert_eq!(evaluate(OP_LSLC, 0, 33, true, false).unwrap().value, 0);
+        assert_eq!(evaluate(OP_LSRC, 0, 33, true, false).unwrap().value, 0);
     }
 
     #[test]
     fn asr_saturates_to_sign_fill() {
-        assert_eq!(reg(9, 0x8000_0000, 31).value, 0xFFFF_FFFF);
-        assert_eq!(reg(9, 0x8000_0000, 40).value, 0xFFFF_FFFF);
-        assert_eq!(reg(9, 0x7FFF_FFFF, 40).value, 0);
+        assert_eq!(reg(OP_ASR, 0x8000_0000, 31).value, 0xFFFF_FFFF);
+        assert_eq!(reg(OP_ASR, 0x8000_0000, 40).value, 0xFFFF_FFFF);
+        assert_eq!(reg(OP_ASR, 0x7FFF_FFFF, 40).value, 0);
     }
 
     #[test]
     fn rotates_use_amount_mod_32() {
-        assert_eq!(reg(10, 0x8000_0001, 33), reg(10, 0x8000_0001, 1));
-        assert_eq!(reg(11, 0x8000_0001, 64).value, 0x8000_0001);
-        assert!(!reg(11, 0x8000_0001, 64).carry, "a rotate by a multiple of 32 moves nothing");
+        assert_eq!(reg(OP_ROTL, 0x8000_0001, 33), reg(OP_ROTL, 0x8000_0001, 1));
+        assert_eq!(reg(OP_ROTR, 0x8000_0001, 64).value, 0x8000_0001);
+        assert!(!reg(OP_ROTR, 0x8000_0001, 64).carry, "a rotate by a multiple of 32 moves nothing");
     }
 
     #[test]
     fn shift_through_carry_inserts_carry_in() {
-        assert_eq!(evaluate(12, 0x1, 1, true, false).unwrap().value, 0x3);
-        assert_eq!(evaluate(13, 0x2, 1, true, false).unwrap().value, 0x8000_0001);
+        assert_eq!(evaluate(OP_LSLC, 0x1, 1, true, false).unwrap().value, 0x3);
+        assert_eq!(evaluate(OP_LSRC, 0x2, 1, true, false).unwrap().value, 0x8000_0001);
     }
 
     #[test]
@@ -273,12 +273,12 @@ mod tests {
 
     #[test]
     fn immediate_form_rejects_ops_without_an_immediate_encoding() {
-        for op in 18..32 {
+        for op in OP_SXTB..32 {
             assert_eq!(evaluate(op, 0, 0, false, true), None, "imm op {op} is not in ISA.md");
             assert_eq!(decode_imm(op, 0), None);
         }
-        assert_eq!(evaluate(22, 0, 0, false, false), None);
-        assert!(evaluate(21, 0, 0, false, false).is_some());
+        assert_eq!(evaluate(OP_TNCD + 1, 0, 0, false, false), None);
+        assert!(evaluate(OP_TNCD, 0, 0, false, false).is_some());
     }
 
     #[test]
@@ -286,6 +286,6 @@ mod tests {
         // 0 - 0x80000000 overflows; the reversed order would not.
         assert!(overflow(OP_SUB, 0, 0x8000_0000, 0x8000_0000));
         assert!(!overflow(OP_SUB, 0x8000_0000, 0, 0x8000_0000));
-        assert!(overflow(14, 0x7FFF_FFFF, 1, 0x8000_0000));
+        assert!(overflow(OP_ADD, 0x7FFF_FFFF, 1, 0x8000_0000));
     }
 }

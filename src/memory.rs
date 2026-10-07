@@ -26,6 +26,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 
+use crate::mouse::MouseQueue;
+
 pub const PHYSMEM_MAX: u32 = 0x7FF_FFFF;
 
 // ---- Device interrupt lines raised by memory-mapped devices -----------------
@@ -72,6 +74,10 @@ const UART_TX: u32 = 0x7FE_5802;
 const UART_RX: u32 = 0x7FE_5803;
 pub const PIT_START: u32 = 0x7FE_5804;
 const PIT_END: u32 = PIT_START + 4;
+// PS/2 mouse event word: byte 0 peeks, byte 3 pops (software reads a word).
+const MOUSE_STREAM_START: u32 = 0x7FE_5808;
+const MOUSE_STREAM_POP: u32 = MOUSE_STREAM_START + 3;
+const MOUSE_STREAM_END: u32 = MOUSE_STREAM_START + 4;
 
 const SD_DMA_START: u32 = 0x7FE_5810;
 const SD2_DMA_START: u32 = 0x7FE_5828;
@@ -638,6 +644,10 @@ pub struct Memory {
     // "non-empty" so every core can poll it each tick without locking.
     input: Mutex<VecDeque<u16>>,
     input_pending: AtomicBool,
+    // Host mouse events waiting for the guest; `mouse_pending` mirrors
+    // "non-empty" for lock-free per-tick polling like `input_pending`.
+    mouse: Mutex<MouseQueue>,
+    mouse_pending: AtomicBool,
     pit_reload: AtomicU32,
     clk_divider: AtomicU32,
     sd_cards: [Mutex<SdCard>; 2],
@@ -668,6 +678,8 @@ impl Memory {
             vga: VgaState::new(),
             input: Mutex::new(VecDeque::new()),
             input_pending: AtomicBool::new(false),
+            mouse: Mutex::new(MouseQueue::new()),
+            mouse_pending: AtomicBool::new(false),
             pit_reload: AtomicU32::new(0),
             clk_divider: AtomicU32::new(0),
             sd_cards: [
@@ -743,6 +755,28 @@ impl Memory {
     // Whether input is waiting in the PS/2/UART queue.
     pub fn has_pending_input(&self) -> bool {
         self.input_pending.load(Ordering::SeqCst)
+    }
+
+    // Queue host mouse state for the guest (docs/mem_map.md "PS/2 mouse").
+    // `buttons` uses the event-word button bits; motion is in guest screen
+    // pixels with +dy = down and +wheel = scroll toward the user.
+    pub fn push_mouse(&self, buttons: u8, dx: i32, dy: i32, wheel: i32) {
+        let mut queue = self.mouse.lock().unwrap();
+        queue.push(buttons, dx, dy, wheel);
+        self.mouse_pending.store(!queue.is_empty(), Ordering::SeqCst);
+    }
+
+    // Pop the oldest mouse event word (0 if none).
+    fn pop_mouse(&self) -> u32 {
+        let mut queue = self.mouse.lock().unwrap();
+        let value = queue.pop();
+        self.mouse_pending.store(!queue.is_empty(), Ordering::SeqCst);
+        value
+    }
+
+    // Whether a mouse event is waiting for the guest.
+    pub fn has_pending_mouse(&self) -> bool {
+        self.mouse_pending.load(Ordering::SeqCst)
     }
 
     // Current clock-divider register value (read every tick by every core).
@@ -962,6 +996,12 @@ impl Memory {
             }
             PS2_STREAM_HIGH if !self.use_uart_rx => (self.pop_input() >> 8) as u8,
             PS2_STREAM | PS2_STREAM_HIGH => 0,
+            // Byte 3 pops; the other bytes peek, so an aligned word load
+            // returns one whole event and consumes it.
+            MOUSE_STREAM_POP => (self.pop_mouse() >> 24) as u8,
+            MOUSE_STREAM_START..MOUSE_STREAM_POP => {
+                self.mouse.lock().unwrap().peek_byte(addr - MOUSE_STREAM_START)
+            }
             UART_TX => panic!("MMIO: attempting to read output port (address {:X})", UART_TX),
             UART_RX if self.use_uart_rx => {
                 let value = self.pop_input();
@@ -1048,6 +1088,10 @@ impl Memory {
                 io::stdout().flush().unwrap();
             }
             UART_RX => panic!("MMIO: attempting to write input port (address {:X})", UART_RX),
+            MOUSE_STREAM_START..MOUSE_STREAM_END => panic!(
+                "MMIO: attempting to write read-only PS/2 mouse stream (address 0x{:08X}, data 0x{:02X})",
+                addr, data
+            ),
             PIT_START..PIT_END | CLK_REG_START..CLK_REG_END => self.write_mmio_bytes(addr, &[data]),
             TILE_H_SCROLL_START..TILE_V_SCROLL_START => {
                 store_u16_byte(&vga.tile_hscroll, addr - TILE_H_SCROLL_START, data)
@@ -1519,5 +1563,33 @@ mod tests {
             2,
             "wall-clock audio mode must advance READ_IDX by one sample",
         );
+    }
+
+    // A guest word load at the mouse stream returns one whole event and
+    // consumes it; an empty stream reads 0 and keeps the pending flag clear.
+    #[test]
+    fn mouse_stream_word_read_pops_one_event() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0);
+        assert!(!memory.has_pending_mouse());
+
+        memory.push_mouse(crate::mouse::MOUSE_BUTTON_LEFT, -3, 5, 1);
+        memory.push_mouse(0, 0, 0, 0);
+        assert!(memory.has_pending_mouse());
+
+        assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0x0105_FD09);
+        assert_eq!(memory.read(MOUSE_STREAM_START), 0x08);
+        assert!(memory.has_pending_mouse());
+        assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0x0000_0008);
+        assert!(!memory.has_pending_mouse());
+        assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0);
+    }
+
+    // The mouse stream is input-only; a store is a guest bug.
+    #[test]
+    #[should_panic(expected = "read-only PS/2 mouse stream")]
+    fn mouse_stream_rejects_writes() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        memory.write_u32(MOUSE_STREAM_START, 0);
     }
 }

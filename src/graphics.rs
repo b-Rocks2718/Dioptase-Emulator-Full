@@ -1,5 +1,6 @@
-// Host window for the VGA device (`--vga`) and host keyboard translation into
-// the guest PS/2 key-event stream (docs/mem_map.md "PS/2 keyboard").
+// Host window for the VGA device (`--vga`), host keyboard translation into
+// the guest PS/2 key-event stream (docs/mem_map.md "PS/2 keyboard"), and host
+// mouse translation into the guest PS/2 mouse stream ("PS/2 mouse").
 
 use ::image::{ImageBuffer, Rgba};
 use piston_window::*;
@@ -12,6 +13,7 @@ use std::{
 };
 
 use crate::memory::*;
+use crate::mouse::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT};
 
 // Scale the host window without changing logical resolution.
 const DISPLAY_SCALE: u32 = 2;
@@ -342,6 +344,107 @@ impl GuestKeyboardMapper {
     }
 }
 
+// Button state and accumulated motion to hand to `Memory::push_mouse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuestMouseEvent {
+    buttons: u8,
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+}
+
+// Translate host mouse input into guest PS/2 mouse events.
+// - Host cursor positions are logical window coordinates, which are the guest
+//   640x480 screen scaled by DISPLAY_SCALE; deltas are divided back down.
+//   Fractional guest pixels are carried in `motion_remainder` so slow
+//   movement still accumulates instead of rounding away.
+// - Deltas are computed here rather than taken from the backend's relative
+//   motion, because the backend keeps its last position across the cursor
+//   leaving the window and would report a jump on re-entry.
+// - Host scroll units are treated as wheel detents. Backends report wheel
+//   notches as 1.0 per detent with positive y meaning "scroll up", so the
+//   sign is inverted for the guest's positive-is-down WHEEL field.
+//   Touchpad pixel scrolling arrives through the same host event and will
+//   therefore scroll quickly; the backend does not let us tell them apart.
+struct GuestMouseMapper {
+    buttons: u8,
+    last_cursor: Option<[f64; 2]>,
+    motion_remainder: [f64; 2],
+    wheel_remainder: f64,
+}
+
+impl GuestMouseMapper {
+    // Create a mapper with every button released and no cursor history.
+    fn new() -> Self {
+        Self { buttons: 0, last_cursor: None, motion_remainder: [0.0; 2], wheel_remainder: 0.0 }
+    }
+
+    // Track a button press or release. Buttons beyond left/right/middle are
+    // not part of the guest contract and are ignored.
+    fn button(&mut self, button: MouseButton, state: ButtonState) -> Option<GuestMouseEvent> {
+        let bit = match button {
+            MouseButton::Left => MOUSE_BUTTON_LEFT,
+            MouseButton::Right => MOUSE_BUTTON_RIGHT,
+            MouseButton::Middle => MOUSE_BUTTON_MIDDLE,
+            _ => return None,
+        };
+        let buttons = match state {
+            ButtonState::Press => self.buttons | bit,
+            ButtonState::Release => self.buttons & !bit,
+        };
+        if buttons == self.buttons {
+            return None;
+        }
+        self.buttons = buttons;
+        Some(GuestMouseEvent { buttons, dx: 0, dy: 0, wheel: 0 })
+    }
+
+    // Convert an absolute host cursor position into guest-pixel motion.
+    fn cursor(&mut self, pos: [f64; 2]) -> Option<GuestMouseEvent> {
+        let last = self.last_cursor.replace(pos)?;
+        let mut whole = [0i32; 2];
+        for axis in 0..2 {
+            let motion = (pos[axis] - last[axis]) / DISPLAY_SCALE as f64 + self.motion_remainder[axis];
+            whole[axis] = motion.trunc() as i32;
+            self.motion_remainder[axis] = motion - whole[axis] as f64;
+        }
+        if whole == [0, 0] {
+            return None;
+        }
+        Some(GuestMouseEvent { buttons: self.buttons, dx: whole[0], dy: whole[1], wheel: 0 })
+    }
+
+    // Convert a host scroll delta into guest wheel detents.
+    fn scroll(&mut self, delta: [f64; 2]) -> Option<GuestMouseEvent> {
+        let wheel = -delta[1] + self.wheel_remainder;
+        let whole = wheel.trunc() as i32;
+        self.wheel_remainder = wheel - whole as f64;
+        if whole == 0 {
+            return None;
+        }
+        Some(GuestMouseEvent { buttons: self.buttons, dx: 0, dy: 0, wheel: whole })
+    }
+
+    // The cursor left the window: forget its position so re-entry at a
+    // different edge is not reported as motion.
+    fn cursor_left(&mut self) {
+        self.last_cursor = None;
+        self.motion_remainder = [0.0; 2];
+    }
+
+    // The window lost focus, so releases may never arrive; report every held
+    // button as released so the guest does not see a stuck button.
+    fn focus_lost(&mut self) -> Option<GuestMouseEvent> {
+        self.cursor_left();
+        self.wheel_remainder = 0.0;
+        if self.buttons == 0 {
+            return None;
+        }
+        self.buttons = 0;
+        Some(GuestMouseEvent { buttons: 0, dx: 0, dy: 0, wheel: 0 })
+    }
+}
+
 // Expand an 8-bit RGB332 tile color into 4-bit RGB channels (0..=15).
 fn expand_rgb332(color: u8) -> (u8, u8, u8) {
     let r3 = (color >> 5) & 0x7;
@@ -383,7 +486,8 @@ pub struct Graphics {
     texture: G2dTexture,
     memory: Arc<Memory>,
     keyboard_mapper: GuestKeyboardMapper,
-    keyboard_debug: bool,
+    ps2_debug: bool,
+    mouse_mapper: GuestMouseMapper,
 }
 
 impl Graphics {
@@ -413,7 +517,8 @@ impl Graphics {
             texture,
             memory,
             keyboard_mapper: GuestKeyboardMapper::new(),
-            keyboard_debug: std::env::var_os("PS2_DEBUG").is_some(),
+            ps2_debug: std::env::var_os("PS2_DEBUG").is_some(),
+            mouse_mapper: GuestMouseMapper::new(),
         }
     }
 
@@ -445,20 +550,40 @@ impl Graphics {
                     }),
                     _,
                 ) => {
-                    if self.keyboard_debug {
+                    if self.ps2_debug {
                         eprintln!("ps2 host button: key={key:?} state={state:?} scancode={scancode:?}");
                     }
                     let event_code = self.keyboard_mapper.translate_button(key, state, scancode);
                     self.deliver_key(event_code);
                 }
                 Event::Input(Input::Text(text), _) => {
-                    if self.keyboard_debug {
+                    if self.ps2_debug {
                         eprintln!("ps2 host text: {text:?}");
                     }
                     let event_code = self.keyboard_mapper.translate_text(&text);
                     self.deliver_key(event_code);
                 }
-                Event::Input(Input::Focus(false), _) => self.keyboard_mapper.clear(),
+                Event::Input(
+                    Input::Button(ButtonArgs { button: Button::Mouse(button), state, .. }),
+                    _,
+                ) => {
+                    let event = self.mouse_mapper.button(button, state);
+                    self.deliver_mouse(event);
+                }
+                Event::Input(Input::Move(Motion::MouseCursor(pos)), _) => {
+                    let event = self.mouse_mapper.cursor(pos);
+                    self.deliver_mouse(event);
+                }
+                Event::Input(Input::Move(Motion::MouseScroll(delta)), _) => {
+                    let event = self.mouse_mapper.scroll(delta);
+                    self.deliver_mouse(event);
+                }
+                Event::Input(Input::Cursor(false), _) => self.mouse_mapper.cursor_left(),
+                Event::Input(Input::Focus(false), _) => {
+                    self.keyboard_mapper.clear();
+                    let event = self.mouse_mapper.focus_lost();
+                    self.deliver_mouse(event);
+                }
                 _ => {}
             }
         }
@@ -467,10 +592,20 @@ impl Graphics {
     // Queue a translated key event for the guest.
     fn deliver_key(&self, event_code: Option<u16>) {
         if let Some(event_code) = event_code {
-            if self.keyboard_debug {
+            if self.ps2_debug {
                 eprintln!("ps2 guest event: 0x{event_code:04X}");
             }
             self.memory.push_input(event_code);
+        }
+    }
+
+    // Queue a translated mouse event for the guest.
+    fn deliver_mouse(&self, event: Option<GuestMouseEvent>) {
+        if let Some(event) = event {
+            if self.ps2_debug {
+                eprintln!("ps2 guest mouse: {event:?}");
+            }
+            self.memory.push_mouse(event.buttons, event.dx, event.dy, event.wheel);
         }
     }
 
@@ -676,5 +811,79 @@ mod tests {
             mapper.translate_button(Key::Unknown, ButtonState::Release, None),
             None
         );
+    }
+
+    // Window coordinates are DISPLAY_SCALE times guest pixels; sub-pixel
+    // motion must accumulate rather than round away.
+    #[test]
+    fn mouse_motion_scales_to_guest_pixels_and_keeps_remainder() {
+        let mut mapper = GuestMouseMapper::new();
+        assert_eq!(mapper.cursor([100.0, 100.0]), None);
+        let scale = DISPLAY_SCALE as f64;
+        assert_eq!(
+            mapper.cursor([100.0 + 4.0 * scale, 100.0 - 2.0 * scale]),
+            Some(GuestMouseEvent { buttons: 0, dx: 4, dy: -2, wheel: 0 })
+        );
+        let half = 0.5 * scale;
+        let base = [100.0 + 4.0 * scale, 100.0 - 2.0 * scale];
+        assert_eq!(mapper.cursor([base[0] + half, base[1]]), None);
+        assert_eq!(
+            mapper.cursor([base[0] + 2.0 * half, base[1]]),
+            Some(GuestMouseEvent { buttons: 0, dx: 1, dy: 0, wheel: 0 })
+        );
+    }
+
+    // Re-entering the window at another edge must not look like motion.
+    #[test]
+    fn mouse_cursor_leaving_window_resets_origin() {
+        let mut mapper = GuestMouseMapper::new();
+        mapper.cursor([0.0, 0.0]);
+        mapper.cursor_left();
+        assert_eq!(mapper.cursor([1000.0, 900.0]), None);
+    }
+
+    // Motion and scroll carry the held buttons; repeated presses are not
+    // new events.
+    #[test]
+    fn mouse_buttons_track_state_and_ride_along_with_motion() {
+        let mut mapper = GuestMouseMapper::new();
+        assert_eq!(
+            mapper.button(MouseButton::Left, ButtonState::Press),
+            Some(GuestMouseEvent { buttons: MOUSE_BUTTON_LEFT, dx: 0, dy: 0, wheel: 0 })
+        );
+        assert_eq!(mapper.button(MouseButton::Left, ButtonState::Press), None);
+        assert_eq!(mapper.button(MouseButton::X1, ButtonState::Press), None);
+        assert_eq!(
+            mapper.button(MouseButton::Middle, ButtonState::Press),
+            Some(GuestMouseEvent { buttons: MOUSE_BUTTON_LEFT | MOUSE_BUTTON_MIDDLE, dx: 0, dy: 0, wheel: 0 })
+        );
+        assert_eq!(
+            mapper.scroll([0.0, 1.0]),
+            Some(GuestMouseEvent { buttons: MOUSE_BUTTON_LEFT | MOUSE_BUTTON_MIDDLE, dx: 0, dy: 0, wheel: -1 })
+        );
+        assert_eq!(
+            mapper.button(MouseButton::Left, ButtonState::Release),
+            Some(GuestMouseEvent { buttons: MOUSE_BUTTON_MIDDLE, dx: 0, dy: 0, wheel: 0 })
+        );
+    }
+
+    // Host "scroll up" (positive y) is guest WHEEL negative; fractional
+    // deltas accumulate into whole detents.
+    #[test]
+    fn mouse_scroll_inverts_sign_and_accumulates_fractions() {
+        let mut mapper = GuestMouseMapper::new();
+        assert_eq!(mapper.scroll([0.0, -0.5]), None);
+        assert_eq!(mapper.scroll([0.0, -0.5]), Some(GuestMouseEvent { buttons: 0, dx: 0, dy: 0, wheel: 1 }));
+        assert_eq!(mapper.scroll([3.0, 0.0]), None);
+    }
+
+    // Losing focus can swallow the release, so held buttons are released.
+    #[test]
+    fn mouse_focus_loss_releases_held_buttons() {
+        let mut mapper = GuestMouseMapper::new();
+        assert_eq!(mapper.focus_lost(), None);
+        mapper.button(MouseButton::Right, ButtonState::Press);
+        assert_eq!(mapper.focus_lost(), Some(GuestMouseEvent { buttons: 0, dx: 0, dy: 0, wheel: 0 }));
+        assert_eq!(mapper.focus_lost(), None);
     }
 }

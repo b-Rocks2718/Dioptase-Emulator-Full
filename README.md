@@ -22,6 +22,8 @@ Use the `--audio-fast` flag to drive the MMIO audio device from wall-clock time 
 
 Use the `--uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
 
+With `--vga`, host mouse motion, left/right/middle buttons, and the scroll wheel are delivered to the guest through the PS/2 mouse stream at `0x7FE5808` (interrupt line 8, IVT `0xF8`); see `docs/mem_map.md`. The mouse is unaffected by `--uart`. Set `PS2_DEBUG=1` to trace host keyboard and mouse events.
+
 Use the `--debug` flag to start an interactive debugger (label breakpoints require `.debug` files built with assembler `--debug`)
 
 Use `--sched` to change the scheduling of when cores run. Options are `free`, `rr` (round robin), and `random`.

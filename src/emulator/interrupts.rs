@@ -15,6 +15,7 @@ pub(super) const TIMER_INTERRUPT_BIT: u32 = 1 << 0;
 pub(super) const KB_INTERRUPT_BIT: u32 = 1 << 1;
 pub(super) const UART_INTERRUPT_BIT: u32 = 1 << 2;
 pub(super) const IPI_INTERRUPT_BIT: u32 = 1 << 5;
+pub(super) const MOUSE_INTERRUPT_BIT: u32 = 1 << 8;
 
 // Device interrupts delivered to one core at a time, rotating across cores.
 const ROUTED_DEVICE_BITS: [u32; 4] = [
@@ -25,7 +26,7 @@ const ROUTED_DEVICE_BITS: [u32; 4] = [
 ];
 
 // Trace names for each interrupt line, in bit order.
-const INTERRUPT_NAMES: [(u32, &str); 8] = [
+const INTERRUPT_NAMES: [(u32, &str); 9] = [
     (TIMER_INTERRUPT_BIT, "timer"),
     (KB_INTERRUPT_BIT, "keyboard"),
     (UART_INTERRUPT_BIT, "uart"),
@@ -34,6 +35,7 @@ const INTERRUPT_NAMES: [(u32, &str); 8] = [
     (VGA_INTERRUPT_BIT, "vga"),
     (AUDIO_INTERRUPT_BIT, "audio"),
     (IPI_INTERRUPT_BIT, "ipi"),
+    (MOUSE_INTERRUPT_BIT, "mouse"),
 ];
 
 // Format pending interrupt bits as stable names for trace output.
@@ -55,13 +57,26 @@ pub(super) fn format_interrupts(bits: u32) -> String {
 #[repr(align(64))]
 struct CacheLine<T>(T);
 
-// Round-robin cursors and the in-flight input interrupt owner.
+// Queued input sources (keyboard/UART stream, then mouse stream), indexed
+// into `RouteState::inputs`.
+const KEYBOARD_INPUT: usize = 0;
+const MOUSE_INPUT: usize = 1;
+const INPUT_SOURCES: usize = 2;
+
+// Routing state for one queue-backed input line. The line stays asserted
+// while its queue is non-empty, but is delivered to one core at a time.
+#[derive(Clone, Copy)]
+struct InputRoute {
+    next: usize,
+    // Core that currently has this line pending; the line is not routed
+    // again until that core clears the ISR bit.
+    inflight: Option<usize>,
+}
+
+// Round-robin cursors and the in-flight input interrupt owners.
 struct RouteState {
     next_device: [usize; ROUTED_DEVICE_BITS.len()],
-    next_input: usize,
-    // Core that currently has the input interrupt pending; a new input
-    // interrupt is not routed until that core acknowledges it.
-    input_inflight: Option<usize>,
+    inputs: [InputRoute; INPUT_SOURCES],
 }
 
 // Per-core pending-interrupt state and inter-processor interrupt delivery.
@@ -69,8 +84,9 @@ struct RouteState {
 // bit is already set merges into it (docs/ISA.md "Inter-processor interrupts").
 pub(super) struct InterruptController {
     cores: usize,
-    // Keyboard or UART line, fixed for the run by `--uart`.
-    input_bit: u32,
+    // ISR bit for each queued input source. The keyboard slot is the
+    // keyboard or UART line, fixed for the run by `--uart`.
+    input_bits: [u32; INPUT_SOURCES],
     pending: Vec<CacheLine<AtomicU32>>,
     routes: Mutex<RouteState>,
 }
@@ -80,12 +96,14 @@ impl InterruptController {
     pub(super) fn new(cores: usize, use_uart_rx: bool) -> Arc<InterruptController> {
         Arc::new(InterruptController {
             cores,
-            input_bit: if use_uart_rx { UART_INTERRUPT_BIT } else { KB_INTERRUPT_BIT },
+            input_bits: [
+                if use_uart_rx { UART_INTERRUPT_BIT } else { KB_INTERRUPT_BIT },
+                MOUSE_INTERRUPT_BIT,
+            ],
             pending: (0..cores).map(|_| CacheLine(AtomicU32::new(0))).collect(),
             routes: Mutex::new(RouteState {
                 next_device: [0; ROUTED_DEVICE_BITS.len()],
-                next_input: 0,
-                input_inflight: None,
+                inputs: [InputRoute { next: 0, inflight: None }; INPUT_SOURCES],
             }),
         })
     }
@@ -125,19 +143,24 @@ impl InterruptController {
         }
     }
 
-    // Route the input interrupt to the next core while input is queued and no
-    // core already owns an unacknowledged input interrupt.
-    pub(super) fn dispatch_input(&self, input_queued: bool) {
+    // Route each queued input line (keyboard/UART, mouse) to the next core
+    // while its queue is non-empty and no core already owns an
+    // unacknowledged interrupt for that line.
+    pub(super) fn dispatch_input(&self, keyboard_queued: bool, mouse_queued: bool) {
         // Every core calls this every tick; skip the lock in the common case.
-        if !input_queued {
+        if !keyboard_queued && !mouse_queued {
             return;
         }
+        let queued = [keyboard_queued, mouse_queued];
         let mut routes = self.routes.lock().unwrap();
-        if routes.input_inflight.is_none() {
-            let core = routes.next_input;
-            routes.next_input = (core + 1) % self.cores;
-            routes.input_inflight = Some(core);
-            self.set_pending_bits(core, self.input_bit);
+        for source in [KEYBOARD_INPUT, MOUSE_INPUT] {
+            let route = &mut routes.inputs[source];
+            if queued[source] && route.inflight.is_none() {
+                let core = route.next;
+                route.next = (core + 1) % self.cores;
+                route.inflight = Some(core);
+                self.set_pending_bits(core, self.input_bits[source]);
+            }
         }
     }
 
@@ -163,14 +186,61 @@ impl InterruptController {
         }
     }
 
-    // Record that `core` cleared ISR bits, reopening input routing for that
-    // core when the input bit was among the cleared ones.
+    // Record that `core` cleared ISR bits, reopening routing for each input
+    // line whose bit was among the cleared ones and that this core owned.
     pub(super) fn acknowledge(&self, core: usize, cleared_bits: u32) {
-        if cleared_bits & self.input_bit != 0 {
-            let mut routes = self.routes.lock().unwrap();
-            if routes.input_inflight == Some(core) {
-                routes.input_inflight = None;
+        if cleared_bits & (self.input_bits[KEYBOARD_INPUT] | self.input_bits[MOUSE_INPUT]) == 0 {
+            return;
+        }
+        let mut routes = self.routes.lock().unwrap();
+        for source in [KEYBOARD_INPUT, MOUSE_INPUT] {
+            let route = &mut routes.inputs[source];
+            if cleared_bits & self.input_bits[source] != 0 && route.inflight == Some(core) {
+                route.inflight = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Keyboard and mouse are independent queued lines: each is routed to one
+    // core at a time and re-routed (round-robin) only after that core clears
+    // its own bit.
+    #[test]
+    fn mouse_and_keyboard_lines_route_independently() {
+        let controller = InterruptController::new(2, false);
+
+        controller.dispatch_input(true, true);
+        assert_eq!(controller.take_pending(0), KB_INTERRUPT_BIT | MOUSE_INTERRUPT_BIT);
+        controller.dispatch_input(true, true);
+        assert_eq!(controller.take_pending(1), 0);
+
+        controller.acknowledge(0, MOUSE_INTERRUPT_BIT);
+        controller.acknowledge(1, KB_INTERRUPT_BIT);
+        controller.dispatch_input(true, true);
+        assert_eq!(controller.take_pending(0), 0);
+        assert_eq!(controller.take_pending(1), MOUSE_INTERRUPT_BIT);
+
+        controller.acknowledge(0, KB_INTERRUPT_BIT);
+        controller.dispatch_input(true, true);
+        assert_eq!(controller.take_pending(1), KB_INTERRUPT_BIT);
+    }
+
+    // `--uart` moves the keyboard line to UART RX but leaves the mouse alone.
+    #[test]
+    fn uart_mode_keeps_mouse_line() {
+        let controller = InterruptController::new(1, true);
+        controller.dispatch_input(true, true);
+        assert_eq!(controller.take_pending(0), UART_INTERRUPT_BIT | MOUSE_INTERRUPT_BIT);
+    }
+
+    // Line 8 vectors through IVT[0xF8] and needs a trace name.
+    #[test]
+    fn mouse_line_is_named() {
+        assert_eq!(MOUSE_INTERRUPT_BIT.trailing_zeros(), 8);
+        assert_eq!(format_interrupts(MOUSE_INTERRUPT_BIT | KB_INTERRUPT_BIT), "keyboard|mouse");
     }
 }

@@ -8,6 +8,7 @@ pub mod disassembler;
 pub mod emulator;
 pub mod graphics;
 pub mod memory;
+pub mod mouse;
 mod isa;
 #[cfg(test)]
 mod tests;

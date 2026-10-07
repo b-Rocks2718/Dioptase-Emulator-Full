@@ -457,7 +457,8 @@ impl Emulator {
     // on the next tick.
     fn collect_interrupts(&mut self) {
         let core = self.core_id as usize;
-        self.interrupts.dispatch_input(self.memory.has_pending_input());
+        self.interrupts
+            .dispatch_input(self.memory.has_pending_input(), self.memory.has_pending_mouse());
         if core == 0 {
             self.tick_devices();
         }

@@ -1082,7 +1082,10 @@ impl Memory {
                     self.raise_pending_interrupt(SD2_INTERRUPT_BIT);
                 }
             }
-            PS2_STREAM => panic!("MMIO: attempting to write input port (address {:X})", PS2_STREAM),
+            PS2_STREAM | PS2_STREAM_HIGH => panic!(
+                "MMIO: attempting to write read-only PS/2 keyboard stream (address 0x{:08X}, data 0x{:02X})",
+                addr, data
+            ),
             UART_TX => {
                 print!("{}", data as char);
                 io::stdout().flush().unwrap();
@@ -1583,6 +1586,15 @@ mod tests {
         assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0x0000_0008);
         assert!(!memory.has_pending_mouse());
         assert_eq!(memory.read_u32(MOUSE_STREAM_START), 0);
+    }
+
+    // Both bytes of the keyboard stream are input-only; the high byte used
+    // to fall through to the generic "unmapped IO" panic.
+    #[test]
+    #[should_panic(expected = "read-only PS/2 keyboard stream (address 0x07FE5801")]
+    fn ps2_stream_high_byte_rejects_writes() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        memory.write(PS2_STREAM_HIGH, 0);
     }
 
     // The mouse stream is input-only; a store is a guest bug.

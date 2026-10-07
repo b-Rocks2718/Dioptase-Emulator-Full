@@ -714,7 +714,7 @@ impl Memory {
                 .fold(value, |acc, (i, byte)| with_byte(acc, offset + i as u32, *byte));
             Some(merged)
         };
-        let _ = word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, merge);
+        let _ = word.try_update(Ordering::SeqCst, Ordering::SeqCst, merge);
     }
 
     // Warn when guest code reads the null physical address.
@@ -874,7 +874,7 @@ impl Memory {
             });
         }
         self.ram_word(addr)
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| Some(update(prev)))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |prev| Some(update(prev)))
             .unwrap()
     }
 

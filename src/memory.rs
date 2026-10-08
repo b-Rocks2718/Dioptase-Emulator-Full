@@ -256,8 +256,9 @@ impl VgaState {
 }
 
 // SD card storage indexed by block, plus DMA register state.
-// Invariants: dma_remaining > 0 while dma_active; BUSY status implies a DMA
-// or init sequence is active; image_len is the exported image length and
+// Invariants: dma_remaining > 0 while dma_active, except during the final
+// word's copy (between tick() and complete_dma(), both on the device-ticking
+// thread); BUSY status implies a DMA or init sequence is active; image_len is the exported image length and
 // grows when writes land past it.
 struct SdCard {
     storage: HashMap<u32, Vec<u8>>,
@@ -283,14 +284,15 @@ struct SdCard {
 enum SdTick {
     Idle,
     RaiseInterrupt,
-    // Move `bytes` between RAM at `mem_addr` and the card at `sd_offset`;
-    // raise the interrupt afterwards if `irq_after`.
+    // Move `bytes` between RAM at `mem_addr` and the card at `sd_offset`.
+    // If `last`, the caller must then call SdCard::complete_dma(), which
+    // publishes DONE and says whether to raise the interrupt.
     Transfer {
         mem_addr: u32,
         sd_offset: u64,
         bytes: u32,
         to_sd: bool,
-        irq_after: bool,
+        last: bool,
     },
 }
 
@@ -451,21 +453,27 @@ impl SdCard {
         self.dma_mem_cursor = self.dma_mem_cursor.wrapping_add(bytes);
         self.dma_sd_byte_cursor = self.dma_sd_byte_cursor.wrapping_add(u64::from(bytes));
         self.dma_remaining -= bytes;
-        let done = self.dma_remaining == 0;
-        if done {
-            self.dma_active = false;
-            self.dma_status = (self.dma_status & !SD_DMA_STATUS_BUSY) | SD_DMA_STATUS_DONE;
-            if self.dma_err != SD_DMA_ERR_NONE {
-                self.dma_status |= SD_DMA_STATUS_ERR;
-            }
-        }
+        // The final word keeps BUSY set: the caller moves it without the card
+        // lock and then calls complete_dma(), so no core can observe DONE
+        // before the last byte has reached RAM (or been read from RAM).
         SdTick::Transfer {
             mem_addr,
             sd_offset,
             bytes,
             to_sd: self.dma_ctrl & SD_DMA_CTRL_DIR_RAM_TO_SD != 0,
-            irq_after: done && irq_enable,
+            last: self.dma_remaining == 0,
         }
+    }
+
+    // Retire a DMA whose final word has been moved: clear BUSY, publish DONE
+    // (and ERR if set), and return whether the completion interrupt fires.
+    fn complete_dma(&mut self) -> bool {
+        self.dma_active = false;
+        self.dma_status = (self.dma_status & !SD_DMA_STATUS_BUSY) | SD_DMA_STATUS_DONE;
+        if self.dma_err != SD_DMA_ERR_NONE {
+            self.dma_status |= SD_DMA_STATUS_ERR;
+        }
+        self.dma_ctrl & SD_DMA_CTRL_IRQ_ENABLE != 0
     }
 
     // Read a byte from storage; unwritten blocks read as 0.
@@ -1161,7 +1169,7 @@ impl Memory {
             sd_offset,
             bytes,
             to_sd,
-            irq_after,
+            last,
         } = action
         else {
             if matches!(action, SdTick::RaiseInterrupt) {
@@ -1186,7 +1194,9 @@ impl Memory {
             }
             self.write_phys_range(mem_addr, buf);
         }
-        if irq_after {
+        // Publish completion only after the final word has moved; see
+        // SdCard::tick.
+        if last && self.sd_cards[index].lock().unwrap().complete_dma() {
             self.raise_pending_interrupt(interrupt_bit);
         }
     }
@@ -1292,6 +1302,65 @@ mod tests {
         assert_eq!(image[0], 0);
         assert_eq!(image[599], 0);
         assert_eq!(image[600], 0x5A);
+    }
+
+    // The final DMA word is handed out with BUSY still set, so software that
+    // polls STATUS cannot see DONE until the caller has moved that word and
+    // called complete_dma(). Publishing DONE earlier let a guest consume a
+    // read buffer, or reuse a write buffer, before the last word moved.
+    #[test]
+    fn sd_dma_publishes_done_only_after_final_word() {
+        let mut sd = SdCard::new(1);
+        sd.initialized = true;
+        sd.write_reg_byte(SD_DMA_OFFSET_LEN, 1);
+        sd.write_reg_byte(SD_DMA_OFFSET_CTRL, (SD_DMA_CTRL_START | SD_DMA_CTRL_IRQ_ENABLE) as u8);
+
+        let words = SD_BLOCK_SIZE as u32 / SD_DMA_BYTES_PER_TICK;
+        for word in 1..=words {
+            let SdTick::Transfer { last, .. } = sd.tick() else {
+                panic!("SD DMA: expected a transfer on word {word} of {words}");
+            };
+            assert_eq!(last, word == words, "only the final word may be marked last");
+            assert_eq!(
+                sd.read_reg_byte(SD_DMA_OFFSET_STATUS) as u32,
+                SD_DMA_STATUS_BUSY,
+                "STATUS must stay BUSY (not DONE) until complete_dma() on word {word}"
+            );
+        }
+
+        assert!(sd.complete_dma(), "IRQ_EN was set, so completion must request the interrupt");
+        assert_eq!(sd.read_reg_byte(SD_DMA_OFFSET_STATUS) as u32, SD_DMA_STATUS_DONE);
+        assert!(matches!(sd.tick(), SdTick::Idle), "a retired DMA must not move more data");
+    }
+
+    // A full DMA read lands every byte in RAM before DONE and the interrupt.
+    #[test]
+    fn sd_dma_read_completes_with_data_and_interrupt() {
+        let image: Vec<u8> = (0..SD_BLOCK_SIZE).map(|i| i as u8).collect();
+        let memory = Memory::new(HashMap::new(), false, 1);
+        {
+            let mut sd = memory.sd_cards[0].lock().unwrap();
+            sd.load_image(&image);
+            sd.initialized = true;
+        }
+        memory.write_u32(SD_DMA_START + SD_DMA_OFFSET_MEM_ADDR, 0x2000);
+        memory.write_u32(SD_DMA_START + SD_DMA_OFFSET_LEN, 1);
+        memory.write_u32(
+            SD_DMA_START + SD_DMA_OFFSET_CTRL,
+            SD_DMA_CTRL_START | SD_DMA_CTRL_IRQ_ENABLE,
+        );
+
+        for _ in 0..SD_BLOCK_SIZE as u32 / SD_DMA_BYTES_PER_TICK {
+            assert_eq!(memory.check_interrupts() & SD_INTERRUPT_BIT, 0,
+                "SD interrupt raised before the transfer finished");
+            memory.tick_sd_dma();
+        }
+
+        assert_eq!(memory.check_interrupts() & SD_INTERRUPT_BIT, SD_INTERRUPT_BIT);
+        assert_eq!(memory.read_u32(SD_DMA_START + SD_DMA_OFFSET_STATUS), SD_DMA_STATUS_DONE);
+        let mut ram = vec![0u8; SD_BLOCK_SIZE];
+        memory.read_phys_range(0x2000, &mut ram);
+        assert_eq!(ram, image, "DMA read must deliver the whole block, including the final word");
     }
 
     // Return zero when guest RAM reads a page that has never been written.

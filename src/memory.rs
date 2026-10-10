@@ -1244,11 +1244,17 @@ impl Memory {
 
     // Consume `sample_count` samples immediately for wall-clock audio mode,
     // filling `out` (reused across calls) and updating READ_IDX/UNDERRUN.
+    // While playback is disabled `out` is left empty, matching `tick_audio`:
+    // the host player receives nothing, so no silence backlog builds up in
+    // its pipe to delay the next playback.
     pub fn consume_audio_wallclock_samples(&self, sample_count: usize, out: &mut Vec<i16>) {
         let _guard = self.mmio_lock.lock().unwrap();
         let mut audio = self.audio.lock().unwrap();
-        let was_low_water = audio.low_water();
         out.clear();
+        if !audio.enabled() {
+            return;
+        }
+        let was_low_water = audio.low_water();
         out.extend((0..sample_count).map(|_| audio.consume_sample_now()));
         if audio.low_water_edge(was_low_water) {
             self.raise_pending_interrupt(AUDIO_INTERRUPT_BIT);
@@ -1634,6 +1640,27 @@ mod tests {
             memory.read_u32(AUDIO_REGS_START + AUDIO_OFFSET_READ_IDX),
             2,
             "wall-clock audio mode must advance READ_IDX by one sample",
+        );
+    }
+
+    // Disabled playback must hand the host nothing; streaming silence would
+    // build a backlog in the player pipe that delays the next playback.
+    #[test]
+    fn wallclock_audio_consumption_emits_nothing_while_disabled() {
+        let memory = Memory::new(HashMap::new(), false, 1);
+        let mut samples = vec![7];
+
+        memory.write(AUDIO_RING_BUFFER_START, 0x34);
+        memory.write(AUDIO_RING_BUFFER_START + 1, 0x12);
+        memory.write_u32(AUDIO_REGS_START + AUDIO_OFFSET_WRITE_IDX, 2);
+
+        memory.consume_audio_wallclock_samples(250, &mut samples);
+
+        assert!(samples.is_empty(), "disabled playback must not produce host samples");
+        assert_eq!(
+            memory.read_u32(AUDIO_REGS_START + AUDIO_OFFSET_READ_IDX),
+            0,
+            "disabled playback must not advance READ_IDX",
         );
     }
 

@@ -16,9 +16,9 @@ You can also pass positional files in order: `cargo run -- <ram.hex> [sd0.bin] [
 
 Use the `--vga` flag to open a window with the VGA output
 
-Use the `--audio` flag to pipe the emulated `25 kHz` mono `s16le` PCM audio stream to `ffplay` for host playback (requires `ffplay` on `PATH`).
+Use the `--audio` flag to pipe the emulated `25 kHz` mono `s16le` PCM audio stream to a host player. Outside WSL the player is `ffplay` (requires `ffplay` on `PATH`). Under WSL the emulator instead streams to a Windows `waveOut` player run through `powershell.exe` (`src/wsl_pcm_player.ps1`), because WSLg's PulseAudio sink falls progressively behind on long streams. Set `DIOPTASE_AUDIO_PLAYER` to `ffplay`, `windows`, or `auto` (default) to override the choice.
 
-Use the `--audio-fast` flag to drive the MMIO audio device from wall-clock time instead of emulated device ticks so host playback remains intelligible when emulation is slow. This is a debugging convenience mode and intentionally changes guest-visible audio timing. If the host audio player falls behind, fast mode may drop host samples rather than stalling MMIO device time.
+Use the `--audio-fast` flag to drive the MMIO audio device from wall-clock time instead of emulated device ticks so host playback remains intelligible when emulation is slow. This is a debugging convenience mode and intentionally changes guest-visible audio timing.
 
 Use the `--uart` flag to route keyboard input to the `UART_RX` address instead of the `PS2_STREAM` address
 

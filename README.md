@@ -40,6 +40,34 @@ Use the `--sd0-out <file>` and `--sd1-out <file>` flags to write the final raw S
 
 SD images are raw binary byte streams; byte 0 maps to SD block 0 byte 0
 
+### Headless display (automated testing of graphical programs)
+
+Use `--headless` to run the VGA device without opening a window. Frames still
+advance at 60 Hz of wall-clock time, so the guest sees the same VGA status,
+frame counter, and vblank interrupts as with `--vga`.
+
+- `--input-script <file>` injects keyboard and mouse events at fixed frame
+  numbers, through the same paths the window uses. One event per line, `#`
+  starts a comment: `<frame> key <name> [tap|down|up]`, `<frame> type <text>`,
+  `<frame> mouse <dx> <dy> [wheel]`, `<frame> button <left|right|middle> <down|up>`,
+  `<frame> shot [name]`, `<frame> exit`. Key names are single characters or
+  `enter`, `space`, `esc`, `backspace`, `tab`, `delete`, arrow names, modifier
+  names (`lshift`, `rctrl`, ...), `f1`..`f12`, or a `0x` keycode (see
+  `src/headless.rs`).
+- `--shot-dir <dir>` is where `shot` lines (and `--shot-every N`) save PNG
+  screenshots of the composited 640x480 frame.
+- `--exit-frame N` stops the run at frame N.
+- `--audio-capture <file.raw>` records the audio device as raw s16le mono PCM
+  at 25 kHz, consuming it on wall-clock time like `--audio-fast`.
+
+Example: boot the OS, type a command at the shell, and grab a screenshot:
+
+```
+printf '150 type snake\n200 key enter\n400 shot snake\n420 exit\n' > script.txt
+Dioptase-Emulator-Full build/bios.hex --sd0 build/kernel.bin --sd1 root.ext2 \
+  --cores 4 --headless --input-script script.txt --shot-dir shots
+```
+
 ### Profiling
 
 Use `--profile <report.txt>` to count every instruction each core executes and write a report when the run ends (also when `--max-cycles` stops it). Counts are exact, not sampled, but they are instruction counts, not hardware cycles: the emulator does not model caches or pipeline stalls.

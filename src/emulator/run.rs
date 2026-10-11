@@ -22,6 +22,7 @@ use super::profiler::{CoreProfile, ProfileWindow};
 use super::{Emulator, build_memory, load_program};
 use crate::audio::{AudioMode, AudioPlayback};
 use crate::graphics::Graphics;
+use crate::headless::{HeadlessOptions, run_headless, spawn_audio_capture};
 use crate::memory::Memory;
 
 // Largest supported core count (CID is 2 bits wide in `ipi` targets).
@@ -60,6 +61,8 @@ pub struct RunConfig {
     pub sd_dma_ticks_per_word: u32,
     // Shared measurement window when `--profile` is enabled.
     pub profile: Option<Arc<ProfileWindow>>,
+    // Headless display and scripted input (`--headless`, see headless.rs).
+    pub headless: Option<Arc<HeadlessOptions>>,
 }
 
 impl Default for RunConfig {
@@ -73,6 +76,7 @@ impl Default for RunConfig {
             use_uart_rx: false,
             sd_dma_ticks_per_word: 1,
             profile: None,
+            headless: None,
         }
     }
 }
@@ -258,10 +262,17 @@ pub fn run_program(
     let scheduler = Scheduler::new(config.sched, config.cores);
 
     // The window must be created on the main thread before cores start.
-    let graphics = config
-        .with_graphics
+    let headless = config.headless.as_ref().filter(|options| options.enabled);
+    let graphics = (config.with_graphics && headless.is_none())
         .then(|| Graphics::new(Arc::clone(&memory)));
     let (audio_mode, audio_output) = AudioPlayback::start(config.audio_mode, Arc::clone(&memory));
+    // Audio capture consumes the device on wall-clock time, so core 0 must not
+    // also consume it on emulated ticks.
+    let capture_stop = Arc::new(AtomicBool::new(false));
+    let capture_thread = match headless.and_then(|options| options.audio_capture.as_deref()) {
+        Some(path) => Some(spawn_audio_capture(Arc::clone(&memory), path, Arc::clone(&capture_stop))?),
+        None => None,
+    };
 
     let mut handles = Vec::with_capacity(config.cores);
     for core_id in 0..config.cores {
@@ -272,7 +283,7 @@ pub fn run_program(
         );
         if core_id == 0 {
             // Wall-clock audio mode drives the device from its own thread.
-            cpu.ticks_audio = audio_mode != AudioMode::Fast;
+            cpu.ticks_audio = audio_mode != AudioMode::Fast && capture_thread.is_none();
             cpu.audio_sink = audio_output.as_ref().and_then(|out| out.emulated_sink());
         }
         if let Some(window) = &config.profile {
@@ -289,12 +300,23 @@ pub fn run_program(
     if let Some(mut graphics) = graphics {
         graphics.start(Arc::clone(&shared.stop));
     }
+    if let Some(options) = headless {
+        // Headless errors (bad script, unwritable screenshot) stop the run.
+        if let Err(err) = run_headless(Arc::clone(&memory), Arc::clone(&shared.stop), options) {
+            eprintln!("{}", err);
+            shared.stop.store(true, Ordering::SeqCst);
+        }
+    }
 
     let exits: Vec<CoreExit> = handles
         .into_iter()
         .map(|handle| handle.join().expect("Run: a core thread panicked"))
         .collect();
     drop(audio_output);
+    capture_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = capture_thread {
+        let _ = handle.join();
+    }
 
     let result = shared
         .halted

@@ -15,9 +15,11 @@
 //   for its first IPI) are counted separately so idle time is visible.
 //
 // Symbolization uses the `#label` / `#line` / `#data` metadata that the
-// assembler emits with `-g`. Symbols only apply to kernel-mode PCs; user-mode
-// PCs are reported per PID without symbols because user programs are loaded
-// from the filesystem and their symbol files are not known to the emulator.
+// assembler emits with `-g`. Kernel symbols apply to kernel-mode PCs. User
+// programs are loaded from the filesystem, so the emulator cannot know their
+// symbols; `--user-symbols` supplies one program's hex file, whose labels then
+// name user-mode PCs of every PID (profile one program at a time). Without
+// it, user code is reported per PID only.
 // PIDs are printed in hex: the value is whatever the OS writes to the PID
 // control register, which Dioptase-OS sets to an address-like value.
 //
@@ -185,6 +187,10 @@ pub struct CoreProfile {
     asleep_ticks: u64,
     kernel_instructions: u64,
     user_instructions: u64,
+    // TLB misses with no matching entry, and how many of them would have hit
+    // had `tlbc` never run (see Tlb::miss_caused_by_clear).
+    tlb_misses: u64,
+    tlb_flush_remisses: u64,
     // Kernel-mode PCs below DENSE_PC_LIMIT, indexed by pc / 4.
     dense_counts: Vec<u64>,
     dense_instrs: Vec<u32>,
@@ -225,6 +231,8 @@ impl CoreProfile {
             asleep_ticks: 0,
             kernel_instructions: 0,
             user_instructions: 0,
+            tlb_misses: 0,
+            tlb_flush_remisses: 0,
             dense_counts: vec![0; DENSE_SLOTS],
             dense_instrs: vec![0; DENSE_SLOTS],
             sparse: HashMap::new(),
@@ -260,6 +268,19 @@ impl CoreProfile {
         self.ticks += 1;
         if asleep {
             self.asleep_ticks += 1;
+        }
+    }
+
+    // Record one TLB miss with no matching entry; `remiss` says it would have
+    // hit had `tlbc` never run.
+    #[inline]
+    pub fn record_tlb_miss(&mut self, remiss: bool) {
+        if !self.window.is_open() {
+            return;
+        }
+        self.tlb_misses += 1;
+        if remiss {
+            self.tlb_flush_remisses += 1;
         }
     }
 
@@ -413,6 +434,10 @@ pub struct Symbols {
     functions: Vec<(u32, String)>,
     // Source line markers sorted by address.
     lines: Vec<LineEntry>,
+    // Function starts and names for user-mode PCs (`--user-symbols`),
+    // ascending, applied to every PID; empty when none were given.
+    user_functions: Vec<(u32, String)>,
+    user_files: Vec<String>,
 }
 
 impl Symbols {
@@ -481,7 +506,24 @@ impl Symbols {
             labels,
             functions,
             lines,
+            user_functions: Vec::new(),
+            user_files: Vec::new(),
         })
+    }
+
+    // Name user-mode PCs from one program's `-g` hex files (the same label
+    // rules as kernel symbols).
+    pub fn load_user(&mut self, paths: &[String]) -> Result<(), String> {
+        let user = Symbols::load(paths)?;
+        self.user_functions = user.functions;
+        self.user_files = paths.to_vec();
+        Ok(())
+    }
+
+    // Index of the user function containing `pc`, if user symbols are loaded.
+    fn user_function_index(&self, pc: u32) -> Option<usize> {
+        let after = self.user_functions.partition_point(|&(addr, _)| addr <= pc);
+        after.checked_sub(1)
     }
 
     // Resolve a window trigger given as a label name or a 0x-prefixed
@@ -528,7 +570,13 @@ impl Symbols {
     // Format `pc` as `function+0xoffset` for the hot instruction table.
     fn describe_pc(&self, space: AddrSpace, pc: u32) -> String {
         match space {
-            AddrSpace::User(_) => String::new(),
+            AddrSpace::User(_) => match self.user_function_index(pc) {
+                Some(idx) => {
+                    let (start, name) = &self.user_functions[idx];
+                    format!("{}+0x{:x}", name, pc - start)
+                }
+                None => String::new(),
+            },
             AddrSpace::Kernel => match self.function_index(pc) {
                 Some(idx) => {
                     let (start, name) = &self.functions[idx];
@@ -906,6 +954,15 @@ pub fn format_report(profiles: &[CoreProfile], symbols: &Symbols) -> String {
         percent(kernel_total, total),
         percent(user_total, total)
     );
+    let misses: u64 = profiles.iter().map(|p| p.tlb_misses).sum();
+    let remisses: u64 = profiles.iter().map(|p| p.tlb_flush_remisses).sum();
+    let _ = writeln!(
+        out,
+        "TLB misses: {}; {} ({:.2}%) would have hit if tlbc never ran.",
+        misses,
+        remisses,
+        percent(remisses, misses)
+    );
     let _ = writeln!(out);
 
     // Routine grouping uses call targets and entry points from every core.
@@ -1014,7 +1071,66 @@ pub fn format_report(profiles: &[CoreProfile], symbols: &Symbols) -> String {
     }
 
     write_entry_sources(&mut out, profiles, symbols, &merged);
+    write_user_functions(&mut out, symbols, &merged);
     out
+}
+
+// Rows per PID in the user function table.
+const REPORT_TOP_USER_FUNCTIONS: usize = 25;
+
+// Per PID, the user functions (from --user-symbols) with the most self
+// instructions, PIDs in order of their total user instructions.
+fn write_user_functions(
+    out: &mut String,
+    symbols: &Symbols,
+    merged: &HashMap<(AddrSpace, u32), PcCount>,
+) {
+    if symbols.user_functions.is_empty() {
+        return;
+    }
+    let mut per_pid: HashMap<u32, HashMap<Option<usize>, u64>> = HashMap::new();
+    for (&(space, pc), entry) in merged {
+        if let AddrSpace::User(pid) = space {
+            *per_pid
+                .entry(pid)
+                .or_default()
+                .entry(symbols.user_function_index(pc))
+                .or_default() += entry.count;
+        }
+    }
+    let mut pids: Vec<(u32, u64)> = per_pid
+        .iter()
+        .map(|(&pid, functions)| (pid, functions.values().sum()))
+        .collect();
+    sort_by_count_desc(&mut pids);
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "User-mode functions (--user-symbols {}), top {} per PID",
+        symbols.user_files.join(", "),
+        REPORT_TOP_USER_FUNCTIONS
+    );
+    let _ = writeln!(out, "-----------------------------------------------------------");
+    for (pid, total) in pids {
+        let mut rows: Vec<(String, u64)> = per_pid[&pid]
+            .iter()
+            .map(|(idx, &count)| {
+                let name = match idx {
+                    Some(i) => symbols.user_functions[*i].1.clone(),
+                    None => "[before the first user symbol]".to_string(),
+                };
+                (name, count)
+            })
+            .collect();
+        sort_by_count_desc(&mut rows);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "pid 0x{:x} ({} user instructions)", pid, total);
+        let _ = writeln!(out, "{:>8} {:>14}  {}", "%", "count", "function");
+        for (name, count) in rows.iter().take(REPORT_TOP_USER_FUNCTIONS) {
+            let _ = writeln!(out, "{:>7.2}% {:>14}  {}", percent(*count, total), count, name);
+        }
+    }
 }
 
 // For each kernel entry point taken from user mode, the user instructions
@@ -1070,8 +1186,8 @@ fn write_entry_sources(
         );
         let _ = writeln!(
             out,
-            "{:>8} {:>12}  {:<14} {:<10} {}",
-            "%", "entries", "space", "pc", "instruction"
+            "{:>8} {:>12}  {:<14} {:<10} {:<36} {}",
+            "%", "entries", "space", "pc", "symbol", "instruction"
         );
         for ((pid, pc), count) in rows.iter().take(REPORT_TOP_ENTRY_SOURCES) {
             let instr = merged
@@ -1080,11 +1196,12 @@ fn write_entry_sources(
                 .unwrap_or_else(|| "?".to_string());
             let _ = writeln!(
                 out,
-                "{:>7.2}% {:>12}  {:<14} {:08x}   {}",
+                "{:>7.2}% {:>12}  {:<14} {:08x}   {:<36} {}",
                 percent(*count, total),
                 count,
                 format!("pid 0x{:x}", pid),
                 pc,
+                symbols.describe_pc(AddrSpace::User(*pid), *pc),
                 instr
             );
         }
@@ -1268,6 +1385,33 @@ mod tests {
         let groups = routine_groups(&symbols, &called, &HashSet::new());
         let names: Vec<&str> = groups.iter().map(|&g| symbols.functions[g].1.as_str()).collect();
         assert_eq!(names, vec!["smul", "smul", "smul", "spin_lock", "spin_lock_acquire", "smulx"]);
+    }
+
+    // --user-symbols names user PCs in the hot instruction table and adds a
+    // per-PID function table.
+    #[test]
+    fn user_symbols_name_user_pcs() {
+        let kernel = write_symbol_file("user_kernel.hex", "#label work 00010000\n");
+        let user = write_symbol_file(
+            "user_prog.hex",
+            "#label _start 80000000\n#label draw 80000100\n#label draw.loop 80000110\n",
+        );
+        let mut symbols = Symbols::load(&[kernel]).unwrap();
+        symbols.load_user(&[user]).unwrap();
+        assert_eq!(symbols.describe_pc(AddrSpace::User(3), 0x8000_0114), "draw+0x14");
+
+        let mut core = CoreProfile::new(0, ProfileWindow::whole_run());
+        for _ in 0..3 {
+            core.record_instruction(0x8000_0110, 0, false, 3, 0);
+        }
+        core.record_instruction(0x8000_0004, 0, false, 3, 0);
+        let report = format_report(&[core], &symbols);
+        assert!(report.contains("pid 0x3 (4 user instructions)"), "{report}");
+        let draw_row = report
+            .lines()
+            .find(|l| l.ends_with("  draw"))
+            .unwrap_or_else(|| panic!("missing draw row in:\n{report}"));
+        assert!(draw_row.contains(" 3  "), "draw has 3 of the 4 instructions: {draw_row}");
     }
 
     // Kernel PCs from different cores merge; user PCs stay separated by PID

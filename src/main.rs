@@ -20,7 +20,7 @@ use emulator::{Emulator, RunConfig, ScheduleMode, run_program, set_trace_interru
 use headless::HeadlessOptions;
 use memory::{Memory, SdSlot};
 
-const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N] [--profile <report.txt>] [--symbols <file.hex>]... [--profile-start user|<label>|0xADDR] [--profile-stop <label>|0xADDR] [--headless [--input-script <file>] [--shot-dir <dir>] [--shot-every N] [--exit-frame N] [--audio-capture <file.raw>]]";
+const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N] [--profile <report.txt>] [--symbols <file.hex>]... [--user-symbols <file.hex>]... [--profile-start user|<label>|0xADDR] [--profile-stop <label>|0xADDR] [--headless [--input-script <file>] [--shot-dir <dir>] [--shot-every N] [--exit-frame N] [--audio-capture <file.raw>]]";
 
 // Print an error and exit with status 1.
 fn fail(message: impl std::fmt::Display) -> ! {
@@ -48,6 +48,7 @@ struct Options {
     sd1_out_path: Option<String>,
     profile_path: Option<String>,
     symbol_paths: Vec<String>,
+    user_symbol_paths: Vec<String>,
     profile_start: Option<String>,
     profile_stop: Option<String>,
 }
@@ -62,6 +63,7 @@ fn parse_args(args: &[String]) -> Options {
     let (mut sd0_path, mut sd1_path, mut sd0_out_path, mut sd1_out_path) = (None, None, None, None);
     let (mut profile_path, mut profile_start, mut profile_stop) = (None, None, None);
     let mut symbol_paths = Vec::new();
+    let mut user_symbol_paths = Vec::new();
     let mut headless = HeadlessOptions::default();
 
     let mut iter = args.iter().skip(1);
@@ -104,6 +106,7 @@ fn parse_args(args: &[String]) -> Options {
             "--sd1-out" => sd1_out_path = Some(value()),
             "--profile" => profile_path = Some(value()),
             "--symbols" => symbol_paths.push(value()),
+            "--user-symbols" => user_symbol_paths.push(value()),
             "--profile-start" => profile_start = Some(value()),
             "--profile-stop" => profile_stop = Some(value()),
             "--headless" => headless.enabled = true,
@@ -147,6 +150,7 @@ fn parse_args(args: &[String]) -> Options {
         sd1_out_path,
         profile_path,
         symbol_paths,
+        user_symbol_paths,
         profile_start,
         profile_stop,
     }
@@ -232,9 +236,12 @@ fn main() {
     }
     let debug_mode = if options.debugc { Some("debugc") } else if options.debug { Some("debug") } else { None };
     if options.profile_path.is_none()
-        && (!options.symbol_paths.is_empty() || options.profile_start.is_some() || options.profile_stop.is_some())
+        && (!options.symbol_paths.is_empty()
+            || !options.user_symbol_paths.is_empty()
+            || options.profile_start.is_some()
+            || options.profile_stop.is_some())
     {
-        println!("Warning: --symbols, --profile-start, and --profile-stop are ignored without --profile");
+        println!("Warning: --symbols, --user-symbols, --profile-start, and --profile-stop are ignored without --profile");
     }
     if options.profile_path.is_some() && debug_mode.is_some() {
         println!("Warning: --profile is ignored in debug modes");
@@ -274,7 +281,13 @@ fn main() {
     let symbols = options.profile_path.as_ref().map(|_| {
         let mut paths = vec![options.ram_path.clone()];
         paths.extend(options.symbol_paths.iter().cloned());
-        Symbols::load(&paths).unwrap_or_else(|err| fail(err))
+        let mut symbols = Symbols::load(&paths).unwrap_or_else(|err| fail(err));
+        if !options.user_symbol_paths.is_empty() {
+            symbols
+                .load_user(&options.user_symbol_paths)
+                .unwrap_or_else(|err| fail(err));
+        }
+        symbols
     });
     if let Some(symbols) = &symbols {
         let window = build_profile_window(

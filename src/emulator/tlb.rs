@@ -65,6 +65,11 @@ struct TlbEntry {
 pub struct Tlb {
     entries: Vec<TlbEntry>,
     next_seq: u64,
+    // Diagnostic only (the profiler's flush re-miss count); never affects
+    // translation. Keys (global, pid, vpn) of a same-size TLB that receives
+    // the same fills and `tlbi`s but ignores `tlbc`, oldest first: a real
+    // miss that this shadow would have hit was caused by a flush.
+    shadow: Vec<(bool, u32, u32)>,
 }
 
 impl Tlb {
@@ -73,6 +78,7 @@ impl Tlb {
         Tlb {
             entries: Vec::with_capacity(TLB_ENTRIES),
             next_seq: 0,
+            shadow: Vec::with_capacity(TLB_ENTRIES),
         }
     }
 
@@ -137,6 +143,13 @@ impl Tlb {
         } else {
             self.find_private(pid, vpn)
         };
+        let key = (global, if global { 0 } else { pid }, vpn);
+        if !self.shadow.contains(&key) {
+            if self.shadow.len() >= TLB_ENTRIES {
+                self.shadow.remove(0);
+            }
+            self.shadow.push(key);
+        }
         if let Some(i) = existing {
             self.entries[i].value = value;
             return;
@@ -173,11 +186,22 @@ impl Tlb {
     pub fn invalidate(&mut self, pid: u32, vpn: u32) {
         self.entries
             .retain(|e| !(e.vpn == vpn && (e.global || e.pid == pid)));
+        self.shadow
+            .retain(|&(global, p, v)| !(v == vpn && (global || p == pid)));
     }
 
-    // Remove every mapping (tlbc).
+    // Remove every mapping (tlbc). The diagnostic shadow keeps its keys.
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    // Whether a miss on (pid, vpn) would have hit had no `tlbc` ever run: the
+    // shadow TLB, which ignores clears but evicts at the same capacity, still
+    // holds the key.
+    pub(super) fn miss_caused_by_clear(&self, pid: u32, vpn: u32) -> bool {
+        self.shadow
+            .iter()
+            .any(|&(global, p, v)| v == vpn && (global || p == pid))
     }
 
     // Print resident entries for the debugger, oldest first within each class.
@@ -232,6 +256,27 @@ mod tests {
             tlb.access(0, 1, Access::Write, false),
             TlbAccess::Fault(TLB_FLAG_USER)
         );
+    }
+
+    // The shadow survives clears (so A -> B -> A switches that clear twice
+    // still count A's re-misses) but not tlbi or capacity eviction.
+    #[test]
+    fn shadow_attributes_misses_to_clears() {
+        let mut tlb = Tlb::new();
+        tlb.write(7, 1, RWX);
+        tlb.write(0, 2, RWX | TLB_FLAG_GLOBAL);
+        tlb.clear();
+        tlb.write(8, 3, RWX);
+        tlb.clear();
+        assert!(tlb.miss_caused_by_clear(7, 1), "resident until the clears");
+        assert!(tlb.miss_caused_by_clear(9, 2), "global entries match any PID");
+        assert!(!tlb.miss_caused_by_clear(8, 1), "another PID's key is not a re-miss");
+        tlb.invalidate(7, 1);
+        assert!(!tlb.miss_caused_by_clear(7, 1), "tlbi removes the key for real");
+        for vpn in 100..100 + TLB_ENTRIES as u32 {
+            tlb.write(8, vpn, RWX);
+        }
+        assert!(!tlb.miss_caused_by_clear(8, 3), "evicted by capacity, not by a clear");
     }
 
     #[test]

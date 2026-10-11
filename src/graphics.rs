@@ -654,11 +654,14 @@ impl Compositor {
 
     // Draw the pixel layer (background). Pixel scale has an implicit +1 so
     // n = 0 doubles 320x240 to fill 640x480.
+    //
+    // The copy drops the framebuffer lock before the scaled blit. Holding it
+    // across the blit made every guest pixel store wait out the whole frame.
     fn draw_pixel_layer(&mut self) {
         let vga = self.memory.vga();
         let scale = 1 << (u32::from(vga.pixel_scale.load(Ordering::SeqCst)) + 1);
         let (scroll_x, scroll_y) = (scroll_offset(&vga.pixel_hscroll), scroll_offset(&vga.pixel_vscroll));
-        let fb = vga.pixel_frame_buffer.read().unwrap();
+        let fb = vga.pixel_frame_buffer.read().unwrap().clone();
         for y in 0..PIXEL_FRAME_HEIGHT {
             for x in 0..PIXEL_FRAME_WIDTH {
                 let idx = 2 * (x + y * PIXEL_FRAME_WIDTH) as usize;
@@ -674,12 +677,13 @@ impl Compositor {
 
     // Draw the tile layer over the pixel layer. 0xFXXX tile pixels are
     // transparent and 0xCXXX pixels take the entry's RGB332 tile color.
+    // Snapshots drop the locks before the blit so HUD writes are not stalled.
     fn draw_tile_layer(&mut self) {
         let vga = self.memory.vga();
         let scale = 1 << u32::from(vga.tile_scale.load(Ordering::SeqCst));
         let (scroll_x, scroll_y) = (scroll_offset(&vga.tile_hscroll), scroll_offset(&vga.tile_vscroll));
-        let fb = vga.tile_frame_buffer.read().unwrap();
-        let tile_map = vga.tile_map.read().unwrap();
+        let fb = vga.tile_frame_buffer.read().unwrap().clone();
+        let tile_map = vga.tile_map.read().unwrap().clone();
         for ty in 0..TILE_FB_HEIGHT_TILES {
             for tx in 0..TILE_FB_WIDTH_TILES {
                 let entry = 2 * (tx + ty * TILE_FB_WIDTH_TILES) as usize;
@@ -710,9 +714,10 @@ impl Compositor {
 
     // Draw the sprites on top; later sprites overlap earlier ones. Sprite
     // coordinates are signed and pixels left of / above the screen are clipped.
+    // The pixel snapshot is taken before the blit so a flame update can proceed.
     fn draw_sprites(&mut self) {
         let vga = self.memory.vga();
-        let sprites = vga.sprite_pixels.read().unwrap();
+        let sprites = vga.sprite_pixels.read().unwrap().clone();
         for index in 0..SPRITE_COUNT {
             let scale = 1 << u32::from(vga.sprite_scales[index].load(Ordering::SeqCst));
             let coords = vga.sprite_coords[index].load(Ordering::SeqCst);

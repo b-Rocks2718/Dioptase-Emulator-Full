@@ -72,6 +72,8 @@ const REPORT_TOP_FUNCTIONS_PER_CORE: usize = 10;
 const REPORT_TOP_FUNCTIONS_PER_CONTEXT: usize = 30;
 const REPORT_FUNCTIONS_WITH_CALLERS: usize = 15;
 const REPORT_CALLERS_PER_FUNCTION: usize = 6;
+// Rows per entry point in the "kernel entries by user instruction" section.
+const REPORT_TOP_ENTRY_SOURCES: usize = 12;
 // Link register written by `call` (docs/abi.md: r29 holds the return address).
 pub const LINK_REGISTER: usize = 29;
 // Kernel work contexts, used to index per-context tables.
@@ -193,6 +195,7 @@ pub struct CoreProfile {
     // is correct the moment the window opens.
     prev_kmode: bool,
     prev_pc: u32,
+    prev_pid: u32,
     entry_pc: Option<u32>,
     // Counted instructions for `entry_pc` not yet added to `entry_stats`
     // (flushed when the entry changes, to keep hashing off the hot path).
@@ -202,6 +205,10 @@ pub struct CoreProfile {
     dense_from_user: Vec<u64>,
     sparse_from_user: HashMap<u32, u64>,
     entry_stats: HashMap<u32, EntryStats>,
+    // The user instruction each counted kernel entry interrupted: the
+    // faulting load or store of a TLB miss, the `trap` of a syscall, or the
+    // last instruction before an interrupt. (entry pc, pid, user pc) -> entries.
+    entry_sources: HashMap<(u32, u32, u32), u64>,
     // (call site pc, callee pc) -> calls, per context.
     calls: [HashMap<(u32, u32), u64>; CONTEXT_COUNT],
     // Every kernel call target seen at any time, used to tell real functions
@@ -224,11 +231,13 @@ impl CoreProfile {
             // Cores start in kernel mode (PSR = 1 at reset).
             prev_kmode: true,
             prev_pc: 0,
+            prev_pid: 0,
             entry_pc: None,
             entry_pending: 0,
             dense_from_user: vec![0; DENSE_SLOTS],
             sparse_from_user: HashMap::new(),
             entry_stats: HashMap::new(),
+            entry_sources: HashMap::new(),
             calls: [HashMap::new(), HashMap::new()],
             called_ever: HashSet::new(),
         }
@@ -266,6 +275,7 @@ impl CoreProfile {
             self.set_entry(Some(pc));
             if counted {
                 self.entry_stats.entry(pc).or_default().entries += 1;
+                *self.entry_sources.entry((pc, self.prev_pid, self.prev_pc)).or_default() += 1;
             }
         } else if !kmode {
             self.set_entry(None);
@@ -276,6 +286,7 @@ impl CoreProfile {
             && pc != self.prev_pc.wrapping_add(4);
         let call_site = self.prev_pc;
         self.prev_pc = pc;
+        self.prev_pid = pid;
         self.prev_kmode = kmode;
         if is_call {
             self.called_ever.insert(pc);
@@ -1002,7 +1013,82 @@ pub fn format_report(profiles: &[CoreProfile], symbols: &Symbols) -> String {
         );
     }
 
+    write_entry_sources(&mut out, profiles, symbols, &merged);
     out
+}
+
+// For each kernel entry point taken from user mode, the user instructions
+// that took it most often. For a TLB miss that is the load or store (or the
+// first instruction on a page) whose address missed, which locates the code
+// whose memory access pattern overflows the TLB; for a syscall it is the
+// `trap`. Entry points are listed by entry count.
+fn write_entry_sources(
+    out: &mut String,
+    profiles: &[CoreProfile],
+    symbols: &Symbols,
+    merged: &HashMap<(AddrSpace, u32), PcCount>,
+) {
+    let mut sources: HashMap<(u32, u32, u32), u64> = HashMap::new();
+    for profile in profiles {
+        for (&key, &count) in &profile.entry_sources {
+            *sources.entry(key).or_default() += count;
+        }
+    }
+    if sources.is_empty() {
+        return;
+    }
+    let mut per_entry: HashMap<u32, Vec<((u32, u32), u64)>> = HashMap::new();
+    for (&(entry, pid, pc), &count) in &sources {
+        per_entry.entry(entry).or_default().push(((pid, pc), count));
+    }
+    let mut entry_rows: Vec<(u32, u64, Vec<((u32, u32), u64)>)> = per_entry
+        .into_iter()
+        .map(|(entry, rows)| (entry, rows.iter().map(|(_, c)| c).sum(), rows))
+        .collect();
+    entry_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Kernel entries by user instruction (top {} per entry point)",
+        REPORT_TOP_ENTRY_SOURCES
+    );
+    let _ = writeln!(out, "-----------------------------------------------------------");
+    let _ = writeln!(
+        out,
+        "The user instruction each entry interrupted: a TLB miss's faulting access, a syscall's"
+    );
+    let _ = writeln!(out, "trap, or the instruction before an interrupt.");
+    for (entry, total, mut rows) in entry_rows {
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{} ({} entries)",
+            symbols.describe_pc(AddrSpace::Kernel, entry),
+            total
+        );
+        let _ = writeln!(
+            out,
+            "{:>8} {:>12}  {:<14} {:<10} {}",
+            "%", "entries", "space", "pc", "instruction"
+        );
+        for ((pid, pc), count) in rows.iter().take(REPORT_TOP_ENTRY_SOURCES) {
+            let instr = merged
+                .get(&(AddrSpace::User(*pid), *pc))
+                .map(|entry| disassemble(entry.instr))
+                .unwrap_or_else(|| "?".to_string());
+            let _ = writeln!(
+                out,
+                "{:>7.2}% {:>12}  {:<14} {:08x}   {}",
+                percent(*count, total),
+                count,
+                format!("pid 0x{:x}", pid),
+                pc,
+                instr
+            );
+        }
+    }
 }
 
 // Build the report and write it to `path`.
@@ -1135,6 +1221,27 @@ mod tests {
         assert_eq!((background, from_user), (2, 4));
         assert_eq!(p.calls[CONTEXT_FROM_USER][&(HANDLER + 4, HELPER)], 1);
         assert!(p.calls[CONTEXT_BACKGROUND].is_empty());
+    }
+
+    // Each counted entry from user mode records the user instruction it
+    // interrupted, so TLB misses can be traced to the access that missed.
+    #[test]
+    fn kernel_entries_record_the_user_instruction() {
+        const MISS: u32 = 0x1_0000;
+        const TRAP: u32 = 0x1_0200;
+        let mut p = CoreProfile::new(0, ProfileWindow::whole_run());
+
+        p.record_instruction(0x8000, 0, false, 5, 0);
+        p.record_instruction(0x8004, 0, false, 5, 0); // the access that misses
+        p.record_instruction(MISS, 0, true, 5, 0);
+        p.record_instruction(0x8004, 0, false, 5, 0); // retried
+        p.record_instruction(MISS, 0, true, 5, 0); // misses again
+        p.record_instruction(0x9000, 0, false, 6, 0);
+        p.record_instruction(TRAP, 0, true, 6, 0);
+
+        assert_eq!(p.entry_sources[&(MISS, 5, 0x8004)], 2);
+        assert_eq!(p.entry_sources[&(TRAP, 6, 0x9000)], 1);
+        assert_eq!(p.entry_sources.len(), 2);
     }
 
     // A fallthrough whose link register happens to equal pc + 4 must not be

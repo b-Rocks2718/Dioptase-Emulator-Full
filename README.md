@@ -86,6 +86,8 @@ To measure while a user program runs, e.g. an OS test whose `/sbin/init` does th
 
 With more than one core, the report also lists each core's top functions, so busy-waiting on an idle core is visible.
 
+The report ends with the user instructions that entered the kernel, per entry point: for a TLB miss, the load or store whose address missed (or the first instruction on a new code page); for a syscall, the `trap`. Mapping those PCs to the program's labels (assemble it with `basm -g` and look them up in its `#label` lines) shows which loop's access pattern overflows the 16-entry TLB.
+
 Kernel time is split into two parts:
 
 - **Kernel work entered from user mode.** Each kernel instruction is charged to the handler the core entered through when it last left user mode, until the core returns to user mode or sleeps. The report lists each entry point (timer interrupt, TLB miss, syscall, ...) with its total instructions, number of entries, and average cost per entry.

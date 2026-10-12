@@ -7,6 +7,7 @@ pub mod audio;
 pub mod disassembler;
 pub mod emulator;
 pub mod graphics;
+pub mod headless;
 pub mod memory;
 pub mod mouse;
 mod isa;
@@ -16,9 +17,10 @@ mod tests;
 use audio::AudioMode;
 use emulator::profiler::{CoreProfile, ProfileWindow, Symbols, WindowStart, write_report};
 use emulator::{Emulator, RunConfig, ScheduleMode, run_program, set_trace_interrupts};
+use headless::HeadlessOptions;
 use memory::{Memory, SdSlot};
 
-const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N] [--profile <report.txt>] [--symbols <file.hex>]... [--profile-start user|<label>|0xADDR] [--profile-stop <label>|0xADDR]";
+const USAGE: &str = "Usage: cargo run -- --ram <file>.hex [--sd0 <sd0.bin>] [--sd1 <sd1.bin>] [--sd0-out <sd0-out.bin>] [--sd1-out <sd1-out.bin>] [--vga] [--audio|--audio-fast] [--uart] [--debug|--debugc] [--trace-ints] [--cores N] [--sched free|rr|random] [--max-cycles N] [--sd-dma-ticks N] [--profile <report.txt>] [--symbols <file.hex>]... [--user-symbols <file.hex>]... [--profile-start user|<label>|0xADDR] [--profile-stop <label>|0xADDR] [--headless [--input-script <file>] [--shot-dir <dir>] [--shot-every N] [--exit-frame N] [--audio-capture <file.raw>]]";
 
 // Print an error and exit with status 1.
 fn fail(message: impl std::fmt::Display) -> ! {
@@ -46,6 +48,7 @@ struct Options {
     sd1_out_path: Option<String>,
     profile_path: Option<String>,
     symbol_paths: Vec<String>,
+    user_symbol_paths: Vec<String>,
     profile_start: Option<String>,
     profile_stop: Option<String>,
 }
@@ -60,6 +63,8 @@ fn parse_args(args: &[String]) -> Options {
     let (mut sd0_path, mut sd1_path, mut sd0_out_path, mut sd1_out_path) = (None, None, None, None);
     let (mut profile_path, mut profile_start, mut profile_stop) = (None, None, None);
     let mut symbol_paths = Vec::new();
+    let mut user_symbol_paths = Vec::new();
+    let mut headless = HeadlessOptions::default();
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -101,8 +106,15 @@ fn parse_args(args: &[String]) -> Options {
             "--sd1-out" => sd1_out_path = Some(value()),
             "--profile" => profile_path = Some(value()),
             "--symbols" => symbol_paths.push(value()),
+            "--user-symbols" => user_symbol_paths.push(value()),
             "--profile-start" => profile_start = Some(value()),
             "--profile-stop" => profile_stop = Some(value()),
+            "--headless" => headless.enabled = true,
+            "--input-script" => headless.script_path = Some(value()),
+            "--shot-dir" => headless.shot_dir = Some(value()),
+            "--shot-every" => headless.shot_every = parse_number(flag, &value()),
+            "--exit-frame" => headless.exit_frame = parse_number(flag, &value()),
+            "--audio-capture" => headless.audio_capture = Some(value()),
             _ if flag.starts_with('-') => fail(format!("Unknown flag: {}", arg)),
             _ => {
                 let slot = [&mut ram_path, &mut sd0_path, &mut sd1_path]
@@ -112,6 +124,18 @@ fn parse_args(args: &[String]) -> Options {
                 *slot = Some(arg.clone());
             }
         }
+    }
+
+    let headless_only = headless.script_path.is_some()
+        || headless.shot_dir.is_some()
+        || headless.shot_every != 0
+        || headless.exit_frame != 0
+        || headless.audio_capture.is_some();
+    if headless_only && !headless.enabled {
+        fail("Error: --input-script, --shot-dir, --shot-every, --exit-frame, and --audio-capture require --headless");
+    }
+    if headless.enabled {
+        config.headless = Some(Arc::new(headless));
     }
 
     Options {
@@ -126,6 +150,7 @@ fn parse_args(args: &[String]) -> Options {
         sd1_out_path,
         profile_path,
         symbol_paths,
+        user_symbol_paths,
         profile_start,
         profile_stop,
     }
@@ -211,9 +236,12 @@ fn main() {
     }
     let debug_mode = if options.debugc { Some("debugc") } else if options.debug { Some("debug") } else { None };
     if options.profile_path.is_none()
-        && (!options.symbol_paths.is_empty() || options.profile_start.is_some() || options.profile_stop.is_some())
+        && (!options.symbol_paths.is_empty()
+            || !options.user_symbol_paths.is_empty()
+            || options.profile_start.is_some()
+            || options.profile_stop.is_some())
     {
-        println!("Warning: --symbols, --profile-start, and --profile-stop are ignored without --profile");
+        println!("Warning: --symbols, --user-symbols, --profile-start, and --profile-stop are ignored without --profile");
     }
     if options.profile_path.is_some() && debug_mode.is_some() {
         println!("Warning: --profile is ignored in debug modes");
@@ -253,7 +281,13 @@ fn main() {
     let symbols = options.profile_path.as_ref().map(|_| {
         let mut paths = vec![options.ram_path.clone()];
         paths.extend(options.symbol_paths.iter().cloned());
-        Symbols::load(&paths).unwrap_or_else(|err| fail(err))
+        let mut symbols = Symbols::load(&paths).unwrap_or_else(|err| fail(err));
+        if !options.user_symbol_paths.is_empty() {
+            symbols
+                .load_user(&options.user_symbol_paths)
+                .unwrap_or_else(|err| fail(err));
+        }
+        symbols
     });
     if let Some(symbols) = &symbols {
         let window = build_profile_window(
@@ -273,9 +307,15 @@ fn main() {
     )
     .unwrap_or_else(|err| fail(err));
     write_profile(options.profile_path.as_deref(), &run.profiles, symbols.as_ref());
+    let memory: &Memory = &run.memory;
+    // A headless run normally ends at its scripted exit frame, not a halt.
+    if run.result.is_none() && options.config.headless.is_some() {
+        write_sd_exports(&options, |slot| memory.dump_sd_image(slot));
+        println!("headless run stopped");
+        return;
+    }
     // Programs return a value in r1; a missing result means the cycle budget ran out.
     let result = run.result.expect("did not terminate");
-    let memory: &Memory = &run.memory;
     write_sd_exports(&options, |slot| memory.dump_sd_image(slot));
     println!("{:08x}", result);
 }

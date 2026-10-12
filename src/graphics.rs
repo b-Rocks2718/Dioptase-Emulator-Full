@@ -476,12 +476,21 @@ fn put_scaled(buffer: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, x: u32, y: u32, scale
     }
 }
 
+// Composites the guest VGA layers (pixel, tile, sprite) into one 640x480
+// host image. Shared by the windowed display and the headless display
+// (`headless.rs`); it only reads VGA state, so a frame may mix state from
+// slightly different instants while cores keep running (as on hardware).
+pub struct Compositor {
+    buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    memory: Arc<Memory>,
+}
+
 // Owns the host window and composites the guest VGA layers into it. Runs on
 // the main thread; reads VGA state from `memory` while cores keep running,
 // so a frame may mix state from slightly different instants (as on hardware).
 pub struct Graphics {
     window: PistonWindow,
-    buffer: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    compositor: Compositor,
     texture_context: G2dTextureContext,
     texture: G2dTexture,
     memory: Arc<Memory>,
@@ -501,18 +510,18 @@ impl Graphics {
         window.set_max_fps(60);
         window.set_ups(60);
 
-        let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(FRAME_WIDTH, FRAME_HEIGHT);
+        let compositor = Compositor::new(Arc::clone(&memory));
         let mut texture_context = window.create_texture_context();
         let texture = Texture::from_image(
             &mut texture_context,
-            &buffer,
+            compositor.image(),
             &TextureSettings::new().filter(Filter::Nearest),
         )
         .unwrap();
 
         Graphics {
             window,
-            buffer,
+            compositor,
             texture_context,
             texture,
             memory,
@@ -609,13 +618,50 @@ impl Graphics {
         }
     }
 
+    // Composite one frame, advance the frame counter, and raise vblank.
+    fn update(&mut self) {
+        let vga = self.memory.vga();
+        // VGA status: 0 = drawing, 3 = idle (vblank).
+        vga.status.store(0, Ordering::SeqCst);
+        self.compositor.compose();
+        vga.frame.fetch_add(1, Ordering::SeqCst);
+        self.texture
+            .update(&mut self.texture_context, self.compositor.image())
+            .unwrap();
+        vga.status.store(3, Ordering::SeqCst);
+        self.memory.raise_pending_interrupt(VGA_INTERRUPT_BIT);
+    }
+}
+
+impl Compositor {
+    // Create a compositor with a black 640x480 frame.
+    pub fn new(memory: Arc<Memory>) -> Compositor {
+        Compositor { buffer: ImageBuffer::new(FRAME_WIDTH, FRAME_HEIGHT), memory }
+    }
+
+    // The most recently composited frame.
+    pub fn image(&self) -> &ImageBuffer<Rgba<u8>, Vec<u8>> {
+        &self.buffer
+    }
+
+    // Redraw every layer from the current VGA state. The pixel layer covers
+    // the whole frame, so drawing it first also erases the previous frame.
+    pub fn compose(&mut self) {
+        self.draw_pixel_layer();
+        self.draw_tile_layer();
+        self.draw_sprites();
+    }
+
     // Draw the pixel layer (background). Pixel scale has an implicit +1 so
     // n = 0 doubles 320x240 to fill 640x480.
+    //
+    // The copy drops the framebuffer lock before the scaled blit. Holding it
+    // across the blit made every guest pixel store wait out the whole frame.
     fn draw_pixel_layer(&mut self) {
         let vga = self.memory.vga();
         let scale = 1 << (u32::from(vga.pixel_scale.load(Ordering::SeqCst)) + 1);
         let (scroll_x, scroll_y) = (scroll_offset(&vga.pixel_hscroll), scroll_offset(&vga.pixel_vscroll));
-        let fb = vga.pixel_frame_buffer.read().unwrap();
+        let fb = vga.pixel_frame_buffer.read().unwrap().clone();
         for y in 0..PIXEL_FRAME_HEIGHT {
             for x in 0..PIXEL_FRAME_WIDTH {
                 let idx = 2 * (x + y * PIXEL_FRAME_WIDTH) as usize;
@@ -631,12 +677,13 @@ impl Graphics {
 
     // Draw the tile layer over the pixel layer. 0xFXXX tile pixels are
     // transparent and 0xCXXX pixels take the entry's RGB332 tile color.
+    // Snapshots drop the locks before the blit so HUD writes are not stalled.
     fn draw_tile_layer(&mut self) {
         let vga = self.memory.vga();
         let scale = 1 << u32::from(vga.tile_scale.load(Ordering::SeqCst));
         let (scroll_x, scroll_y) = (scroll_offset(&vga.tile_hscroll), scroll_offset(&vga.tile_vscroll));
-        let fb = vga.tile_frame_buffer.read().unwrap();
-        let tile_map = vga.tile_map.read().unwrap();
+        let fb = vga.tile_frame_buffer.read().unwrap().clone();
+        let tile_map = vga.tile_map.read().unwrap().clone();
         for ty in 0..TILE_FB_HEIGHT_TILES {
             for tx in 0..TILE_FB_WIDTH_TILES {
                 let entry = 2 * (tx + ty * TILE_FB_WIDTH_TILES) as usize;
@@ -667,9 +714,10 @@ impl Graphics {
 
     // Draw the sprites on top; later sprites overlap earlier ones. Sprite
     // coordinates are signed and pixels left of / above the screen are clipped.
+    // The pixel snapshot is taken before the blit so a flame update can proceed.
     fn draw_sprites(&mut self) {
         let vga = self.memory.vga();
-        let sprites = vga.sprite_pixels.read().unwrap();
+        let sprites = vga.sprite_pixels.read().unwrap().clone();
         for index in 0..SPRITE_COUNT {
             let scale = 1 << u32::from(vga.sprite_scales[index].load(Ordering::SeqCst));
             let coords = vga.sprite_coords[index].load(Ordering::SeqCst);
@@ -689,22 +737,6 @@ impl Graphics {
         }
     }
 
-    // Composite one frame, advance the frame counter, and raise vblank.
-    fn update(&mut self) {
-        let vga = self.memory.vga();
-        // VGA status: 0 = drawing, 3 = idle (vblank).
-        vga.status.store(0, Ordering::SeqCst);
-        self.draw_pixel_layer();
-        self.draw_tile_layer();
-        self.draw_sprites();
-        let vga = self.memory.vga();
-        vga.frame.fetch_add(1, Ordering::SeqCst);
-        self.texture
-            .update(&mut self.texture_context, &self.buffer)
-            .unwrap();
-        vga.status.store(3, Ordering::SeqCst);
-        self.memory.raise_pending_interrupt(VGA_INTERRUPT_BIT);
-    }
 }
 
 #[cfg(test)]

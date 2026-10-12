@@ -436,6 +436,12 @@ impl Emulator {
     // failed translation (0 when the access failed for another reason).
     fn raise_pending_tlb_miss(&mut self, addr: u32) {
         let flags = self.pending_tlb_fault.take().unwrap_or(TLB_FAULT_ABSENT);
+        if let Some(profile) = self.profile.as_mut() {
+            if flags == TLB_FAULT_ABSENT {
+                let remiss = self.tlb.miss_caused_by_clear(self.cregfile[CREG_PID], addr >> 12);
+                profile.record_tlb_miss(remiss);
+            }
+        }
         if tracing() {
             println!(
                 "[core {}] exception tlb_miss mode={} addr=0x{:08X} flags=0x{:08X} pc=0x{:08X} psr=0x{:08X}",

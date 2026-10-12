@@ -40,11 +40,41 @@ Use the `--sd0-out <file>` and `--sd1-out <file>` flags to write the final raw S
 
 SD images are raw binary byte streams; byte 0 maps to SD block 0 byte 0
 
+### Headless display (automated testing of graphical programs)
+
+Use `--headless` to run the VGA device without opening a window. Frames still
+advance at 60 Hz of wall-clock time, so the guest sees the same VGA status,
+frame counter, and vblank interrupts as with `--vga`.
+
+- `--input-script <file>` injects keyboard and mouse events at fixed frame
+  numbers, through the same paths the window uses. One event per line, `#`
+  starts a comment: `<frame> key <name> [tap|down|up]`, `<frame> type <text>`,
+  `<frame> mouse <dx> <dy> [wheel]`, `<frame> button <left|right|middle> <down|up>`,
+  `<frame> shot [name]`, `<frame> exit`. Key names are single characters or
+  `enter`, `space`, `esc`, `backspace`, `tab`, `delete`, arrow names, modifier
+  names (`lshift`, `rctrl`, ...), `f1`..`f12`, or a `0x` keycode (see
+  `src/headless.rs`).
+- `--shot-dir <dir>` is where `shot` lines (and `--shot-every N`) save PNG
+  screenshots of the composited 640x480 frame.
+- `--exit-frame N` stops the run at frame N.
+- `--audio-capture <file.raw>` records the audio device as raw s16le mono PCM
+  at 25 kHz, consuming it on wall-clock time like `--audio-fast`.
+
+Example: boot the OS, type a command at the shell, and grab a screenshot:
+
+```
+printf '150 type snake\n200 key enter\n400 shot snake\n420 exit\n' > script.txt
+Dioptase-Emulator-Full build/bios.hex --sd0 build/kernel.bin --sd1 root.ext2 \
+  --cores 4 --headless --input-script script.txt --shot-dir shots
+```
+
 ### Profiling
 
 Use `--profile <report.txt>` to count every instruction each core executes and write a report when the run ends (also when `--max-cycles` stops it). Counts are exact, not sampled, but they are instruction counts, not hardware cycles: the emulator does not model caches or pipeline stalls.
 
-Use `--symbols <file.hex>` (repeatable) to name kernel functions and source lines. Pass the kernel `.hex` built with `basm -g` (the OS build writes `build/<test>.hex` next to each `build/<test>.bin`). The `--ram` image is always loaded for symbols too.
+Use `--symbols <file.hex>` (repeatable) to name kernel functions and source lines.
+
+Use `--user-symbols <file.hex>` (repeatable) to name user-mode code: pass a user program assembled with `basm -g`. Its labels then name user PCs of every PID in the hot-instruction and kernel-entry tables, and the report adds a per-PID table of user functions. Since every user program is linked at the same base address, profile one program at a time. Pass the kernel `.hex` built with `basm -g` (the OS build writes `build/<test>.hex` next to each `build/<test>.bin`). The `--ram` image is always loaded for symbols too.
 
 The report has per-core tick counts (including ticks spent asleep), a table of all functions by instruction count, the hottest kernel source lines, and the hottest instructions with disassembly. User-mode code is reported per PID (the raw PID control register value, in hex) without symbols.
 
@@ -57,6 +87,10 @@ Use `--profile-start <trigger>` and `--profile-stop <trigger>` to count only par
 To measure while a user program runs, e.g. an OS test whose `/sbin/init` does the work: `--profile-start user --profile-stop stop`. `stop` is the kernel's thread-exit function. Any exiting thread closes the window, so if the report shows it opened more than once, a kernel thread exited while the program was running.
 
 With more than one core, the report also lists each core's top functions, so busy-waiting on an idle core is visible.
+
+Under the per-core table, the report counts TLB misses with no matching entry and how many of them would have hit if `tlbc` had never run, judged by a shadow TLB of the same size and replacement order that sees every fill and `tlbi` but ignores clears. That second number is the miss traffic caused by TLB flushes, such as a flush on every context switch.
+
+The report ends with the user instructions that entered the kernel, per entry point: for a TLB miss, the load or store whose address missed (or the first instruction on a new code page); for a syscall, the `trap`. Mapping those PCs to the program's labels (assemble it with `basm -g` and look them up in its `#label` lines) shows which loop's access pattern overflows the 16-entry TLB.
 
 Kernel time is split into two parts:
 

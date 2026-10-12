@@ -13,9 +13,11 @@
 // - Registers read every tick without `mmio_lock` (PIT reload, clock divider)
 //   are atomics that each MMIO transaction updates with a single store, so
 //   lock-free readers never see a partially written value.
-// - The graphics thread reads `VgaState` concurrently. It only writes the
-//   VGA status/frame registers, which are read-only to the guest; every other
-//   VGA register is written only by guest MMIO under `mmio_lock`.
+// - The graphics thread reads `VgaState` concurrently. It copies a VGA buffer
+//   under that buffer's lock, then draws the copy, so a guest store waits for
+//   the copy and not for the whole blit. It only writes the VGA status/frame
+//   registers, which are read-only to the guest; every other VGA register is
+//   written only by guest MMIO under `mmio_lock`.
 // - Device tick state that only core 0 advances (PIT countdown, audio sample
 //   countdown) lives in atomics so the per-tick fast path takes no locks.
 // All atomics use SeqCst.
@@ -166,6 +168,21 @@ fn byte_of(value: u32, offset: u32) -> u8 {
 fn with_byte(value: u32, offset: u32, byte: u8) -> u32 {
     let shift = 8 * offset;
     (value & !(0xFF << shift)) | (u32::from(byte) << shift)
+}
+
+// Copy one guest store into a VGA buffer under a single write lock.
+// Returns false when the span is not entirely inside `[base, limit)`.
+fn write_locked_span(buf: &RwLock<Vec<u8>>, base: u32, limit: u32, addr: u32, data: &[u8]) -> bool {
+    let Some(end) = addr.checked_add(data.len() as u32) else {
+        return false;
+    };
+    if addr < base || end > limit {
+        return false;
+    }
+    let mut guard = buf.write().unwrap();
+    let off = (addr - base) as usize;
+    guard[off..off + data.len()].copy_from_slice(data);
+    true
 }
 
 // Replace one byte of a 16-bit register. Only called under `mmio_lock`, and
@@ -948,7 +965,8 @@ impl Memory {
     }
 
     // Write contiguous MMIO bytes. Caller holds `mmio_lock`. Writes that fall
-    // inside one lock-free register are applied with a single store.
+    // inside one lock-free register are applied with a single store. A store
+    // that stays inside one framebuffer takes that buffer's lock once.
     fn write_mmio_bytes(&self, addr: u32, data: &[u8]) {
         if let Some((reg, base)) = self.lockfree_register(addr)
             && addr + data.len() as u32 <= base + 4 {
@@ -959,6 +977,14 @@ impl Memory {
                 reg.store(value, Ordering::SeqCst);
                 return;
             }
+        let vga = &self.vga;
+        if write_locked_span(&vga.pixel_frame_buffer, PIXEL_FRAME_BUFFER_START, PIXEL_FRAME_BUFFER_END, addr, data)
+            || write_locked_span(&vga.tile_frame_buffer, TILE_FRAME_BUFFER_START, TILE_FRAME_BUFFER_END, addr, data)
+            || write_locked_span(&vga.tile_map, TILE_MAP_START, TILE_MAP_END, addr, data)
+            || write_locked_span(&vga.sprite_pixels, SPRITE_MAP_START, SPRITE_MAP_END, addr, data)
+        {
+            return;
+        }
         for (i, byte) in data.iter().enumerate() {
             self.write_mmio_byte(addr + i as u32, *byte);
         }

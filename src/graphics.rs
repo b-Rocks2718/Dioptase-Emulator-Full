@@ -666,10 +666,13 @@ impl Compositor {
             for x in 0..PIXEL_FRAME_WIDTH {
                 let idx = 2 * (x + y * PIXEL_FRAME_WIDTH) as usize;
                 let pixel = bgr12_to_rgba(u16::from_le_bytes([fb[idx], fb[idx + 1]]));
-                // Signed scroll wraps with Euclidean modulo so large negative
-                // offsets keep wrapping correctly.
-                let fx = (x as i32 + scroll_x).rem_euclid(FRAME_WIDTH as i32) as u32;
-                let fy = (y as i32 + scroll_y).rem_euclid(FRAME_HEIGHT as i32) as u32;
+                // Signed scroll wraps with Euclidean modulo at the pixel
+                // layer's own 320x240 size, so the layer is a ring buffer: a
+                // column or row scrolled off one edge reappears at the other.
+                // (It used to wrap at the 640x480 output size, which left the
+                // uncovered edge showing the previous frame.)
+                let fx = (x as i32 + scroll_x).rem_euclid(PIXEL_FRAME_WIDTH as i32) as u32;
+                let fy = (y as i32 + scroll_y).rem_euclid(PIXEL_FRAME_HEIGHT as i32) as u32;
                 put_scaled(&mut self.buffer, fx, fy, scale, pixel);
             }
         }

@@ -15,7 +15,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Longest a parked idle core waits before re-checking (a backstop: raising an
+// interrupt for it unparks it at once).
+const IDLE_PARK: Duration = Duration::from_millis(1);
 
 use super::interrupts::InterruptController;
 use super::profiler::{CoreProfile, ProfileWindow};
@@ -199,6 +203,14 @@ fn run_core(
 ) -> CoreExit {
     let core = cpu.core_id as usize;
     cpu.count = 0;
+    // Free-running secondary cores park while asleep instead of spinning a
+    // host thread on empty ticks. Core 0 keeps ticking: it advances the device
+    // clock (PIT, SD DMA, audio). Lockstep schedulers keep every core ticking.
+    let parks = scheduler.is_none() && core != 0;
+    let interrupts = Arc::clone(&cpu.interrupts);
+    if parks {
+        interrupts.register_thread(core);
+    }
     loop {
         if shared.stop.load(Ordering::SeqCst) {
             break;
@@ -221,6 +233,9 @@ fn run_core(
         }
         if let Some(sched) = &scheduler {
             sched.finish_turn(core);
+        }
+        if parks && cpu.asleep && interrupts.peek_pending(core) == 0 {
+            interrupts.park_idle(core, IDLE_PARK);
         }
     }
     if let Some(sched) = &scheduler {

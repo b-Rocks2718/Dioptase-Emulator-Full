@@ -4,9 +4,18 @@
 // Concurrency: `pending` is a lock-free per-core atomic. Any core may set bits for any core; only the owning core
 // takes (clears) its own pending bits. Routing cursors live behind `routes`.
 // All atomics use SeqCst.
+//
+// Idle parking (free-running cores only, see run.rs): a secondary core that
+// is asleep (`mode sleep`) with nothing pending parks its host thread instead
+// of spinning. It raises its `sleeping` flag, re-reads `pending`, and parks;
+// `set_pending_bits` stores the bits, then reads the flag and unparks. With
+// SeqCst on both sides at least one of the two sees the other's write, so a
+// wake-up is never lost; the park also times out as a backstop.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, Thread};
+use std::time::Duration;
 
 use crate::memory::{AUDIO_INTERRUPT_BIT, SD2_INTERRUPT_BIT, SD_INTERRUPT_BIT, VGA_INTERRUPT_BIT};
 
@@ -89,6 +98,10 @@ pub(super) struct InterruptController {
     input_bits: [u32; INPUT_SOURCES],
     pending: Vec<CacheLine<AtomicU32>>,
     routes: Mutex<RouteState>,
+    // Per core: its host thread is parked or about to park (see above).
+    sleeping: Vec<CacheLine<AtomicBool>>,
+    // Host threads of cores that may park, registered by run.rs.
+    threads: Mutex<Vec<Option<Thread>>>,
 }
 
 impl InterruptController {
@@ -105,12 +118,33 @@ impl InterruptController {
                 next_device: [0; ROUTED_DEVICE_BITS.len()],
                 inputs: [InputRoute { next: 0, inflight: None }; INPUT_SOURCES],
             }),
+            sleeping: (0..cores).map(|_| CacheLine(AtomicBool::new(false))).collect(),
+            threads: Mutex::new((0..cores).map(|_| None).collect()),
         })
     }
 
     // Publish pending bits for a core without losing concurrent updates.
     fn set_pending_bits(&self, core: usize, bits: u32) {
         self.pending[core].0.fetch_or(bits, Ordering::SeqCst);
+        if self.sleeping[core].0.load(Ordering::SeqCst)
+            && let Some(thread) = &self.threads.lock().unwrap()[core] {
+                thread.unpark();
+            }
+    }
+
+    // Record the calling host thread as `core`'s, so interrupts can wake it.
+    pub(super) fn register_thread(&self, core: usize) {
+        self.threads.lock().unwrap()[core] = Some(thread::current());
+    }
+
+    // Park the calling (registered) host thread of `core` until an interrupt
+    // is raised for it or `timeout` passes. Returns at once if one is pending.
+    pub(super) fn park_idle(&self, core: usize, timeout: Duration) {
+        self.sleeping[core].0.store(true, Ordering::SeqCst);
+        if self.pending[core].0.load(Ordering::SeqCst) == 0 {
+            thread::park_timeout(timeout);
+        }
+        self.sleeping[core].0.store(false, Ordering::SeqCst);
     }
 
     // Pending bits for a core, without consuming them.

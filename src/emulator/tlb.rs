@@ -5,11 +5,13 @@
 // most one global entry per VPN. Lookups prefer the private entry and fall
 // back to the global one.
 //
-// Replacement is implementation-defined by the ISA. This model evicts the
-// oldest entry of the same class (private/global) as the incoming entry, or
-// the oldest entry overall if that class is empty. It is deterministic across
-// runs, unlike the earlier HashMap-based model whose eviction order depended
-// on the process's random hash seed.
+// Replacement (docs/ISA.md "TLB Structure") is least recently used: a
+// translation that hits, or a tlbw that fills or rewrites an entry, marks it
+// used; tlbr and faulting lookups do not. At capacity the least recently used
+// entry of the incoming entry's class (private/global) is evicted, or of the
+// other class if that one is empty. Oldest-first eviction, used before, threw
+// out hot code, stack and global pages every 16 misses. The model is
+// deterministic across runs.
 
 pub(super) const TLB_ENTRIES: usize = 16;
 
@@ -56,20 +58,33 @@ struct TlbEntry {
     vpn: u32,
     value: u32,
     global: bool,
-    // Insertion sequence number used for oldest-first eviction.
-    seq: u64,
+    // Stamp of the last use (hit or fill); the smallest stamp is evicted.
+    used: u64,
+}
+
+// A key of the diagnostic shadow TLB and the stamp of its last use. While the
+// key is resident in the real TLB, the real entry's stamp is the current one;
+// the record's own stamp is brought up to date when the entry leaves (evicted
+// or cleared), which keeps hits from touching the shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShadowKey {
+    global: bool,
+    pid: u32,
+    vpn: u32,
+    used: u64,
 }
 
 // Fixed-capacity TLB for one core.
 #[derive(Debug)]
 pub struct Tlb {
     entries: Vec<TlbEntry>,
-    next_seq: u64,
+    // Use clock for the LRU stamps.
+    clock: u64,
     // Diagnostic only (the profiler's flush re-miss count); never affects
-    // translation. Keys (global, pid, vpn) of a same-size TLB that receives
-    // the same fills and `tlbi`s but ignores `tlbc`, oldest first: a real
-    // miss that this shadow would have hit was caused by a flush.
-    shadow: Vec<(bool, u32, u32)>,
+    // translation. Keys of a same-size LRU TLB that sees the same fills, hits
+    // and `tlbi`s but ignores `tlbc`: a real miss that this shadow would have
+    // hit was caused by a flush.
+    shadow: Vec<ShadowKey>,
 }
 
 impl Tlb {
@@ -77,9 +92,35 @@ impl Tlb {
     pub fn new() -> Tlb {
         Tlb {
             entries: Vec::with_capacity(TLB_ENTRIES),
-            next_seq: 0,
+            clock: 0,
             shadow: Vec::with_capacity(TLB_ENTRIES),
         }
+    }
+
+    // Advance the use clock and return the new stamp.
+    fn stamp(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    // Whether a shadow record names the same mapping as a real entry.
+    fn same_key(k: &ShadowKey, e: &TlbEntry) -> bool {
+        k.global == e.global && k.vpn == e.vpn && (k.global || k.pid == e.pid)
+    }
+
+    // Bring the shadow record of a departing real entry up to its last use.
+    fn sync_shadow(&mut self, e: TlbEntry) {
+        if let Some(k) = self.shadow.iter_mut().find(|k| Self::same_key(k, &e)) {
+            k.used = e.used;
+        }
+    }
+
+    // A shadow record's current stamp: the real entry's while it is resident.
+    fn shadow_used(&self, k: &ShadowKey) -> u64 {
+        self.entries
+            .iter()
+            .find(|e| Self::same_key(k, e))
+            .map_or(k.used, |e| e.used)
     }
 
     // Index of the private entry for (pid, vpn), if resident.
@@ -111,19 +152,27 @@ impl Tlb {
         }
     }
 
-    // Translate a virtual page for a read, write, or execute access. A private
-    // entry that denies the access does not hide a permitting global entry;
-    // if no global entry exists the private entry's fault flags are reported.
-    pub(super) fn access(&self, pid: u32, vpn: u32, access: Access, kmode: bool) -> TlbAccess {
+    // Translate a virtual page for a read, write, or execute access, marking
+    // the entry that permits it as used. A private entry that denies the
+    // access does not hide a permitting global entry; if no global entry
+    // exists the private entry's fault flags are reported.
+    pub(super) fn access(&mut self, pid: u32, vpn: u32, access: Access, kmode: bool) -> TlbAccess {
         let mut private_fault = None;
         if let Some(i) = self.find_private(pid, vpn) {
             match Self::classify(self.entries[i].value, access, kmode) {
-                hit @ TlbAccess::Hit(_) => return hit,
+                hit @ TlbAccess::Hit(_) => {
+                    self.entries[i].used = self.stamp();
+                    return hit;
+                }
                 TlbAccess::Fault(flags) => private_fault = Some(flags),
             }
         }
         if let Some(i) = self.find_global(vpn) {
-            return Self::classify(self.entries[i].value, access, kmode);
+            let result = Self::classify(self.entries[i].value, access, kmode);
+            if let TlbAccess::Hit(_) = result {
+                self.entries[i].used = self.stamp();
+            }
+            return result;
         }
         TlbAccess::Fault(private_fault.unwrap_or(TLB_FAULT_ABSENT))
     }
@@ -135,23 +184,21 @@ impl Tlb {
             .map(|i| self.entries[i].value)
     }
 
-    // Insert or replace a mapping (tlbw), evicting at capacity.
+    // Insert or replace a mapping (tlbw), evicting the least recently used
+    // entry at capacity. Either way the mapping counts as just used.
     pub fn write(&mut self, pid: u32, vpn: u32, value: u32) {
         let global = value & TLB_FLAG_GLOBAL != 0;
+        let pid = if global { 0 } else { pid };
+        let now = self.stamp();
+        self.shadow_fill(ShadowKey { global, pid, vpn, used: now });
         let existing = if global {
             self.find_global(vpn)
         } else {
             self.find_private(pid, vpn)
         };
-        let key = (global, if global { 0 } else { pid }, vpn);
-        if !self.shadow.contains(&key) {
-            if self.shadow.len() >= TLB_ENTRIES {
-                self.shadow.remove(0);
-            }
-            self.shadow.push(key);
-        }
         if let Some(i) = existing {
             self.entries[i].value = value;
+            self.entries[i].used = now;
             return;
         }
         if self.entries.len() >= TLB_ENTRIES {
@@ -162,23 +209,39 @@ impl Tlb {
             vpn,
             value,
             global,
-            seq: self.next_seq,
+            used: now,
         });
-        self.next_seq += 1;
     }
 
-    // Drop the oldest entry, preferring the incoming entry's class.
+    // Record a fill in the shadow, evicting its least recently used key.
+    fn shadow_fill(&mut self, key: ShadowKey) {
+        let same = |k: &ShadowKey| k.global == key.global && k.vpn == key.vpn && (k.global || k.pid == key.pid);
+        if let Some(k) = self.shadow.iter_mut().find(|k| same(k)) {
+            k.used = key.used;
+            return;
+        }
+        if self.shadow.len() >= TLB_ENTRIES {
+            let victim = (0..self.shadow.len()).min_by_key(|&i| self.shadow_used(&self.shadow[i]));
+            if let Some(i) = victim {
+                self.shadow.swap_remove(i);
+            }
+        }
+        self.shadow.push(key);
+    }
+
+    // Drop the least recently used entry, preferring the incoming entry's class.
     fn evict_one(&mut self, prefer_global: bool) {
-        let oldest_in = |global: bool| {
+        let lru_in = |global: bool| {
             self.entries
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.global == global)
-                .min_by_key(|(_, e)| e.seq)
+                .min_by_key(|(_, e)| e.used)
                 .map(|(i, _)| i)
         };
-        if let Some(i) = oldest_in(prefer_global).or_else(|| oldest_in(!prefer_global)) {
-            self.entries.swap_remove(i);
+        if let Some(i) = lru_in(prefer_global).or_else(|| lru_in(!prefer_global)) {
+            let gone = self.entries.swap_remove(i);
+            self.sync_shadow(gone);
         }
     }
 
@@ -187,12 +250,16 @@ impl Tlb {
         self.entries
             .retain(|e| !(e.vpn == vpn && (e.global || e.pid == pid)));
         self.shadow
-            .retain(|&(global, p, v)| !(v == vpn && (global || p == pid)));
+            .retain(|k| !(k.vpn == vpn && (k.global || k.pid == pid)));
     }
 
-    // Remove every mapping (tlbc). The diagnostic shadow keeps its keys.
+    // Remove every mapping (tlbc). The diagnostic shadow keeps its keys, with
+    // their last-use stamps brought up to date.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        let gone: Vec<TlbEntry> = self.entries.drain(..).collect();
+        for e in gone {
+            self.sync_shadow(e);
+        }
     }
 
     // Whether a miss on (pid, vpn) would have hit had no `tlbc` ever run: the
@@ -201,13 +268,14 @@ impl Tlb {
     pub(super) fn miss_caused_by_clear(&self, pid: u32, vpn: u32) -> bool {
         self.shadow
             .iter()
-            .any(|&(global, p, v)| v == vpn && (global || p == pid))
+            .any(|k| k.vpn == vpn && (k.global || k.pid == pid))
     }
 
-    // Print resident entries for the debugger, oldest first within each class.
+    // Print resident entries for the debugger, least recently used first
+    // within each class.
     pub(super) fn debug_dump(&self) {
         let mut sorted = self.entries.clone();
-        sorted.sort_by_key(|e| e.seq);
+        sorted.sort_by_key(|e| e.used);
         for (title, global) in [("private", false), ("global", true)] {
             let class: Vec<&TlbEntry> = sorted.iter().filter(|e| e.global == global).collect();
             println!("TLB {}: {} entries", title, class.len());
@@ -230,7 +298,8 @@ impl Tlb {
 /*
 Summary:
 - Private entries shadow global ones only when they permit the access.
-- Capacity is enforced with deterministic oldest-first, same-class eviction.
+- Capacity is enforced with deterministic least-recently-used, same-class
+  eviction; hits and fills count as uses.
 */
 mod tests {
     use super::*;
@@ -280,14 +349,43 @@ mod tests {
     }
 
     #[test]
-    fn eviction_is_oldest_first_within_class() {
+    fn eviction_is_least_recently_used_within_class() {
         let mut tlb = Tlb::new();
         for vpn in 0..TLB_ENTRIES as u32 {
             tlb.write(0, vpn, RWX);
         }
         tlb.write(0, 100, RWX);
-        assert_eq!(tlb.read(0, 0), None, "the oldest private entry is evicted first");
+        assert_eq!(tlb.read(0, 0), None, "an untouched first fill is the least recently used");
         assert!(tlb.read(0, 1).is_some());
         assert_eq!(tlb.entries.len(), TLB_ENTRIES);
+        assert_eq!(tlb.access(0, 1, Access::Read, true), TlbAccess::Hit(0));
+        tlb.write(0, 101, RWX);
+        assert!(tlb.read(0, 1).is_some(), "a hit keeps the oldest fill resident");
+        assert_eq!(tlb.read(0, 2), None, "the least recently used entry goes instead");
+    }
+
+    // tlbr and faulting lookups are management, not use.
+    #[test]
+    fn reads_and_faults_do_not_refresh() {
+        let mut tlb = Tlb::new();
+        for vpn in 0..TLB_ENTRIES as u32 {
+            tlb.write(0, vpn, TLB_FLAG_READ);
+        }
+        assert!(tlb.read(0, 0).is_some());
+        assert_eq!(tlb.access(0, 0, Access::Write, true), TlbAccess::Fault(TLB_FLAG_WRITE));
+        tlb.write(0, 100, RWX);
+        assert_eq!(tlb.read(0, 0), None, "neither tlbr nor a fault counted as a use");
+    }
+
+    // A hot global page survives a stream of private fills.
+    #[test]
+    fn hot_entries_survive_a_sweep() {
+        let mut tlb = Tlb::new();
+        tlb.write(0, 7, RWX | TLB_FLAG_GLOBAL);
+        for vpn in 100..100 + 4 * TLB_ENTRIES as u32 {
+            tlb.write(1, vpn, RWX);
+            assert_eq!(tlb.access(1, 7, Access::Execute, true), TlbAccess::Hit(0));
+        }
+        assert!(tlb.read(0, 7).is_some(), "an entry used between fills is never the victim");
     }
 }
